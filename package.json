@@ -1,0 +1,82 @@
+{
+  "name": "openclaw-vk",
+  "version": "2026.3.19",
+  "description": "OpenClaw VK (VKontakte) channel plugin",
+  "author": {
+    "name": "Pavel Frankov",
+    "url": "https://github.com/pfrankov"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "openclaw-channel",
+    "vk",
+    "vkontakte",
+    "vk-bot",
+    "bot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pfrankov/openclaw-vk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pfrankov/openclaw-vk/issues"
+  },
+  "homepage": "https://github.com/pfrankov/openclaw-vk#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "api.ts",
+    "index.ts",
+    "setup-entry.ts",
+    "openclaw.plugin.json",
+    "src/accounts.ts",
+    "src/channel.setup.ts",
+    "src/channel.ts",
+    "src/config-schema.ts",
+    "src/inbound.ts",
+    "src/monitor.ts",
+    "src/probe.ts",
+    "src/runtime.ts",
+    "src/send.ts",
+    "src/setup-core.ts",
+    "src/setup-surface.ts",
+    "src/types.ts"
+  ],
+  "scripts": {
+    "check:pack": "npm pack --dry-run",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "vk-io": "^4.10.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "vitest": "^3.1.1"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "vk",
+      "label": "VK",
+      "selectionLabel": "VK (VKontakte Bot)",
+      "docsPath": "/channels/vk",
+      "docsLabel": "vk",
+      "blurb": "VK (VKontakte) community bot via Long Poll API.",
+      "order": 80,
+      "quickstartAllowFrom": true
+    },
+    "install": {
+      "npmSpec": "openclaw-vk",
+      "localPath": "extensions/vk",
+      "defaultChoice": "npm"
+    }
+  }
+}
