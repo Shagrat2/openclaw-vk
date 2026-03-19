@@ -18,13 +18,17 @@
 5. *(Для работы в беседах)* Откройте **Управление → Сообщения → Настройки для бота** и включите *Разрешать добавлять сообщество в чаты*.
 
 ### 2. Установка плагина
+```
+Установи OpenClaw-плагин для vk чётко по инструкции https://github.com/pfrankov/openclaw-vk
+Вот мой токен: vk1.a...
+```
 
 ```bash
-openclaw plugins install openclaw-vk
+openclaw plugins install @openclaw-vk/vk
 openclaw plugins enable vk
 ```
 
-> Для локальной разработки: `openclaw plugins install ~/path/to/openclaw-vk`
+> Только для локальной разработки: `openclaw plugins install ~/path/to/openclaw-vk`
 
 ### 3. Настройка
 
@@ -36,8 +40,7 @@ openclaw plugins enable vk
     "vk": {
       "enabled": true,
       "token": "<ВАШ_ТОКЕН>",
-      "dmPolicy": "pairing",
-      "groupPolicy": "allowlist"
+      "dmPolicy": "pairing"
     }
   }
 }
