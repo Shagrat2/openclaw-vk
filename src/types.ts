@@ -41,8 +41,19 @@ export type VkInboundMessage = {
   text: string;
   timestamp: number;
   isGroup: boolean;
+  messagePayload?: unknown;
   attachments?: VkInboundAttachment[];
 };
+
+export type VkButtonStyle = "primary" | "secondary" | "success" | "danger";
+
+export type VkReplyButton = {
+  text: string;
+  callback_data: string;
+  style?: VkButtonStyle;
+};
+
+export type VkReplyButtons = ReadonlyArray<ReadonlyArray<VkReplyButton>>;
 
 export type VkInboundAttachment = {
   type: string;

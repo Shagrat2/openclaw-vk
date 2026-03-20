@@ -28,8 +28,16 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
 
 // ── Internal module mocks ────────────────────────────────────────────────────
 
-const mockSendMessageVk = vi.hoisted(() => vi.fn().mockResolvedValue({ messageId: "1", chatId: "0" }));
-vi.mock("./send.js", () => ({ sendMessageVk: mockSendMessageVk }));
+const mockSendMessageVk = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ messageId: "1", chatId: "0" }),
+);
+const mockSendPayloadVk = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ messageId: "2", chatId: "0" }),
+);
+vi.mock("./send.js", () => ({
+  sendMessageVk: mockSendMessageVk,
+  sendPayloadVk: mockSendPayloadVk,
+}));
 
 const mockMonitorVkProvider = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock("./monitor.js", () => ({ monitorVkProvider: mockMonitorVkProvider }));
@@ -78,6 +86,7 @@ import { vkPlugin } from "./channel.js";
 
 beforeEach(() => {
   mockSendMessageVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
+  mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "2", chatId: "0" });
   mockProbeVkBot.mockReset().mockResolvedValue({ ok: true, groupName: "TestBot", groupId: 1 });
   mockMonitorVkProvider.mockReset().mockResolvedValue(undefined);
   mockResolveVkAccount.mockReset().mockReturnValue({
@@ -344,6 +353,30 @@ describe("directory", () => {
 // ── Outbound ─────────────────────────────────────────────────────────────────
 
 describe("outbound", () => {
+  it("sendPayload delegates to sendPayloadVk", async () => {
+    const payload = {
+      text: "Providers:",
+      channelData: {
+        vk: {
+          buttons: [[{ text: "OpenAI", callback_data: "/models openai", style: "primary" }]],
+        },
+      },
+    };
+
+    const result = await vkPlugin.outbound!.sendPayload({
+      cfg: {},
+      to: "123",
+      payload,
+      accountId: "default",
+    } as never);
+
+    expect(mockSendPayloadVk).toHaveBeenCalledWith("123", payload, {
+      cfg: {},
+      accountId: "default",
+    });
+    expect(result).toEqual({ channel: "vk", messageId: "2", chatId: "0" });
+  });
+
   it("sendText delegates to sendMessageVk", async () => {
     const result = await vkPlugin.outbound!.sendText({
       cfg: {},

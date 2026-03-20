@@ -23,7 +23,7 @@ import { VkConfigSchema } from "./config-schema.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
 import { getVkRuntime } from "./runtime.js";
-import { sendMessageVk } from "./send.js";
+import { sendMessageVk, sendPayloadVk } from "./send.js";
 import type { CoreConfig, VkConfig } from "./types.js";
 
 const meta = {
@@ -162,6 +162,15 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
     deliveryMode: "direct",
     chunker: (text, limit) => getVkRuntime().channel.text.chunkMarkdownText(text, limit),
     textChunkLimit: 4096,
+    sendPayload: async ({ to, payload, accountId, cfg }) => {
+      const result = await sendPayloadVk(to, payload, {
+        cfg,
+        accountId: accountId ?? undefined,
+      });
+      return result
+        ? { channel: "vk", ...result }
+        : { channel: "vk", messageId: "", chatId: to };
+    },
     sendText: async ({ cfg, to, text, accountId }) => {
       const result = await sendMessageVk(to, text, {
         cfg,

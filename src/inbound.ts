@@ -1,24 +1,25 @@
 import {
   createScopedPairingAccess,
-  dispatchInboundReplyWithBase,
-  formatTextWithAttachmentLinks,
   issuePairingChallenge,
   logInboundDrop,
-  isDangerousNameMatchingEnabled,
   readStoreAllowFromForDmPolicy,
   resolveControlCommandGate,
-  resolveOutboundMediaUrls,
   resolveAllowlistProviderRuntimeGroupPolicy,
   resolveDefaultGroupPolicy,
   resolveEffectiveAllowFromLists,
   GROUP_POLICY_BLOCKED_LABEL,
   warnMissingProviderGroupPolicyFallbackOnce,
-  type OutboundReplyPayload,
   type OpenClawConfig,
   type RuntimeEnv,
 } from "openclaw/plugin-sdk/compat";
+import {
+  createReplyPrefixOptions,
+  createTypingCallbacks,
+  logTypingFailure,
+} from "openclaw/plugin-sdk/channel-runtime";
+import { resolveVkCommandFromPayload } from "./keyboard.js";
 import { getVkRuntime } from "./runtime.js";
-import { sendMessageVk } from "./send.js";
+import { sendPayloadVk, sendTypingVk } from "./send.js";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -53,24 +54,26 @@ function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number
   };
 }
 
+type VkDispatchPayload = {
+  text?: string;
+  mediaUrl?: string;
+  mediaUrls?: string[];
+  replyToId?: string;
+  channelData?: Record<string, unknown>;
+};
+
 async function deliverVkReply(params: {
-  payload: OutboundReplyPayload;
+  payload: VkDispatchPayload;
   peerId: number;
   accountId: string;
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
 }) {
-  const combined = formatTextWithAttachmentLinks(
-    params.payload.text,
-    resolveOutboundMediaUrls(params.payload),
-  );
-  if (!combined) {
+  const result = await sendPayloadVk(String(params.peerId), params.payload, {
+    accountId: params.accountId,
+  });
+  if (!result) {
     return;
   }
-
-  await sendMessageVk(String(params.peerId), combined, {
-    accountId: params.accountId,
-    replyTo: params.payload.replyToId,
-  });
   params.statusSink?.({ lastOutboundAt: Date.now() });
 }
 
@@ -89,7 +92,7 @@ export async function handleVkInbound(params: {
     accountId: account.accountId,
   });
 
-  const rawBody = message.text?.trim() ?? "";
+  const rawBody = resolveVkCommandFromPayload(message.messagePayload) ?? message.text?.trim() ?? "";
   if (!rawBody) {
     return;
   }
@@ -300,28 +303,60 @@ export async function handleVkInbound(params: {
     CommandAuthorized: commandGate.commandAuthorized,
   });
 
-  await dispatchInboundReplyWithBase({
-    cfg: config as OpenClawConfig,
-    channel: CHANNEL_ID,
-    accountId: account.accountId,
-    route,
-    storePath,
-    ctxPayload,
-    core,
-    deliver: async (payload) => {
-      await deliverVkReply({
-        payload,
-        peerId: message.peerId,
-        accountId: account.accountId,
-        statusSink,
+  const onDispatchError = (err: unknown, info: { kind: string }) => {
+    runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
+  };
+  const typingCallbacks = createTypingCallbacks({
+    start: async () => {
+      await sendTypingVk(String(message.peerId), account);
+    },
+    onStartError: (err) => {
+      logTypingFailure({
+        log: (line) => runtime.log?.(line),
+        channel: CHANNEL_ID,
+        target: String(message.peerId),
+        error: err,
       });
     },
+  });
+  const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
+    cfg: config as OpenClawConfig,
+    agentId: route.agentId,
+    channel: CHANNEL_ID,
+    accountId: account.accountId,
+  });
+
+  await core.channel.session.recordInboundSession({
+    storePath,
+    ctxPayload,
+    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
     onRecordError: (err) => {
       runtime.error?.(`vk: failed updating session meta: ${String(err)}`);
     },
-    onDispatchError: (err, info) => {
-      runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
+  });
+
+  await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: config as OpenClawConfig,
+    dispatcherOptions: {
+      ...prefixOptions,
+      typingCallbacks,
+      deliver: async (payload: unknown) => {
+        const normalized =
+          payload && typeof payload === "object" && !Array.isArray(payload)
+            ? (payload as VkDispatchPayload)
+            : {};
+        await deliverVkReply({
+          payload: normalized,
+          peerId: message.peerId,
+          accountId: account.accountId,
+          statusSink,
+        });
+      },
+      onError: onDispatchError,
     },
-    replyOptions: {},
+    replyOptions: {
+      onModelSelected,
+    },
   });
 }

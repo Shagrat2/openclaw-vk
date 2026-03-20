@@ -4,6 +4,7 @@ import {
   clearVkInstances,
   sendDocumentVk,
   sendMessageVk,
+  sendPayloadVk,
   sendPhotoVk,
   sendTypingVk,
 } from "./send.js";
@@ -115,6 +116,21 @@ describe("sendMessageVk", () => {
 
     expect(mockMessagesSend).toHaveBeenCalledWith(
       expect.not.objectContaining({ reply_to: expect.anything() }),
+    );
+  });
+
+  it("forwards keyboard when buttons are provided", async () => {
+    mockMessagesSend.mockResolvedValueOnce(7);
+
+    await sendMessageVk("123", "menu", {
+      cfg,
+      buttons: [[{ text: "Browse providers", callback_data: "/models", style: "primary" }]],
+    });
+
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        keyboard: expect.any(String),
+      }),
     );
   });
 
@@ -300,5 +316,64 @@ describe("sendTypingVk", () => {
 
     // Should not throw
     await sendTypingVk("123", makeAccount());
+  });
+});
+
+describe("sendPayloadVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesSend.mockReset().mockResolvedValue(22);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("sends explicit vk buttons through sendMessageVk", async () => {
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "Select a provider:",
+        channelData: {
+          vk: {
+            buttons: [[{ text: "OpenAI", callback_data: "/models openai", style: "primary" }]],
+          },
+        },
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "22", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Select a provider:",
+        keyboard: expect.any(String),
+      }),
+    );
+  });
+
+  it("enriches parsed model text with keyboard buttons", async () => {
+    await sendPayloadVk(
+      "123",
+      {
+        text: [
+          "Providers:",
+          "- anthropic (2)",
+          "- openai (3)",
+          "",
+          "Use: /models <provider>",
+        ].join("\n"),
+      },
+      { cfg },
+    );
+
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        keyboard: expect.any(String),
+      }),
+    );
+  });
+
+  it("returns null when payload has no text or media", async () => {
+    const result = await sendPayloadVk("123", { text: "   " }, { cfg });
+    expect(result).toBeNull();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
   });
 });

@@ -101,6 +101,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       text,
       timestamp: Date.now(),
       isGroup,
+      messagePayload: context.messagePayload,
     };
 
     core.channel.activity.record({

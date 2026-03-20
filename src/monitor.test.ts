@@ -118,6 +118,7 @@ function makeCtx(overrides: Record<string, unknown> = {}): Record<string, unknow
     peerId: 555_000,
     senderId: 555_000,
     text: "hello",
+    messagePayload: undefined,
     isOutbox: false,
     ...overrides,
   };
@@ -240,7 +241,13 @@ describe("message_new handler", () => {
     await flush();
 
     await getMessageHandler()(
-      makeCtx({ id: 99, peerId: 123_456, senderId: 555_000, text: "hi" }),
+      makeCtx({
+        id: 99,
+        peerId: 123_456,
+        senderId: 555_000,
+        text: "hi",
+        messagePayload: { oc: "/models anthropic" },
+      }),
     );
 
     expect(mockHandleVkInbound).toHaveBeenCalledOnce();
@@ -251,6 +258,7 @@ describe("message_new handler", () => {
       senderId: 555_000,
       text: "hi",
       isGroup: false,
+      messagePayload: { oc: "/models anthropic" },
     });
   });
 

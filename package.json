@@ -38,6 +38,7 @@
     "src/channel.ts",
     "src/config-schema.ts",
     "src/inbound.ts",
+    "src/keyboard.ts",
     "src/monitor.ts",
     "src/probe.ts",
     "src/runtime.ts",
