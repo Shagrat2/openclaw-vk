@@ -84,9 +84,11 @@ vi.mock("openclaw/plugin-sdk/channel-runtime", () => ({
 const mockSendPayloadVk = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ messageId: "1", chatId: "0" }),
 );
+const mockMarkMessageReadVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockSendTypingVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock("./send.js", () => ({
+  markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
 }));
@@ -134,6 +136,7 @@ function getDispatchCall(runtime: ReturnType<typeof makeVkRuntime>) {
 }
 
 beforeEach(() => {
+  mockMarkMessageReadVk.mockReset().mockResolvedValue(undefined);
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendTypingVk.mockReset().mockResolvedValue(undefined);
   PREFIX_OPTIONS.responsePrefixContextProvider.mockReset().mockReturnValue({});
@@ -167,6 +170,7 @@ describe("empty message body", () => {
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
     expect(mockCreateTypingCallbacks).not.toHaveBeenCalled();
+    expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
     expect(mockSendPayloadVk).not.toHaveBeenCalled();
   });
 
@@ -184,6 +188,7 @@ describe("empty message body", () => {
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
     expect(mockCreateTypingCallbacks).not.toHaveBeenCalled();
+    expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
   });
 });
 
@@ -204,6 +209,7 @@ describe("DM access control", () => {
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
     expect(mockCreateTypingCallbacks).not.toHaveBeenCalled();
+    expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
   });
 
   it("dispatches DM when dmPolicy=open", async () => {
@@ -261,6 +267,7 @@ describe("DM access control", () => {
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
     expect(mockSendPayloadVk).not.toHaveBeenCalled();
+    expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
   });
 
   it("issues pairing challenge to unknown sender when dmPolicy=pairing", async () => {
@@ -293,6 +300,7 @@ describe("DM access control", () => {
       { accountId: "default" },
     );
     expect(mockCreateTypingCallbacks).not.toHaveBeenCalled();
+    expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
     expect(mockSendTypingVk).not.toHaveBeenCalled();
   });
 
@@ -313,7 +321,48 @@ describe("DM access control", () => {
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
+    expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
     expect(mockSendPayloadVk).not.toHaveBeenCalled();
+  });
+
+  it("dispatches DM when allowFrom contains wildcard '*'", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: 999_999, peerId: 999_999 }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "allowlist",
+          allowFrom: ["*"],
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+  });
+
+  it("dispatches DM when sender matches via vk: prefix in allowFrom", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "allowlist",
+          allowFrom: [`vk:${SENDER_ID}`],
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
   });
 
   it("dispatches DM when sender is in the pairing store", async () => {
@@ -427,6 +476,61 @@ describe("group access control", () => {
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
+  });
+
+  it("drops group message when the group is explicitly disabled", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groups: {
+            [String(GROUP_PEER_ID)]: { enabled: false },
+          },
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).not.toHaveBeenCalled();
+  });
+
+  it("uses per-group allowFrom override instead of the account-wide group allowlist", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "allowlist",
+          groupAllowFrom: [999_999],
+          groups: {
+            [String(GROUP_PEER_ID)]: { allowFrom: [SENDER_ID] },
+          },
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
   });
 });
 
@@ -571,13 +675,14 @@ describe("dispatch payload", () => {
 
     expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
       expect.objectContaining({
-        RawBody: "/models openai",
+        RawBody: "OpenAI",
+        BodyForAgent: "/models openai",
         CommandBody: "/models openai",
       }),
     );
   });
 
-  it("passes typing callbacks into reply dispatch and start() sends typing", async () => {
+  it("starts typing before dispatch and passes callbacks into reply dispatch", async () => {
     const runtime = installRuntime();
 
     await handleVkInbound({
@@ -596,12 +701,37 @@ describe("dispatch payload", () => {
 
     const dispatchCall = getDispatchCall(runtime);
     expect(dispatchCall.dispatcherOptions.typingCallbacks).toBeDefined();
-
-    await dispatchCall.dispatcherOptions.typingCallbacks.onReplyStart();
+    expect(dispatchCall.dispatcherOptions.onReplyStart).toBeDefined();
 
     expect(mockSendTypingVk).toHaveBeenCalledWith(
       String(SENDER_ID),
       expect.objectContaining({ accountId: "default" }),
+    );
+  });
+
+  it("marks the inbound message as read before dispatching", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        messageId: "77",
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockMarkMessageReadVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      "77",
+      expect.objectContaining({ accountId: "default" }),
+    );
+
+    expect(mockMarkMessageReadVk.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mock
+        .invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
     );
   });
 
@@ -640,6 +770,333 @@ describe("dispatch payload", () => {
         },
       },
       { accountId: "default" },
+    );
+  });
+
+  it("clears the old keyboard after a button-triggered final reply with no new choices", async () => {
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          {
+            text: "Thinking level set to high.",
+          },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "high",
+        messagePayload: { oc: "/think high" },
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      {
+        text: "Thinking level set to high.",
+      },
+      { accountId: "default", clearKeyboard: true },
+    );
+  });
+
+  it("keeps the keyboard when a button-triggered final reply still has choices", async () => {
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          {
+            text: [
+              "Current thinking level: high.",
+              "Options: off, minimal, low, medium, high, adaptive.",
+            ].join("\n"),
+          },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "high",
+        messagePayload: { oc: "/think high" },
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      {
+        text: [
+          "Current thinking level: high.",
+          "Options: off, minimal, low, medium, high, adaptive.",
+        ].join("\n"),
+      },
+      { accountId: "default" },
+    );
+  });
+
+  it("dispatches attachment-only messages with media placeholders and media context", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          {
+            type: "photo",
+            kind: "image",
+            url: "https://example.com/photo.png",
+            title: "photo.png",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: "<media:image>",
+        RawBody: "<media:image>",
+        MediaUrl: "https://example.com/photo.png",
+        MediaUrls: ["https://example.com/photo.png"],
+        MediaType: "image",
+        MediaTypes: ["image"],
+      }),
+    );
+  });
+
+  it("prefers attachment mime types in MediaType/MediaTypes when available", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          {
+            type: "doc",
+            kind: "image",
+            url: "https://example.com/phone-photo",
+            mimeType: "image/heic",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: "<media:image>",
+        RawBody: "<media:image>",
+        MediaUrl: "https://example.com/phone-photo",
+        MediaUrls: ["https://example.com/phone-photo"],
+        MediaType: "image/heic",
+        MediaTypes: ["image/heic"],
+      }),
+    );
+  });
+
+  it("adds MediaPath and MediaPaths when inbound media is materialized locally", async () => {
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.media.fetchRemoteMedia).mockResolvedValueOnce({
+      buffer: Buffer.from("heic"),
+      contentType: "image/heic",
+    } as Awaited<ReturnType<typeof runtime.channel.media.fetchRemoteMedia>>);
+    vi.mocked(runtime.channel.media.saveMediaBuffer).mockResolvedValueOnce({
+      path: "/tmp/openclaw/media/inbound/IMG_0001.HEIC",
+      contentType: "image/heic",
+      size: 4,
+      name: "IMG_0001.HEIC",
+    } as Awaited<ReturnType<typeof runtime.channel.media.saveMediaBuffer>>);
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          {
+            type: "doc",
+            kind: "image",
+            url: "https://example.com/phone-photo",
+            title: "IMG_0001.HEIC",
+            mimeType: "image/heic",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: "<media:image>",
+        RawBody: "<media:image>",
+        MediaPath: "/tmp/openclaw/media/inbound/IMG_0001.HEIC",
+        MediaPaths: ["/tmp/openclaw/media/inbound/IMG_0001.HEIC"],
+        MediaUrl: "https://example.com/phone-photo",
+        MediaUrls: ["https://example.com/phone-photo"],
+        MediaType: "image/heic",
+        MediaTypes: ["image/heic"],
+      }),
+    );
+  });
+
+  it("passes multiple image URLs in MediaUrls for multi-photo messages", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          { type: "photo", kind: "image", url: "https://example.com/1.jpg" },
+          { type: "photo", kind: "image", url: "https://example.com/2.jpg" },
+          { type: "photo", kind: "image", url: "https://example.com/3.jpg" },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        MediaUrl: "https://example.com/1.jpg",
+        MediaUrls: [
+          "https://example.com/1.jpg",
+          "https://example.com/2.jpg",
+          "https://example.com/3.jpg",
+        ],
+        MediaType: "image",
+        MediaTypes: ["image"],
+      }),
+    );
+  });
+
+  it("uses text as body when message has both text and attachments", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "Look at this photo",
+        attachments: [
+          { type: "photo", kind: "image", url: "https://example.com/photo.jpg" },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        RawBody: "Look at this photo",
+        BodyForAgent: "Look at this photo",
+        MediaUrl: "https://example.com/photo.jpg",
+        MediaUrls: ["https://example.com/photo.jpg"],
+        MediaType: "image",
+        MediaTypes: ["image"],
+      }),
+    );
+  });
+
+  it("passes mixed MediaTypes for messages with different attachment kinds", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          { type: "photo", kind: "image", url: "https://example.com/pic.jpg" },
+          { type: "doc", kind: "document", url: "https://example.com/file.pdf" },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        MediaUrl: "https://example.com/pic.jpg",
+        MediaUrls: ["https://example.com/pic.jpg", "https://example.com/file.pdf"],
+        MediaType: "image",
+        MediaTypes: ["image", "document"],
+      }),
+    );
+  });
+
+  it("omits MediaUrl and MediaUrls when message has no attachments", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "plain text",
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        MediaUrl: undefined,
+        MediaUrls: undefined,
+        MediaType: undefined,
+        MediaTypes: undefined,
+      }),
+    );
+  });
+
+  it("includes reply metadata in the inbound context", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        replyToMessageId: "77",
+        replyToText: "quoted reply",
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ReplyToId: "77",
+        ReplyToIdFull: "77",
+        ReplyToBody: "quoted reply",
+      }),
     );
   });
 
@@ -695,5 +1152,195 @@ describe("dispatch payload", () => {
       expect.objectContaining({ lastInboundAt: expect.any(Number) }),
     );
     expect(vi.mocked(runtime.channel.session.recordInboundSession)).toHaveBeenCalledOnce();
+    expect(vi.mocked(runtime.channel.session.recordInboundSession)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ctx: expect.objectContaining({
+          SessionKey: "vk:123456",
+        }),
+      }),
+    );
+  });
+
+  it("passes GroupSystemPrompt from per-group config", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groups: { [String(GROUP_PEER_ID)]: { systemPrompt: "Be concise." } },
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        GroupSystemPrompt: "Be concise.",
+      }),
+    );
+  });
+
+  it("passes WasMentioned=true when mention is detected in group", async () => {
+    const runtime = installRuntime({
+      buildMentionRegexes: vi.fn().mockReturnValue([/@bot/i]),
+      matchesMentionPatterns: vi.fn().mockReturnValue(true),
+    });
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "@bot hello",
+      }),
+      account: makeAccount({
+        config: { dmPolicy: "open", groupPolicy: "open" },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(vi.mocked(runtime.channel.reply.finalizeInboundContext)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        WasMentioned: true,
+      }),
+    );
+  });
+
+  it("tolerates markRead failure without blocking dispatch", async () => {
+    const runtime = installRuntime();
+    const runtimeEnv = createVkRuntimeEnv();
+    const logSpy = vi.spyOn(runtimeEnv, "log").mockImplementation(() => {});
+    mockMarkMessageReadVk.mockRejectedValueOnce(new Error("markRead failed"));
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: runtimeEnv,
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("mark read failed"),
+    );
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+  });
+
+  it("logs typing failures via logTypingFailure", async () => {
+    installRuntime();
+    mockSendTypingVk.mockRejectedValueOnce(new Error("typing error"));
+    mockCreateTypingCallbacks.mockReset().mockImplementation(({ start, onStartError }) => ({
+      onReplyStart: vi.fn(async () => {
+        try {
+          await start();
+        } catch (err) {
+          onStartError?.(err);
+        }
+      }),
+      onIdle: vi.fn(),
+      onCleanup: vi.fn(),
+    }));
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockLogTypingFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "vk",
+        target: String(SENDER_ID),
+      }),
+    );
+  });
+
+  it("logs pairing reply errors without crashing", async () => {
+    const runtimeEnv = createVkRuntimeEnv();
+    const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
+    mockSendPayloadVk.mockRejectedValueOnce(new Error("send failed"));
+
+    installRuntime({
+      upsertPairingRequest: vi.fn().mockResolvedValue({ code: "X", created: true }),
+    });
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "pairing", allowFrom: [] } }),
+      config: baseCfg(),
+      runtime: runtimeEnv,
+    });
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("pairing reply failed"),
+    );
+  });
+});
+
+// ── Command gating ──────────────────────────────────────────────────────────
+
+describe("command gating", () => {
+  it("drops group message when command gate blocks unauthorized control command", async () => {
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/compat");
+    vi.mocked(resolveControlCommandGate).mockReturnValueOnce({
+      shouldBlock: true,
+      commandAuthorized: false,
+    });
+
+    const runtime = installRuntime({ hasControlCommand: true });
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "/admin reset",
+      }),
+      account: makeAccount({
+        config: { dmPolicy: "open", groupPolicy: "open" },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).not.toHaveBeenCalled();
+  });
+
+  it("does not block DM messages even when command gate blocks", async () => {
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/compat");
+    vi.mocked(resolveControlCommandGate).mockReturnValueOnce({
+      shouldBlock: true,
+      commandAuthorized: false,
+    });
+
+    const runtime = installRuntime({ hasControlCommand: true });
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "/admin reset",
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
   });
 });

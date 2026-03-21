@@ -3,20 +3,11 @@
 ## Scope
 This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as a native OpenClaw plugin.
 
-## Current Launch Status (Verified)
-Verified on **March 18, 2026** (Europe/Moscow):
-
-- `pnpm test:extension vk` (run from OpenClaw repo root) passed:
-  - 4 test files
-  - 55 tests
-  - 0 failures
-- `pnpm openclaw plugins list` includes `@openclaw/vk` with plugin id `vk`.
-- `pnpm openclaw plugins inspect vk --json` confirms:
-  - `format: openclaw`
-  - `status: disabled` (expected for bundled plugins by default)
-  - `configSchema: true`
-
-This confirms the plugin is discoverable and its extension test suite is green in the current workspace.
+## Durability Rules
+- Keep this file focused on durable repository knowledge.
+- Do not store secrets, private infrastructure details, exact server addresses, user-specific absolute paths, temporary backup filenames, or one-off rollout outcomes here.
+- Do not pin exact package versions or test counts here unless the version itself is the point of the instruction.
+- Put machine-specific or environment-specific notes into `AGENTS.local.md` if needed; that file is gitignored and may not exist.
 
 ## Local Code Map
 - `index.ts`: channel plugin entry (`defineChannelPluginEntry`)
@@ -29,10 +20,13 @@ This confirms the plugin is discoverable and its extension test suite is green i
 - `src/setup-surface.ts`: setup UI/runtime bridge used by setup entry
 - `src/accounts.ts`: account resolution and normalization helpers
 - `src/runtime.ts`: runtime singleton access (`getVkRuntime` / `setVkRuntime`)
+- `src/channel-runtime-compat.ts`: fallback loader for `channel-runtime` helpers on older OpenClaw releases
 - `src/monitor.ts`: VK updates polling and inbound event bridge
 - `src/inbound.ts`: inbound normalization, policy checks, dispatch to OpenClaw runtime
 - `src/send.ts`: outbound messaging via VK API
 - `src/probe.ts`: token/bot probe via `groups.getById`
+- `src/media.ts`: inbound attachment extraction, outbound media loading (HTTP, data URL, local files)
+- `src/keyboard.ts`: VK keyboard/button building, text menu auto-parsing
 - `src/types.ts`: shared plugin runtime/config/message types
 
 ## Module Format
@@ -42,16 +36,19 @@ This confirms the plugin is discoverable and its extension test suite is green i
 - Converting to plain JS ESM is optional and usually only useful when you want to drop TS toolchain/tests.
 
 ## Minimal Runtime Smoke Check
-Run from OpenClaw monorepo root:
-1. `pnpm test:extension vk`
-2. `pnpm openclaw plugins inspect vk --json`
-3. `pnpm openclaw plugins enable vk` (if you need an enabled local run)
-4. `pnpm openclaw plugins list`
+Run from this repo root:
+1. `pnpm test`
+2. `pnpm run check:pack`
+
+Optional publish check:
+3. `npm publish --tag beta`
 
 Expected checkpoints:
 - tests stay green
-- inspect reports `format: openclaw` and `configSchema: true`
-- list shows `vk` as enabled after step 3
+- pack output includes `src/media.ts`, `src/channel-runtime-compat.ts`, and all runtime entrypoints
+
+Important:
+- inspecting a sibling OpenClaw checkout can tell you about the bundled VK extension there, not necessarily about this external plugin package. Do not treat that as proof that the package in this repo is valid.
 
 ## Telegram Reference Implementation
 Use the Telegram channel in the sibling extension as the primary style and architecture reference:
@@ -119,6 +116,30 @@ Collected from the requested links on **March 18, 2026**.
   - discovery/validation should be manifest-driven without executing plugin code
   - plugin shape and capability ownership are explicit and inspectable
 
+## Test Quality Guidelines (updated 2026-03-21)
+
+### Test trustworthiness — what to avoid
+Tests must verify **contracts and behavior**, not just confirm the current implementation works. After writing or modifying tests, audit them against these anti-patterns:
+
+1. **Tautological tests** — tests that only assert `typeof x === "function"` or `Array.isArray(result)` without checking content. These pass regardless of correctness. Either test concrete output or delete the test.
+
+2. **Pure delegation tests** — `expect(mockFn).toHaveBeenCalledWith(...)` against a fully-mocked dependency proves only that the call was made, not that the result is correct. Instead: verify that **specific arguments are correctly mapped** (e.g., `replyToId`, `forceDocument`, `accountId`) and that the **return value is shaped correctly**.
+
+3. **"No error thrown" assertions** — `primeVkGroupId("", 123)` with no assertions only proves the function didn't crash. Add a follow-up assertion that the state was NOT mutated (e.g., subsequent `sendTypingVk` call does NOT include the primed `group_id`).
+
+4. **`expect.any(String)` on structured data** — when testing keyboard/button JSON, parse the actual JSON and verify labels, payloads, or colors. `expect.any(String)` would pass even if the keyboard was completely wrong.
+
+### Test trustworthiness — what to do
+- **Test business rules with zero coverage** — e.g., GIF exclusion from image classification (`image/gif` → `document`), command aliases (`thinking` → `think`), wildcard `*` in allowlists, `vk:` prefix matching.
+- **Test all retry error codes** — not just one. The `isRetryableVkError` function recognizes codes 6, 9, 10 and regex patterns (`ECONNRESET`, `timeout`, `429`, `5xx`). Each should have a test.
+- **Test fallback/error paths** — `markRead` failure should not block dispatch; typing failure should be logged via `logTypingFailure`; pairing reply errors should be caught and logged.
+- **After every batch of new tests, run `npm run test:coverage`** and inspect the uncovered lines to find untested branches.
+
+### Test structure
+- Keep shared factories in `src/test-helpers.ts`
+- `src/test-helpers.ts` — shared factories: `createVkRuntimeEnv()`, `makeVkRuntime()`, `makeAccount()`, `makeMessage()`
+- Coverage: `@vitest/coverage-v8`, configured in `vitest.config.ts`, run via `npm run test:coverage`
+
 ## Testing Gotchas (discovered 2026-03-18)
 
 ### vk-io VK class mock — must use regular function, not arrow
@@ -153,13 +174,48 @@ global.fetch = vi.fn().mockImplementation((_url, opts) => new Promise((_, reject
 - `messages` scope only → `groups.getLongPollServer` throws → User LP (`vk.updates.startPolling()`)
 
 ### Test commands
+- Run all tests: `npm test`
+- Run with coverage: `npm run test:coverage`
+- Single file: `npx vitest run src/inbound.test.ts`
+- Watch mode: `npm run test:watch`
 - From monorepo root: `pnpm test -- extensions/vk`
-- Single file: `pnpm test -- extensions/vk/src/inbound.test.ts`
+
+## Deployment Notes
+
+### General rollout checklist
+- Verify the plugin package locally before publishing: `pnpm test`, `pnpm run check:pack`
+- After install on a target host, verify plugin load state with `openclaw plugins info vk --json`
+- Restart the gateway after rollout and verify the service status/logs from that host's service manager
+
+### Installer failure mode
+Older OpenClaw installations may fail or partially wedge config when repeatedly running `openclaw plugins install ... --pin`.
+
+### Manual recovery/install path
+If the CLI installer misbehaves:
+1. Remove the target plugin directory under the current OpenClaw data root
+2. Run `npm pack @openclaw-vk/vk@<version>` on the target host
+3. Extract the tarball into the plugin directory with `--strip-components=1`
+4. Run `npm install --omit=dev --ignore-scripts` inside the extracted plugin directory
+5. Restore the plugin config from the host's current backup or source-of-truth config
+6. Verify `openclaw plugins info vk --json`
+7. Restart the gateway
+
+### Manual install gotcha
+If you only unpack the tarball and skip `npm install --omit=dev --ignore-scripts`, the plugin will fail to load with:
+
+```text
+Error: Cannot find module 'zod'
+```
 
 ## Practical Rules For Future Changes
 - Keep VK plugin behavior aligned with OpenClaw channel policy patterns (pairing, allowlists, group policy).
 - Keep manifest/schema valid and minimal; never remove `configSchema` from `openclaw.plugin.json`.
 - Prefer Telegram extension behavior as the compatibility reference when implementing channel lifecycle changes.
+- Keep private rollout details in `AGENTS.local.md`, not here.
+- When adding new features, write tests that verify **behavior**, not just wiring. Run `npm run test:coverage` to check for uncovered branches.
+- After writing tests, audit them: would each test fail if the feature it covers was broken? If not, rewrite or remove the test.
 - Re-run these checks after edits:
-  1. `pnpm test:extension vk`
-  2. `pnpm openclaw plugins inspect vk`
+  1. `pnpm test` (all tests pass)
+  2. `pnpm run check:pack`
+  3. If publishing: `npm publish --tag beta`
+  4. If deploying: verify plugin load and restart the gateway on the target host

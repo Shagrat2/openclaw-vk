@@ -17,6 +17,11 @@ export type VkAccountConfig = {
       allowFrom?: Array<string | number>;
       requireMention?: boolean;
       systemPrompt?: string;
+      tools?: {
+        allow?: string[];
+        alsoAllow?: string[];
+        deny?: string[];
+      };
     }
   >;
 };
@@ -43,6 +48,8 @@ export type VkInboundMessage = {
   isGroup: boolean;
   messagePayload?: unknown;
   attachments?: VkInboundAttachment[];
+  replyToMessageId?: string;
+  replyToText?: string;
 };
 
 export type VkButtonStyle = "primary" | "secondary" | "success" | "danger";
@@ -57,8 +64,17 @@ export type VkReplyButtons = ReadonlyArray<ReadonlyArray<VkReplyButton>>;
 
 export type VkInboundAttachment = {
   type: string;
+  kind: string;
   url?: string;
   title?: string;
+  mimeType?: string;
+};
+
+export type VkInboundResolvedMedia = {
+  path?: string;
+  url: string;
+  contentType?: string;
+  attachment: VkInboundAttachment;
 };
 
 export type VkProbe = {

@@ -4,12 +4,22 @@ import { z } from "zod";
 const OPEN_DM_POLICY_ALLOW_FROM_ERROR =
   'channels.vk.dmPolicy="open" requires channels.vk.allowFrom to include "*"';
 
+const VkGroupToolPolicySchema = z
+  .object({
+    allow: z.array(z.string()).optional(),
+    alsoAllow: z.array(z.string()).optional(),
+    deny: z.array(z.string()).optional(),
+  })
+  .strict()
+  .optional();
+
 const VkGroupConfigSchema = z
   .object({
     enabled: z.boolean().optional(),
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     requireMention: z.boolean().optional(),
     systemPrompt: z.string().optional(),
+    tools: VkGroupToolPolicySchema,
   })
   .strict()
   .optional();

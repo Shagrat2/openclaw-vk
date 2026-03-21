@@ -132,6 +132,57 @@ describe("VkAccountSchema", () => {
     });
     expect(result.success).toBe(true);
   });
+
+  it("accepts groups with tools policy", () => {
+    const result = VkAccountSchema.safeParse({
+      groups: {
+        "2000000001": {
+          tools: {
+            allow: ["web_search"],
+            alsoAllow: ["calculator"],
+            deny: ["code_exec"],
+          },
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts groups with partial tools policy (only allow)", () => {
+    const result = VkAccountSchema.safeParse({
+      groups: {
+        "2000000001": { tools: { allow: ["web_search"] } },
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts groups with empty tools object", () => {
+    const result = VkAccountSchema.safeParse({
+      groups: {
+        "2000000001": { tools: {} },
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects unknown fields in tools policy (strict)", () => {
+    const result = VkAccountSchema.safeParse({
+      groups: {
+        "2000000001": { tools: { customField: true } },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects non-string arrays in tools policy", () => {
+    const result = VkAccountSchema.safeParse({
+      groups: {
+        "2000000001": { tools: { allow: [123] } },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 // ── VkConfigSchema ───────────────────────────────────────────────────────────

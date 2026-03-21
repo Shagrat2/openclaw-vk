@@ -23,8 +23,16 @@ import { VkConfigSchema } from "./config-schema.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
 import { getVkRuntime } from "./runtime.js";
-import { sendMessageVk, sendPayloadVk } from "./send.js";
-import type { CoreConfig, VkConfig } from "./types.js";
+import {
+  applyVkAllowlistConfigEdit,
+  isVkGroupPeerId,
+  readVkAllowlistConfig,
+  resolveVkDirectoryGroups,
+  resolveVkDirectoryPeers,
+  sendMessageVk,
+  sendPayloadVk,
+} from "./send.js";
+import type { CoreConfig, VkConfig, VkProbe } from "./types.js";
 
 const meta = {
   id: "vk",
@@ -46,6 +54,7 @@ const vkConfigAccessors = createScopedAccountConfigAccessors({
       .map((entry) => String(entry).trim())
       .filter(Boolean)
       .map((entry) => entry.replace(/^vk:(?:user:)?/i, "")),
+  resolveDefaultTo: (account: ResolvedVkAccount) => account.config.defaultTo,
 });
 
 const vkConfigBase = createScopedChannelConfigBase<ResolvedVkAccount, OpenClawConfig>({
@@ -65,7 +74,7 @@ const resolveVkDmPolicy = createScopedDmSecurityResolver<ResolvedVkAccount>({
   normalizeEntry: (raw) => raw.replace(/^vk:(?:user:)?/i, ""),
 });
 
-export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
+export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   id: "vk",
   meta: {
     ...meta,
@@ -81,6 +90,20 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
         cfg,
       });
     },
+  },
+  allowlist: {
+    supportsScope: ({ scope }) => scope === "dm" || scope === "group" || scope === "all",
+    readConfig: ({ cfg, accountId }) =>
+      readVkAllowlistConfig(resolveVkAccount({ cfg: cfg as CoreConfig, accountId })),
+    applyConfigEdit: ({ cfg, parsedConfig, accountId, scope, action, entry }) =>
+      applyVkAllowlistConfigEdit({
+        cfg: cfg as CoreConfig,
+        parsedConfig,
+        accountId,
+        scope,
+        action,
+        entry,
+      }),
   },
   capabilities: {
     chatTypes: ["direct", "group"],
@@ -133,6 +156,18 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
       const groupConfig = groups[groupId] ?? groups["*"];
       return groupConfig?.requireMention ?? false;
     },
+    resolveToolPolicy: ({ cfg, accountId, groupId }) => {
+      const account = resolveVkAccount({
+        cfg,
+        accountId: accountId ?? undefined,
+      });
+      const groups = account.config.groups;
+      if (!groups || !groupId) {
+        return undefined;
+      }
+      const groupConfig = groups[groupId] ?? groups["*"];
+      return groupConfig?.tools ?? undefined;
+    },
   },
   messaging: {
     normalizeTarget: (target) => {
@@ -141,6 +176,28 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
         return undefined;
       }
       return trimmed.replace(/^vk:(?:user:|chat:)?/i, "");
+    },
+    parseExplicitTarget: ({ raw }) => {
+      const normalized = raw.trim().replace(/^vk:(?:user:|chat:)?/i, "");
+      if (!normalized) {
+        return null;
+      }
+      const peerId = Number(normalized);
+      if (Number.isNaN(peerId)) {
+        return null;
+      }
+      return {
+        to: normalized,
+        chatType: isVkGroupPeerId(peerId) ? ("group" as const) : ("direct" as const),
+      };
+    },
+    inferTargetChatType: ({ to }) => {
+      const normalized = to.trim().replace(/^vk:(?:user:|chat:)?/i, "");
+      const peerId = Number(normalized);
+      if (Number.isNaN(peerId)) {
+        return undefined;
+      }
+      return isVkGroupPeerId(peerId) ? ("group" as const) : ("direct" as const);
     },
     targetResolver: {
       looksLikeId: (id) => {
@@ -155,36 +212,86 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
   },
   directory: {
     self: async () => null,
-    listPeers: async () => [],
-    listGroups: async () => [],
+    listPeers: async (params) =>
+      resolveVkDirectoryPeers({
+        account: resolveVkAccount({
+          cfg: ((params?.cfg as CoreConfig | undefined) ?? {}) as CoreConfig,
+          accountId: params?.accountId,
+        }),
+        query: params?.query,
+        limit: params?.limit,
+      }),
+    listGroups: async (params) =>
+      resolveVkDirectoryGroups({
+        account: resolveVkAccount({
+          cfg: ((params?.cfg as CoreConfig | undefined) ?? {}) as CoreConfig,
+          accountId: params?.accountId,
+        }),
+        query: params?.query,
+        limit: params?.limit,
+      }),
   },
   outbound: {
     deliveryMode: "direct",
     chunker: (text, limit) => getVkRuntime().channel.text.chunkMarkdownText(text, limit),
+    chunkerMode: "markdown",
     textChunkLimit: 4096,
-    sendPayload: async ({ to, payload, accountId, cfg }) => {
+    shouldSkipPlainTextSanitization: ({ payload }) => Boolean(payload.channelData),
+    resolveEffectiveTextChunkLimit: ({ fallbackLimit }) =>
+      typeof fallbackLimit === "number" ? Math.min(fallbackLimit, 4096) : 4096,
+    sendPayload: async ({ to, payload, accountId, cfg, mediaLocalRoots, replyToId, forceDocument }) => {
       const result = await sendPayloadVk(to, payload, {
         cfg,
         accountId: accountId ?? undefined,
+        mediaLocalRoots,
+        replyTo: replyToId ?? undefined,
+        forceDocument: forceDocument ?? undefined,
       });
       return result
         ? { channel: "vk", ...result }
         : { channel: "vk", messageId: "", chatId: to };
     },
-    sendText: async ({ cfg, to, text, accountId }) => {
-      const result = await sendMessageVk(to, text, {
-        cfg,
-        accountId: accountId ?? undefined,
-      });
+    sendText: async ({ cfg, to, text, accountId, replyToId }) => {
+      const result =
+        (await sendPayloadVk(
+          to,
+          {
+            text,
+            replyToId: replyToId ?? undefined,
+          },
+          {
+            cfg,
+            accountId: accountId ?? undefined,
+          },
+        )) ??
+        (await sendMessageVk(to, text, {
+          cfg,
+          accountId: accountId ?? undefined,
+          replyTo: replyToId ?? undefined,
+        }));
       return { channel: "vk", ...result };
     },
-    sendMedia: async ({ cfg, to, text, mediaUrl, accountId }) => {
-      // For media, send as text with URL (VK doesn't support direct URL attachments easily)
-      const combined = mediaUrl ? (text ? `${text}\n${mediaUrl}` : mediaUrl) : text;
-      const result = await sendMessageVk(to, combined, {
-        cfg,
-        accountId: accountId ?? undefined,
-      });
+    sendMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, replyToId, forceDocument }) => {
+      const result =
+        (await sendPayloadVk(
+          to,
+          {
+            text,
+            mediaUrl,
+            replyToId: replyToId ?? undefined,
+          },
+          {
+            cfg,
+            accountId: accountId ?? undefined,
+            mediaLocalRoots,
+            forceDocument: forceDocument ?? undefined,
+          },
+        )) ??
+        (await sendMessageVk(to, text, {
+          cfg,
+          accountId: accountId ?? undefined,
+          replyTo: replyToId ?? undefined,
+        }));
       return { channel: "vk", ...result };
     },
   },
@@ -212,6 +319,19 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount> = {
       return issues;
     },
     buildChannelSummary: ({ snapshot }) => buildTokenChannelStatusSummary(snapshot),
+    formatCapabilitiesProbe: ({ probe }) => {
+      const lines: Array<{ text: string }> = [];
+      if (probe?.ok) {
+        if (probe.groupName) {
+          const groupId = probe.groupId ? ` (${probe.groupId})` : "";
+          lines.push({ text: `Group: ${probe.groupName}${groupId}` });
+        }
+        if (probe.screenName) {
+          lines.push({ text: `Screen name: ${probe.screenName}` });
+        }
+      }
+      return lines;
+    },
     probeAccount: async ({ account, timeoutMs }) => probeVkBot(account.token, timeoutMs),
     buildAccountSnapshot: ({ account, runtime, probe }) => {
       const configured = Boolean(account.token?.trim());

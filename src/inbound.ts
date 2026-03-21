@@ -12,14 +12,19 @@ import {
   type OpenClawConfig,
   type RuntimeEnv,
 } from "openclaw/plugin-sdk/compat";
+import { loadChannelRuntimeCompat } from "./channel-runtime-compat.js";
+import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
-  createReplyPrefixOptions,
-  createTypingCallbacks,
-  logTypingFailure,
-} from "openclaw/plugin-sdk/channel-runtime";
-import { resolveVkCommandFromPayload } from "./keyboard.js";
+  resolveVkInboundBodyText,
+  resolveVkInboundResolvedMedia,
+  resolveVkInboundResolvedMediaPaths,
+  resolveVkInboundResolvedMediaTypes,
+  resolveVkInboundResolvedMediaUrls,
+  resolveVkInboundMediaTypes,
+  resolveVkInboundMediaUrls,
+} from "./media.js";
 import { getVkRuntime } from "./runtime.js";
-import { sendPayloadVk, sendTypingVk } from "./send.js";
+import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -67,9 +72,11 @@ async function deliverVkReply(params: {
   peerId: number;
   accountId: string;
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
+  clearKeyboard?: boolean;
 }) {
   const result = await sendPayloadVk(String(params.peerId), params.payload, {
     accountId: params.accountId,
+    clearKeyboard: params.clearKeyboard,
   });
   if (!result) {
     return;
@@ -92,7 +99,12 @@ export async function handleVkInbound(params: {
     accountId: account.accountId,
   });
 
-  const rawBody = resolveVkCommandFromPayload(message.messagePayload) ?? message.text?.trim() ?? "";
+  const payloadCommand = resolveVkCommandFromPayload(message.messagePayload);
+  const visibleBody = resolveVkInboundBodyText({
+    text: message.text,
+    attachments: message.attachments,
+  });
+  const rawBody = payloadCommand ?? visibleBody;
   if (!rawBody) {
     return;
   }
@@ -101,6 +113,9 @@ export async function handleVkInbound(params: {
 
   const senderDisplay = String(message.senderId);
   const isGroup = message.isGroup;
+  const groupConfig = isGroup
+    ? (account.config.groups?.[String(message.peerId)] ?? account.config.groups?.["*"])
+    : undefined;
 
   const dmPolicy = account.config.dmPolicy ?? "pairing";
   const defaultGroupPolicy = resolveDefaultGroupPolicy(config as OpenClawConfig);
@@ -135,9 +150,18 @@ export async function handleVkInbound(params: {
     dmPolicy,
     groupAllowFromFallbackToAllowFrom: false,
   });
+  const groupAllowOverride =
+    groupConfig && Object.hasOwn(groupConfig, "allowFrom")
+      ? normalizeVkAllowlist(groupConfig.allowFrom)
+      : undefined;
+  const effectiveGroupSenderAllowFrom = groupAllowOverride ?? effectiveGroupAllowFrom;
 
   // Group access check
   if (isGroup) {
+    if (groupConfig?.enabled === false) {
+      runtime.log?.(`vk: drop group peerId=${message.peerId} (group disabled by config)`);
+      return;
+    }
     if (groupPolicy === "disabled") {
       runtime.log?.(`vk: drop group peerId=${message.peerId} (groupPolicy=${groupPolicy})`);
       return;
@@ -148,7 +172,7 @@ export async function handleVkInbound(params: {
   if (isGroup) {
     if (groupPolicy === "allowlist") {
       const senderAllowed = resolveVkAllowlistMatch({
-        allowFrom: effectiveGroupAllowFrom,
+        allowFrom: effectiveGroupSenderAllowFrom,
         senderId: message.senderId,
       });
       if (!senderAllowed.allowed) {
@@ -204,7 +228,7 @@ export async function handleVkInbound(params: {
         | undefined) !== false
     : true;
   const senderAllowedForCommands = resolveVkAllowlistMatch({
-    allowFrom: isGroup ? effectiveGroupAllowFrom : effectiveAllowFrom,
+    allowFrom: isGroup ? effectiveGroupSenderAllowFrom : effectiveAllowFrom,
     senderId: message.senderId,
   }).allowed;
   const hasControlCommand = core.channel.text.hasControlCommand(rawBody, config as OpenClawConfig);
@@ -233,10 +257,6 @@ export async function handleVkInbound(params: {
   // Mention check for group chats
   const mentionRegexes = core.channel.mentions.buildMentionRegexes(config as OpenClawConfig);
   const wasMentioned = core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes);
-
-  const groupConfig = isGroup
-    ? (account.config.groups?.[String(message.peerId)] ?? account.config.groups?.["*"])
-    : undefined;
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
   if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
@@ -278,10 +298,23 @@ export async function handleVkInbound(params: {
   });
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
+  const resolvedMedia = await resolveVkInboundResolvedMedia({
+    attachments: message.attachments,
+    mediaRuntime: core.channel.media,
+    logError: (line) => runtime.log?.(line),
+  });
+  const mediaPaths = resolveVkInboundResolvedMediaPaths(resolvedMedia);
+  const downloadedMediaUrls = resolveVkInboundResolvedMediaUrls(resolvedMedia);
+  const downloadedMediaTypes = resolveVkInboundResolvedMediaTypes(resolvedMedia);
+  const mediaUrls =
+    mediaPaths.length > 0 ? downloadedMediaUrls : resolveVkInboundMediaUrls(message.attachments);
+  const mediaTypes =
+    mediaPaths.length > 0 ? downloadedMediaTypes : resolveVkInboundMediaTypes(message.attachments);
 
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
-    RawBody: rawBody,
+    BodyForAgent: rawBody,
+    RawBody: visibleBody || rawBody,
     CommandBody: rawBody,
     From: fromLabel,
     To: `vk:${peerId}`,
@@ -301,11 +334,22 @@ export async function handleVkInbound(params: {
     OriginatingChannel: CHANNEL_ID,
     OriginatingTo: `vk:${peerId}`,
     CommandAuthorized: commandGate.commandAuthorized,
+    MediaPath: mediaPaths[0],
+    MediaUrl: mediaUrls[0],
+    MediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
+    MediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
+    MediaType: mediaTypes[0],
+    MediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
+    ReplyToId: message.replyToMessageId,
+    ReplyToIdFull: message.replyToMessageId,
+    ReplyToBody: message.replyToText,
   });
 
   const onDispatchError = (err: unknown, info: { kind: string }) => {
     runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
   };
+  const { createReplyPrefixOptions, createTypingCallbacks, logTypingFailure } =
+    await loadChannelRuntimeCompat();
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
       await sendTypingVk(String(message.peerId), account);
@@ -319,6 +363,14 @@ export async function handleVkInbound(params: {
       });
     },
   });
+  let typingStarted = false;
+  const startTypingOnce = async () => {
+    if (typingStarted) {
+      return;
+    }
+    typingStarted = true;
+    await typingCallbacks.onReplyStart();
+  };
   const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
     cfg: config as OpenClawConfig,
     agentId: route.agentId,
@@ -328,29 +380,43 @@ export async function handleVkInbound(params: {
 
   await core.channel.session.recordInboundSession({
     storePath,
-    ctxPayload,
+    ctx: ctxPayload,
     sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
     onRecordError: (err) => {
       runtime.error?.(`vk: failed updating session meta: ${String(err)}`);
     },
   });
 
+  try {
+    await markMessageReadVk(String(message.peerId), message.messageId, account);
+  } catch (err) {
+    runtime.log?.(
+      `vk: mark read failed for peerId=${message.peerId} messageId=${message.messageId}: ${String(err)}`,
+    );
+  }
+
+  await startTypingOnce();
+
   await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: config as OpenClawConfig,
     dispatcherOptions: {
       ...prefixOptions,
+      onReplyStart: startTypingOnce,
       typingCallbacks,
-      deliver: async (payload: unknown) => {
+      deliver: async (payload: unknown, info?: { kind?: string }) => {
         const normalized =
           payload && typeof payload === "object" && !Array.isArray(payload)
             ? (payload as VkDispatchPayload)
             : {};
+        const resolvedButtons = resolveVkButtonsFromPayload(normalized);
         await deliverVkReply({
           payload: normalized,
           peerId: message.peerId,
           accountId: account.accountId,
           statusSink,
+          clearKeyboard:
+            payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
         });
       },
       onError: onDispatchError,

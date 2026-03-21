@@ -5,6 +5,12 @@ const MAX_BUTTONS_PER_ROW = 4;
 const MAX_BUTTON_LABEL_CHARS = 40;
 const MAX_PAYLOAD_BYTES = 255;
 const OPENCLAW_COMMAND_KEY = "oc";
+const ROW_LABEL_WIDTH_LIMITS = {
+  1: 40,
+  2: 22,
+  3: 14,
+  4: 9,
+} as const;
 
 type VkKeyboardPayload = {
   [OPENCLAW_COMMAND_KEY]?: string;
@@ -23,7 +29,24 @@ type VkKeyboardMenu =
   | { kind: "providers"; buttons: VkReplyButtons }
   | { kind: "models"; buttons: VkReplyButtons }
   | { kind: "summary"; buttons: VkReplyButtons }
+  | { kind: "command-options"; buttons: VkReplyButtons }
   | null;
+
+const COMMAND_DESCRIPTOR_ALIASES: Record<string, string> = {
+  thinking: "think",
+};
+
+const COMMAND_DESCRIPTOR_STOPWORDS = new Set([
+  "access",
+  "current",
+  "level",
+  "mode",
+  "permission",
+  "permissions",
+  "setting",
+  "state",
+  "status",
+]);
 
 function truncateLabel(text: string): string {
   const normalized = text.trim();
@@ -51,6 +74,35 @@ function serializeCommandPayload(command: string): string | null {
   }
   const json = JSON.stringify({ [OPENCLAW_COMMAND_KEY]: trimmed } satisfies VkKeyboardPayload);
   return Buffer.byteLength(json, "utf8") <= MAX_PAYLOAD_BYTES ? json : null;
+}
+
+function estimateLabelWidth(text: string): number {
+  let width = 0;
+  for (const char of Array.from(truncateLabel(text))) {
+    if (/\s/u.test(char)) {
+      width += 0.5;
+      continue;
+    }
+    if (/[-_/\\|.,:;()[\]{}]/u.test(char)) {
+      width += 0.75;
+      continue;
+    }
+    if (/[\u0000-\u007f]/u.test(char)) {
+      width += 1;
+      continue;
+    }
+    width += 2;
+  }
+  return width;
+}
+
+function canFitRow(items: ReadonlyArray<{ text: string }>): boolean {
+  const rowSize = items.length;
+  if (rowSize < 1 || rowSize > MAX_BUTTONS_PER_ROW) {
+    return false;
+  }
+  const maxLabelWidth = ROW_LABEL_WIDTH_LIMITS[rowSize as keyof typeof ROW_LABEL_WIDTH_LIMITS];
+  return items.every((item) => estimateLabelWidth(item.text) <= maxLabelWidth);
 }
 
 function normalizeButton(raw: unknown): VkReplyButton | undefined {
@@ -100,34 +152,44 @@ export function normalizeVkButtons(raw: unknown): VkReplyButtons | undefined {
 
 function buildButtonRows(params: {
   items: ReadonlyArray<{ text: string; command: string; style?: VkReplyButton["style"] }>;
-  rowSize: number;
 }): VkReplyButtons | undefined {
   const rows: VkReplyButton[][] = [];
-  const rowSize = Math.max(1, Math.min(MAX_BUTTONS_PER_ROW, Math.floor(params.rowSize)));
+  let currentRow: VkReplyButton[] = [];
 
-  for (let index = 0; index < params.items.length && rows.length < MAX_KEYBOARD_ROWS; index += rowSize) {
-    const slice = params.items.slice(index, index + rowSize);
-    const row = slice
-      .map((item) => {
-        const text = item.text.trim();
-        const command = item.command.trim();
-        if (!text || !command) {
-          return undefined;
-        }
-        if (!serializeCommandPayload(command)) {
-          return undefined;
-        }
-        return {
-          text,
-          callback_data: command,
-          style: item.style,
-        } satisfies VkReplyButton;
-      })
-      .filter((item): item is VkReplyButton => Boolean(item));
-
-    if (row.length > 0) {
-      rows.push(row);
+  for (const item of params.items) {
+    if (rows.length >= MAX_KEYBOARD_ROWS) {
+      break;
     }
+
+    const text = item.text.trim();
+    const command = item.command.trim();
+    if (!text || !command || !serializeCommandPayload(command)) {
+      continue;
+    }
+
+    const button = {
+      text,
+      callback_data: command,
+      style: item.style,
+    } satisfies VkReplyButton;
+
+    if (currentRow.length === 0) {
+      currentRow = [button];
+      continue;
+    }
+
+    const candidateRow = [...currentRow, button];
+    if (canFitRow(candidateRow)) {
+      currentRow = candidateRow;
+      continue;
+    }
+
+    rows.push(currentRow);
+    currentRow = [button];
+  }
+
+  if (currentRow.length > 0 && rows.length < MAX_KEYBOARD_ROWS) {
+    rows.push(currentRow);
   }
 
   return rows.length > 0 ? rows : undefined;
@@ -152,7 +214,6 @@ function parseProviderButtons(text: string): VkKeyboardMenu {
       command: `/models ${provider}`,
       style: "primary",
     })),
-    rowSize: 4,
   });
 
   return buttons ? { kind: "providers", buttons } : null;
@@ -181,7 +242,7 @@ function parseModelsButtons(text: string): VkKeyboardMenu {
     style: "primary" as const,
   }));
 
-  const buttons = buildButtonRows({ items, rowSize: 4 });
+  const buttons = buildButtonRows({ items });
   if (!buttons) {
     return null;
   }
@@ -225,10 +286,67 @@ function parseBrowseSummaryButton(text: string): VkKeyboardMenu {
 
   const buttons = buildButtonRows({
     items: [{ text: "Browse providers", command: "/models", style: "primary" }],
-    rowSize: 1,
   });
 
   return buttons ? { kind: "summary", buttons } : null;
+}
+
+function parseCurrentCommandOptions(text: string): VkKeyboardMenu {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const currentLine = lines.find((line) => line.includes("Current "));
+  const optionsLine = lines.find((line) => line.startsWith("Options: "));
+  if (!currentLine || !optionsLine) {
+    return null;
+  }
+
+  const explicitCommands = Array.from(
+    new Set(
+      [...text.matchAll(/\/([a-z][a-z0-9-]*)\b/gi)]
+        .map((match) => match[1]?.trim().toLowerCase())
+        .filter((entry): entry is string => Boolean(entry)),
+    ),
+  );
+  let resolvedCommand =
+    explicitCommands.length === 1 ? `/${explicitCommands[0]}` : undefined;
+  if (!resolvedCommand) {
+    const descriptor = currentLine.match(/Current\s+([^:]+):/i)?.[1]?.toLowerCase() ?? "";
+    const descriptorTokens = descriptor
+      .split(/[\s/(),.-]+/)
+      .map((token) => token.trim())
+      .filter((token) => token && !COMMAND_DESCRIPTOR_STOPWORDS.has(token));
+    const commandToken = descriptorTokens[0];
+    if (commandToken) {
+      resolvedCommand = `/${COMMAND_DESCRIPTOR_ALIASES[commandToken] ?? commandToken}`;
+    }
+  }
+  if (!resolvedCommand) {
+    return null;
+  }
+
+  const currentMatch = currentLine.match(/Current [^:]+:\s*([^.]+)\./i);
+  const currentValue = currentMatch?.[1]?.trim().split(/\s+/, 1)[0]?.toLowerCase();
+  const rawOptions = optionsLine.replace(/^Options:\s*/i, "").replace(/\.$/, "");
+  const options = rawOptions
+    .split(",")
+    .map((option) => option.trim())
+    .filter(Boolean);
+  if (options.length === 0) {
+    return null;
+  }
+
+  const buttons = buildButtonRows({
+    items: options.map((option) => ({
+      text: option,
+      command: `${resolvedCommand} ${option}`,
+      style: option.toLowerCase() === currentValue ? "success" : "secondary",
+    })),
+  });
+
+  return buttons ? { kind: "command-options", buttons } : null;
 }
 
 export function buildVkButtonsFromTextMenu(text: string): VkReplyButtons | undefined {
@@ -240,7 +358,8 @@ export function buildVkButtonsFromTextMenu(text: string): VkReplyButtons | undef
   const parsed =
     parseModelsButtons(normalized) ??
     parseProviderButtons(normalized) ??
-    parseBrowseSummaryButton(normalized);
+    parseBrowseSummaryButton(normalized) ??
+    parseCurrentCommandOptions(normalized);
 
   return parsed?.buttons;
 }
@@ -280,6 +399,13 @@ export function buildVkKeyboard(buttons?: VkReplyButtons): string | undefined {
   return JSON.stringify({
     one_time: true,
     buttons: keyboardButtons,
+  });
+}
+
+export function buildVkKeyboardRemoval(): string {
+  return JSON.stringify({
+    one_time: false,
+    buttons: [],
   });
 }
 

@@ -2,7 +2,12 @@ import type { RuntimeEnv } from "openclaw/plugin-sdk/compat";
 import { VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound } from "./inbound.js";
+import {
+  extractVkInboundAttachments,
+  resolveVkInboundReplyContext,
+} from "./media.js";
 import { getVkRuntime } from "./runtime.js";
+import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
 export type VkMonitorOptions = {
@@ -24,9 +29,13 @@ async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: numb
     if (!groupId) {
       return { ok: false };
     }
-    // Verify the token can actually start Bots LP
-    await vk.api.groups.getLongPollServer({ group_id: groupId });
-    return { ok: true, groupId };
+    try {
+      // Verify the token can actually start Bots LP
+      await vk.api.groups.getLongPollServer({ group_id: groupId });
+      return { ok: true, groupId };
+    } catch {
+      return { ok: false, groupId };
+    }
   } catch {
     return { ok: false };
   }
@@ -93,15 +102,24 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     const senderId = context.senderId;
     const text = context.text ?? "";
     const isGroup = peerId >= 2_000_000_000;
+    const attachments = extractVkInboundAttachments(context.attachments);
+    const replyContext = resolveVkInboundReplyContext(context.replyMessage);
+    const createdAtSeconds =
+      typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
+        ? context.createdAt
+        : undefined;
 
     const message: VkInboundMessage = {
       messageId: String(context.id),
       peerId,
       senderId,
       text,
-      timestamp: Date.now(),
+      timestamp: createdAtSeconds ? createdAtSeconds * 1000 : Date.now(),
       isGroup,
       messagePayload: context.messagePayload,
+      attachments,
+      replyToMessageId: replyContext.replyToMessageId,
+      replyToText: replyContext.replyToText,
     };
 
     core.channel.activity.record({
@@ -133,6 +151,9 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   try {
     // Detect whether Bots LP is available; fall back to User LP otherwise
     const botsLp = await canUseBotsLongPoll(vk);
+    if (botsLp.groupId !== undefined) {
+      primeVkGroupId(opts.token, botsLp.groupId);
+    }
     if (botsLp.ok && botsLp.groupId !== undefined) {
       opts.runtime.log?.(`[${opts.accountId}] using Bots Long Poll (group ${botsLp.groupId})`);
       await vk.updates.start();

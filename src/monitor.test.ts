@@ -72,6 +72,9 @@ const mockHandleVkInbound = vi.hoisted(() =>
 );
 vi.mock("./inbound.js", () => ({ handleVkInbound: mockHandleVkInbound }));
 
+const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
+vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function baseCfg(): CoreConfig {
@@ -119,6 +122,7 @@ function makeCtx(overrides: Record<string, unknown> = {}): Record<string, unknow
     senderId: 555_000,
     text: "hello",
     messagePayload: undefined,
+    createdAt: 1_700_000_000,
     isOutbox: false,
     ...overrides,
   };
@@ -140,6 +144,7 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({ server: "lp.vk.com", key: "abc", ts: 1 });
   mockHandleVkInbound.mockReset().mockResolvedValue(undefined);
+  mockPrimeVkGroupId.mockReset();
   setVkRuntime(makeVkRuntime());
 });
 
@@ -159,6 +164,7 @@ describe("Long Poll mode selection", () => {
     await flush();
 
     expect(mockGroupsGetById).toHaveBeenCalled();
+    expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678);
     expect(mockGroupsGetLongPollServer).toHaveBeenCalledWith({
       group_id: 12345678,
     });
@@ -174,6 +180,7 @@ describe("Long Poll mode selection", () => {
     activeMonitor = startMonitor();
     await flush();
 
+    expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678);
     expect(mockUpdatesStart).not.toHaveBeenCalled();
     expect(mockUpdatesStartPolling).toHaveBeenCalledOnce();
   });
@@ -259,7 +266,75 @@ describe("message_new handler", () => {
       text: "hi",
       isGroup: false,
       messagePayload: { oc: "/models anthropic" },
+      timestamp: 1_700_000_000_000,
     });
+  });
+
+  it("propagates attachments, reply context, and VK timestamps", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(
+      makeCtx({
+        id: 100,
+        createdAt: 1_700_000_123,
+        attachments: [{ type: "photo", largeSizeUrl: "https://example.com/photo.png" }],
+        replyMessage: { id: 7, text: "quoted" },
+      }),
+    );
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message).toMatchObject({
+      timestamp: 1_700_000_123_000,
+      attachments: [
+        {
+          type: "photo",
+          kind: "image",
+          url: "https://example.com/photo.png",
+        },
+      ],
+      replyToMessageId: "7",
+      replyToText: "quoted",
+    });
+  });
+
+  it("normalizes vk-io style document image attachments from preview photos", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(
+      makeCtx({
+        attachments: [
+          {
+            get type() {
+              return "doc";
+            },
+            get isImage() {
+              return true;
+            },
+            get ext() {
+              return "heic";
+            },
+            get preview() {
+              return {
+                photo: [{ url: "https://example.com/phone-photo-preview" }],
+              };
+            },
+          },
+        ],
+      }),
+    );
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.attachments).toEqual([
+      {
+        type: "doc",
+        kind: "image",
+        url: "https://example.com/phone-photo-preview",
+        title: undefined,
+        mimeType: "image/heic",
+      },
+    ]);
   });
 
   it("sets isGroup=true for group chat peer IDs (>= 2_000_000_000)", async () => {
@@ -333,5 +408,56 @@ describe("message_new handler", () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("dispatch failed"),
     );
+  });
+
+  it("falls back to Date.now() when createdAt is missing", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    const before = Date.now();
+    await getMessageHandler()(makeCtx({ createdAt: undefined }));
+    const after = Date.now();
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.timestamp).toBeGreaterThanOrEqual(before);
+    expect(message.timestamp).toBeLessThanOrEqual(after);
+  });
+
+  it("falls back to Date.now() when createdAt is NaN", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    const before = Date.now();
+    await getMessageHandler()(makeCtx({ createdAt: NaN }));
+    const after = Date.now();
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.timestamp).toBeGreaterThanOrEqual(before);
+    expect(message.timestamp).toBeLessThanOrEqual(after);
+  });
+
+  it("reloads config for each message (gets fresh account state)", async () => {
+    const core = makeVkRuntime();
+    setVkRuntime(core);
+
+    activeMonitor = startMonitor();
+    await flush();
+    await getMessageHandler()(makeCtx());
+
+    expect(vi.mocked(core.config.loadConfig)).toHaveBeenCalled();
+  });
+
+  it("handles messages without attachments or replyMessage", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(
+      makeCtx({ attachments: undefined, replyMessage: undefined }),
+    );
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.attachments).toEqual([]);
+    expect(message.replyToMessageId).toBeUndefined();
+    expect(message.replyToText).toBeUndefined();
   });
 });
