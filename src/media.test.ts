@@ -510,6 +510,14 @@ describe("loadVkOutboundMedia", () => {
     expect(result.title).toBe("report.pdf");
   });
 
+  it("resolves HTTP audio URL as audio_message", async () => {
+    const result = await loadVkOutboundMedia({
+      mediaUrl: "https://example.com/voice.mp3",
+    });
+    expect(result.kind).toBe("audio_message");
+    expect(result.title).toBe("voice.mp3");
+  });
+
   it("forces document kind when forceDocument=true", async () => {
     const result = await loadVkOutboundMedia({
       mediaUrl: "https://example.com/photo.png",
@@ -532,6 +540,13 @@ describe("loadVkOutboundMedia", () => {
     expect(result.kind).toBe("document");
     expect(result.source).toBeInstanceOf(Buffer);
     expect((result.source as Buffer).toString()).toBe("hello world");
+  });
+
+  it("decodes audio data URL as audio_message", async () => {
+    const result = await loadVkOutboundMedia({ mediaUrl: "data:audio/mpeg;base64,SGVsbG8=" });
+    expect(result.kind).toBe("audio_message");
+    expect(result.title).toBe("attachment.mp3");
+    expect(result.source).toBeInstanceOf(Buffer);
   });
 
   it("classifies GIF as document, not image", async () => {
@@ -574,6 +589,7 @@ describe("loadVkOutboundMedia", () => {
       tempDir = await mkdtemp(join(tmpdir(), "vk-media-test-"));
       await writeFile(join(tempDir, "test.png"), Buffer.from("fake-png"));
       await writeFile(join(tempDir, "doc.pdf"), Buffer.from("fake-pdf"));
+      await writeFile(join(tempDir, "voice.mp3"), Buffer.from("fake-mp3"));
     });
 
     afterAll(async () => {
@@ -595,6 +611,14 @@ describe("loadVkOutboundMedia", () => {
       });
       expect(result.kind).toBe("document");
       expect(result.title).toBe("doc.pdf");
+    });
+
+    it("reads local audio file as audio_message", async () => {
+      const result = await loadVkOutboundMedia({
+        mediaUrl: join(tempDir, "voice.mp3"),
+      });
+      expect(result.kind).toBe("audio_message");
+      expect(result.title).toBe("voice.mp3");
     });
 
     it("rejects local path outside allowed roots", async () => {

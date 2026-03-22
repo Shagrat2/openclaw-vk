@@ -13,6 +13,7 @@ import {
   resolveVkDirectoryGroups,
   resolveVkDirectoryPeers,
   sendDocumentVk,
+  sendAudioMessageVk,
   sendMessageVk,
   sendPayloadVk,
   sendPhotoVk,
@@ -51,6 +52,7 @@ const mockMessagesMarkAsRead = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSetActivity = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockUploadPhoto = vi.hoisted(() => vi.fn().mockResolvedValue("photo123_456"));
 const mockUploadDocument = vi.hoisted(() => vi.fn().mockResolvedValue("doc123_789"));
+const mockUploadAudioMessage = vi.hoisted(() => vi.fn().mockResolvedValue("audio_message123_789"));
 const mockGroupsGetById = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] }),
 );
@@ -73,6 +75,7 @@ vi.mock("vk-io", () => ({
       upload: {
         messagePhoto: mockUploadPhoto,
         messageDocument: mockUploadDocument,
+        audioMessage: mockUploadAudioMessage,
       },
     };
   }),
@@ -90,6 +93,7 @@ describe("sendMessageVk", () => {
     mockSetActivity.mockReset().mockResolvedValue(1);
     mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
     mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
+    mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
     mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
     mockChunkMarkdownText.mockReset().mockImplementation((text: string) => [text]);
     // Reset the constructor call count so per-test assertions stay isolated.
@@ -113,6 +117,17 @@ describe("sendMessageVk", () => {
     await expect(
       sendMessageVk("not-a-number", "text", { cfg }),
     ).rejects.toThrow("Invalid VK peer ID: not-a-number");
+  });
+
+  it("accepts vk-prefixed direct targets", async () => {
+    mockMessagesSend.mockResolvedValueOnce(43);
+
+    const result = await sendMessageVk("vk:123456", "hello", { cfg });
+
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 123456 }),
+    );
+    expect(result).toEqual({ messageId: "43", chatId: "123456" });
   });
 
   it("throws when no token is configured", async () => {
@@ -313,6 +328,37 @@ describe("sendDocumentVk", () => {
   });
 });
 
+describe("sendAudioMessageVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesSend.mockReset();
+    mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+    vi.mocked(VK).mockClear();
+  });
+
+  it("uploads audio as VK audio_message and sends it as attachment", async () => {
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", {
+      cfg,
+    });
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledWith({
+      peer_id: 456,
+      source: { value: "https://example.com/voice.mp3" },
+      title: "voice.mp3",
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        peer_id: 456,
+        message: "caption",
+        attachment: "audio_message123_789",
+      }),
+    );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+});
+
 // ── sendTypingVk ─────────────────────────────────────────────────────────────
 
 describe("sendTypingVk", () => {
@@ -344,6 +390,14 @@ describe("sendTypingVk", () => {
     await sendTypingVk("abc", makeAccount());
 
     expect(mockSetActivity).not.toHaveBeenCalled();
+  });
+
+  it("normalizes vk-prefixed peer IDs", async () => {
+    await sendTypingVk("vk:user:123", makeAccount());
+
+    expect(mockSetActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 123 }),
+    );
   });
 
   it("throws typing errors so the caller can log them", async () => {
@@ -386,6 +440,16 @@ describe("markMessageReadVk", () => {
     await markMessageReadVk("123", "nope", makeAccount());
 
     expect(mockMessagesMarkAsRead).not.toHaveBeenCalled();
+  });
+
+  it("normalizes vk-prefixed peer IDs before marking messages read", async () => {
+    await markMessageReadVk("vk:chat:123", "77", makeAccount());
+
+    expect(mockMessagesMarkAsRead).toHaveBeenCalledWith({
+      peer_id: 123,
+      start_message_id: 77,
+      mark_conversation_as_read: true,
+    });
   });
 });
 
@@ -522,6 +586,31 @@ describe("sendPayloadVk", () => {
       expect.objectContaining({
         message: "caption",
         attachment: "photo123_456",
+      }),
+    );
+  });
+
+  it("sends audio media through VK audio_message upload flow", async () => {
+    mockMessagesSend.mockResolvedValueOnce(28);
+
+    await sendPayloadVk(
+      "123",
+      {
+        text: "voice caption",
+        mediaUrl: "https://example.com/voice.mp3",
+      },
+      { cfg },
+    );
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: { value: "https://example.com/voice.mp3" },
+      title: "voice.mp3",
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "voice caption",
+        attachment: "audio_message123_789",
       }),
     );
   });

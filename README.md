@@ -12,6 +12,7 @@
 3. Откройте **Управление → Работа с API → Ключи доступа**, нажмите *Создать ключ* и выберите права:
    - **Сообщения сообщества**
    - **Управление сообществом** (необходимо для Bots Long Poll API)
+   - **Документы** / `docs` (обязательно для исходящих файлов, TTS audio и голосовых сообщений, потому что VK upload идёт через `docs.getMessagesUploadServer`)
 4. Откройте **Управление → Работа с API → Long Poll API**:
    - Включите Long Poll API.
    - На вкладке **Типы событий** отметьте **Входящие сообщения**.
@@ -145,6 +146,34 @@ openclaw channels status --json --probe
 **`Group authorization failed: group revoke access for this token`** — ключ доступа устарел или отозван. Перевыпустите токен в настройках сообщества, обновите конфигурацию и перезапустите шлюз.
 
 **Статус `running: false` при `configured: true`** — неверный токен. Подробности в поле `lastError` вывода команды статуса.
+
+**`APIError: Code №15 - Access denied: no access to call this method. It cannot be called with current scopes.` при отправке аудио/документов** — у текущего community token нет права `docs`.
+
+Как исправить:
+1. Откройте сообщество во ВКонтакте.
+2. Перейдите в **Управление → Дополнительно → Работа с API → Ключи доступа**.
+3. Нажмите **Создать ключ**.
+4. В списке прав обязательно отметьте:
+   - **Сообщения сообщества** / `messages`
+   - **Управление сообществом** / `manage`
+   - **Документы** / `docs`
+5. Подтвердите создание ключа в мобильном приложении VK.
+6. Обновите `channels.vk.token` в `~/.openclaw/openclaw.json`.
+7. Перезапустите шлюз:
+   ```bash
+   openclaw gateway restart
+   ```
+
+Проверка:
+- `docs.getMessagesUploadServer` требует право `docs` и используется для `doc` и `audio_message`, поэтому без него исходящие файлы и голосовые не отправятся.
+- Исходящие `audio/*` вложения плагин отправляет как `audio_message` (голосовое). Если нужен обычный файл, используйте `forceDocument`.
+- Текущие права токена можно проверить через `groups.getTokenPermissions`.
+- Если после обновления токена `groups.getTokenPermissions` показывает только `messages` и `manage`, создайте новый ключ заново и убедитесь, что `docs` отмечен при создании.
+
+Официальная документация VK:
+- Настройки community token: <https://dev.vk.com/ru/api/access-token/community-token/in-community-settings>
+- Проверка прав токена: <https://dev.vk.com/ru/method/groups.getTokenPermissions>
+- Upload для документов и голосовых: <https://dev.vk.com/ru/method/docs.getMessagesUploadServer>
 
 **Бот не отвечает, ошибок нет** — сообщения отклоняются политиками доступа. Проверьте `dmPolicy`, `allowFrom` и `requireMention`. Логи: `~/.openclaw/logs/commands.log` (фильтруйте по `"source":"vk"`).
 

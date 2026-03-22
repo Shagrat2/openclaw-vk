@@ -40,9 +40,6 @@ Run from this repo root:
 1. `pnpm test`
 2. `pnpm run check:pack`
 
-Optional publish check:
-3. `npm publish --tag beta`
-
 Expected checkpoints:
 - tests stay green
 - pack output includes `src/media.ts`, `src/channel-runtime-compat.ts`, and all runtime entrypoints
@@ -187,6 +184,19 @@ global.fetch = vi.fn().mockImplementation((_url, opts) => new Promise((_, reject
 - After install on a target host, verify plugin load state with `openclaw plugins info vk --json`
 - Restart the gateway after rollout and verify the service status/logs from that host's service manager
 
+### Release and publish flow
+- Official release automation lives in `.github/workflows/publish-npm.yml`.
+- The workflow runs on pushed tags matching `v*`.
+- The pushed tag must match `package.json` version exactly (example: package version `2026.3.22` requires tag `v2026.3.22`).
+- On tag push the workflow runs `npm ci`, `npm test`, `npm pack --dry-run`, publishes to npm, and creates the GitHub Release.
+- Preferred operator flow:
+  1. land changes on `main`
+  2. bump `package.json` version
+  3. commit the version bump
+  4. create tag `v<version>`
+  5. push `main` and the tag
+  6. verify the npm version is visible before deploying it anywhere
+
 ### Installer failure mode
 Older OpenClaw installations may fail or partially wedge config when repeatedly running `openclaw plugins install ... --pin`.
 
@@ -199,6 +209,8 @@ If the CLI installer misbehaves:
 5. Restore the plugin config from the host's current backup or source-of-truth config
 6. Verify `openclaw plugins info vk --json`
 7. Restart the gateway
+
+Prefer deploying the published npm package version over reusing a locally copied tarball. This avoids stale-artifact mistakes and guarantees the deployed bits match the public release tag.
 
 ### Manual install gotcha
 If you only unpack the tarball and skip `npm install --omit=dev --ignore-scripts`, the plugin will fail to load with:
@@ -217,5 +229,5 @@ Error: Cannot find module 'zod'
 - Re-run these checks after edits:
   1. `pnpm test` (all tests pass)
   2. `pnpm run check:pack`
-  3. If publishing: `npm publish --tag beta`
-  4. If deploying: verify plugin load and restart the gateway on the target host
+  3. If releasing: bump `package.json`, push matching `v<version>` tag, and verify the publish workflow succeeds
+  4. If deploying: install the published npm package version, verify plugin load, and restart the gateway on the target host

@@ -15,6 +15,16 @@ const IMAGE_EXTENSIONS = new Set([
   ".png",
   ".webp",
 ]);
+const AUDIO_EXTENSIONS = new Set([
+  ".aac",
+  ".flac",
+  ".m4a",
+  ".mp3",
+  ".oga",
+  ".ogg",
+  ".opus",
+  ".wav",
+]);
 
 const DATA_URL_DEFAULT_NAME = "attachment.bin";
 const DEFAULT_VK_INBOUND_MEDIA_MAX_BYTES = 20 * 1024 * 1024;
@@ -44,7 +54,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
 };
 
 export type VkResolvedOutboundMedia = {
-  kind: "image" | "document";
+  kind: "image" | "document" | "audio_message";
   source: string | Buffer;
   title: string;
   mediaUrl: string;
@@ -533,7 +543,7 @@ function inferOutboundKind(params: {
   name: string;
   mimeType?: string;
   forceDocument?: boolean;
-}): "image" | "document" {
+}): "image" | "document" | "audio_message" {
   if (params.forceDocument) {
     return "document";
   }
@@ -541,7 +551,13 @@ function inferOutboundKind(params: {
   if (mimeType && mimeType.startsWith("image/") && mimeType !== "image/gif") {
     return "image";
   }
+  if (mimeType && mimeType.startsWith("audio/")) {
+    return "audio_message";
+  }
   const extension = extname(params.name).trim().toLowerCase();
+  if (AUDIO_EXTENSIONS.has(extension)) {
+    return "audio_message";
+  }
   return IMAGE_EXTENSIONS.has(extension) ? "image" : "document";
 }
 
@@ -563,6 +579,20 @@ function decodeDataUrl(dataUrl: string): { buffer: Buffer; mimeType?: string; na
         ? ".jpg"
         : mimeType === "image/webp"
           ? ".webp"
+          : mimeType === "audio/mpeg"
+            ? ".mp3"
+            : mimeType === "audio/ogg"
+              ? ".ogg"
+              : mimeType === "audio/opus"
+                ? ".opus"
+                : mimeType === "audio/wav"
+                  ? ".wav"
+                  : mimeType === "audio/aac"
+                    ? ".aac"
+                    : mimeType === "audio/flac"
+                      ? ".flac"
+                      : mimeType === "audio/mp4"
+                        ? ".m4a"
           : mimeType === "application/pdf"
             ? ".pdf"
             : "";

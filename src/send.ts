@@ -174,7 +174,8 @@ function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: s
     throw new Error("VK token not configured");
   }
 
-  const peerId = Number(params.to);
+  const normalizedTo = normalizeVkTargetId(params.to);
+  const peerId = Number(normalizedTo);
   if (Number.isNaN(peerId)) {
     throw new Error(`Invalid VK peer ID: ${params.to}`);
   }
@@ -182,6 +183,7 @@ function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: s
   return {
     account,
     peerId,
+    to: normalizedTo,
   };
 }
 
@@ -242,13 +244,13 @@ export async function sendMessageVk(
   text: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
-  const { account, peerId } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = resolveSendTarget({
     cfg: opts.cfg,
     accountId: opts.accountId,
     to,
   });
   return await sendVkApiMessage({
-    to,
+    to: normalizedTo,
     peerId,
     account,
     message: text,
@@ -262,7 +264,7 @@ export async function sendPhotoVk(
   text?: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
-  const { account, peerId } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = resolveSendTarget({
     cfg: opts.cfg,
     accountId: opts.accountId,
     to,
@@ -276,7 +278,7 @@ export async function sendPhotoVk(
   });
 
   return await sendVkApiMessage({
-    to,
+    to: normalizedTo,
     peerId,
     account,
     message: text ?? "",
@@ -292,7 +294,7 @@ export async function sendDocumentVk(
   text?: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
-  const { account, peerId } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = resolveSendTarget({
     cfg: opts.cfg,
     accountId: opts.accountId,
     to,
@@ -307,7 +309,38 @@ export async function sendDocumentVk(
   });
 
   return await sendVkApiMessage({
+    to: normalizedTo,
+    peerId,
+    account,
+    message: text ?? "",
+    attachment: String(attachment),
+    opts,
+  });
+}
+
+export async function sendAudioMessageVk(
+  to: string,
+  audioSource: string | Buffer,
+  title: string,
+  text?: string,
+  opts: SendVkOptions = {},
+): Promise<SendVkResult> {
+  const { account, peerId, to: normalizedTo } = resolveSendTarget({
+    cfg: opts.cfg,
+    accountId: opts.accountId,
     to,
+  });
+  const vk = getOrCreateVk(account.token);
+  const attachment = await withVkRetry(async () => {
+    return await vk.upload.audioMessage({
+      peer_id: peerId,
+      source: { value: audioSource },
+      title,
+    });
+  });
+
+  return await sendVkApiMessage({
+    to: normalizedTo,
     peerId,
     account,
     message: text ?? "",
@@ -321,7 +354,7 @@ export async function sendTypingVk(to: string, account: ResolvedVkAccount): Prom
     return;
   }
 
-  const peerId = Number(to);
+  const peerId = Number(normalizeVkTargetId(to));
   if (Number.isNaN(peerId)) {
     return;
   }
@@ -347,7 +380,7 @@ export async function markMessageReadVk(
     return;
   }
 
-  const peerId = Number(to);
+  const peerId = Number(normalizeVkTargetId(to));
   const startMessageId = Number(messageId);
   if (Number.isNaN(peerId) || Number.isNaN(startMessageId)) {
     return;
@@ -398,6 +431,9 @@ async function sendResolvedMediaVk(params: {
   });
   if (media.kind === "image") {
     return await sendPhotoVk(params.to, media.source, params.caption, params.opts);
+  }
+  if (media.kind === "audio_message") {
+    return await sendAudioMessageVk(params.to, media.source, media.title, params.caption, params.opts);
   }
   return await sendDocumentVk(params.to, media.source, media.title, params.caption, params.opts);
 }
