@@ -65,4 +65,41 @@ describe("loadChannelRuntimeCompat", () => {
 
     expect(fallbackCreateTypingCallbacks).toHaveBeenCalledOnce();
   });
+
+  it("synthesizes logTypingFailure when channel-runtime omits it", async () => {
+    const createReplyPrefixOptions = vi.fn(() => ({
+      responsePrefixContextProvider: () => ({}),
+      onModelSelected: () => {},
+    }));
+    const createTypingCallbacks = vi.fn(() => ({
+      onReplyStart: async () => {},
+    }));
+    const fallbackCreateTypingCallbacks = vi.fn();
+    const log = vi.fn();
+
+    vi.doMock("openclaw/plugin-sdk/channel-runtime", () => ({
+      createReplyPrefixOptions,
+      createTypingCallbacks,
+    }));
+    vi.doMock("openclaw/plugin-sdk", () => ({
+      createReplyPrefixOptions: vi.fn(),
+      createTypingCallbacks: fallbackCreateTypingCallbacks,
+    }));
+
+    const { loadChannelRuntimeCompat } = await import("./channel-runtime-compat.js");
+    const runtime = await loadChannelRuntimeCompat();
+
+    runtime.logTypingFailure({
+      log,
+      channel: "vk",
+      target: "123",
+      error: new Error("boom"),
+    });
+
+    expect(createTypingCallbacks).not.toHaveBeenCalled();
+    expect(fallbackCreateTypingCallbacks).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("vk: typing failed for target=123: Error: boom"),
+    );
+  });
 });

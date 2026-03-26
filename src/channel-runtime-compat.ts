@@ -32,6 +32,17 @@ type ChannelRuntimeCompatModule = {
 
 let runtimeModulePromise: Promise<ChannelRuntimeCompatModule> | undefined;
 
+function defaultLogTypingFailure(params: {
+  log: (line: string) => void;
+  channel: string;
+  target: string;
+  error: unknown;
+}) {
+  params.log(
+    `${params.channel}: typing failed for target=${params.target}: ${String(params.error)}`,
+  );
+}
+
 function toCompatModule(candidate: unknown): ChannelRuntimeCompatModule | undefined {
   if (!candidate || typeof candidate !== "object") {
     return undefined;
@@ -40,16 +51,22 @@ function toCompatModule(candidate: unknown): ChannelRuntimeCompatModule | undefi
   const record = candidate as Record<string, unknown>;
   if (
     typeof record.createReplyPrefixOptions !== "function" ||
-    typeof record.createTypingCallbacks !== "function" ||
-    typeof record.logTypingFailure !== "function"
+    typeof record.createTypingCallbacks !== "function"
   ) {
     return undefined;
   }
 
+  const logTypingFailureExport = Object.prototype.hasOwnProperty.call(record, "logTypingFailure")
+    ? Reflect.get(record, "logTypingFailure")
+    : undefined;
+
   return {
     createReplyPrefixOptions: record.createReplyPrefixOptions as ChannelRuntimeCompatModule["createReplyPrefixOptions"],
     createTypingCallbacks: record.createTypingCallbacks as ChannelRuntimeCompatModule["createTypingCallbacks"],
-    logTypingFailure: record.logTypingFailure as ChannelRuntimeCompatModule["logTypingFailure"],
+    logTypingFailure:
+      typeof logTypingFailureExport === "function"
+        ? (logTypingFailureExport as ChannelRuntimeCompatModule["logTypingFailure"])
+        : defaultLogTypingFailure,
   };
 }
 
