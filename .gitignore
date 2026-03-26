@@ -22,3 +22,7 @@ Thumbs.db
 
 # npm pack artifacts
 *.tgz
+
+*.pyc
+
+skills/
