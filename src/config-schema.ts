@@ -1,5 +1,21 @@
-import { DmPolicySchema, GroupPolicySchema, requireOpenAllowFrom } from "openclaw/plugin-sdk/compat";
+import { DmPolicySchema, GroupPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
 import { z } from "zod";
+
+function requireOpenAllowFrom(params: {
+  policy?: string;
+  allowFrom?: Array<string | number>;
+  ctx: z.RefinementCtx;
+  path: Array<string | number>;
+  message: string;
+}): void {
+  if (params.policy === "open" && !params.allowFrom?.map(String).includes("*")) {
+    params.ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: params.path,
+      message: params.message,
+    });
+  }
+}
 
 const OPEN_DM_POLICY_ALLOW_FROM_ERROR =
   'channels.vk.dmPolicy="open" requires channels.vk.allowFrom to include "*"';

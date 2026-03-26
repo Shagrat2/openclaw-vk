@@ -7,7 +7,7 @@ import {
   type ChannelSetupDmPolicy,
   type ChannelSetupWizard,
 } from "openclaw/plugin-sdk/setup";
-import type { DmPolicy } from "openclaw/plugin-sdk/compat";
+import type { DmPolicy } from "./types.js";
 import { resolveVkAccount } from "./accounts.js";
 import {
   isVkConfigured,

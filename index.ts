@@ -1,4 +1,4 @@
-const { emptyPluginConfigSchema } = require("openclaw/plugin-sdk/compat");
+const { emptyPluginConfigSchema } = require("openclaw/plugin-sdk");
 const { vkPlugin } = require("./src/channel.js");
 const { setVkRuntime } = require("./src/runtime.js");
 

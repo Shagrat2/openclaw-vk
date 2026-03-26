@@ -2,17 +2,15 @@ import {
   createScopedAccountConfigAccessors,
   createScopedChannelConfigBase,
   createScopedDmSecurityResolver,
-} from "openclaw/plugin-sdk/compat";
-import { collectAllowlistProviderRestrictSendersWarnings } from "openclaw/plugin-sdk/compat";
+  collectAllowlistProviderRestrictSendersWarnings,
+} from "openclaw/plugin-sdk/channel-config-helpers";
+import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 import {
-  buildChannelConfigSchema,
   buildComputedAccountStatusSnapshot,
   buildTokenChannelStatusSummary,
-  DEFAULT_ACCOUNT_ID,
-  type ChannelPlugin,
-  type ChannelStatusIssue,
-  type OpenClawConfig,
-} from "openclaw/plugin-sdk/compat";
+} from "openclaw/plugin-sdk/channel-status";
+import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
+import type { ChannelPlugin, ChannelStatusIssue, OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   listVkAccountIds,
   resolveDefaultVkAccountId,

@@ -7,8 +7,11 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
   tryReadSecretFileSync: vi.fn(),
 }));
 
-vi.mock("openclaw/plugin-sdk/compat", () => ({
+vi.mock("openclaw/plugin-sdk/account-id", () => ({
   normalizeAccountId: (id?: string) => id?.trim() || "default",
+}));
+
+vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
   createPluginRuntimeStore: (errorMsg: string) => {
     let runtime: unknown;
     return {
@@ -23,12 +26,18 @@ vi.mock("openclaw/plugin-sdk/compat", () => ({
       },
     };
   },
-  createScopedPairingAccess: ({ core, channel, accountId }: Record<string, unknown>) => ({
+}));
+
+vi.mock("openclaw/plugin-sdk/channel-pairing", () => ({
+  createChannelPairingController: ({ core, channel, accountId }: Record<string, unknown>) => ({
     readStoreForDmPolicy: () =>
       (core as any).channel.pairing.readAllowFromStore({ channel, accountId }),
     upsertPairingRequest: (params: Record<string, unknown>) =>
       (core as any).channel.pairing.upsertPairingRequest({ ...params, accountId }),
   }),
+}));
+
+vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
   issuePairingChallenge: async ({
     upsertPairingRequest,
     sendPairingReply,
@@ -45,18 +54,15 @@ vi.mock("openclaw/plugin-sdk/compat", () => ({
       }
     }
   },
+}));
+
+vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   logInboundDrop: vi.fn(),
+}));
+
+vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   readStoreAllowFromForDmPolicy: async ({ readStore }: Record<string, any>) =>
     readStore ? await readStore() : [],
-  resolveControlCommandGate: vi.fn(() => ({
-    shouldBlock: false,
-    commandAuthorized: false,
-  })),
-  resolveAllowlistProviderRuntimeGroupPolicy: ({ groupPolicy }: Record<string, unknown>) => ({
-    groupPolicy: groupPolicy ?? "open",
-    providerMissingFallbackApplied: false,
-  }),
-  resolveDefaultGroupPolicy: () => "open",
   resolveEffectiveAllowFromLists: ({
     allowFrom,
     groupAllowFrom,
@@ -65,6 +71,21 @@ vi.mock("openclaw/plugin-sdk/compat", () => ({
     effectiveAllowFrom: [...(allowFrom ?? []), ...(storeAllowFrom ?? [])],
     effectiveGroupAllowFrom: [...(groupAllowFrom ?? [])],
   }),
+}));
+
+vi.mock("openclaw/plugin-sdk/command-auth", () => ({
+  resolveControlCommandGate: vi.fn(() => ({
+    shouldBlock: false,
+    commandAuthorized: false,
+  })),
+}));
+
+vi.mock("openclaw/plugin-sdk/config-runtime", () => ({
+  resolveAllowlistProviderRuntimeGroupPolicy: ({ groupPolicy }: Record<string, unknown>) => ({
+    groupPolicy: groupPolicy ?? "open",
+    providerMissingFallbackApplied: false,
+  }),
+  resolveDefaultGroupPolicy: () => "open",
   GROUP_POLICY_BLOCKED_LABEL: { channel: "blocked" },
   warnMissingProviderGroupPolicyFallbackOnce: vi.fn(),
 }));
@@ -1292,7 +1313,7 @@ describe("dispatch payload", () => {
 
 describe("command gating", () => {
   it("drops group message when command gate blocks unauthorized control command", async () => {
-    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/compat");
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth");
     vi.mocked(resolveControlCommandGate).mockReturnValueOnce({
       shouldBlock: true,
       commandAuthorized: false,
@@ -1320,7 +1341,7 @@ describe("command gating", () => {
   });
 
   it("does not block DM messages even when command gate blocks", async () => {
-    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/compat");
+    const { resolveControlCommandGate } = await import("openclaw/plugin-sdk/command-auth");
     vi.mocked(resolveControlCommandGate).mockReturnValueOnce({
       shouldBlock: true,
       commandAuthorized: false,

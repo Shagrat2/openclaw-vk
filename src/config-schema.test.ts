@@ -3,31 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 // ── SDK mock ─────────────────────────────────────────────────────────────────
 // Provide real-shaped Zod schemas so VkConfigSchema can be parsed end-to-end.
 
-vi.mock("openclaw/plugin-sdk/compat", async () => {
+vi.mock("openclaw/plugin-sdk/channel-config-schema", async () => {
   const { z } = await import("zod");
   return {
     DmPolicySchema: z.enum(["pairing", "allowlist", "open", "disabled"]),
     GroupPolicySchema: z.enum(["allowlist", "open", "disabled"]),
-    requireOpenAllowFrom: ({
-      policy,
-      allowFrom,
-      ctx,
-      path,
-      message,
-    }: {
-      policy?: string;
-      allowFrom?: unknown[];
-      ctx: { addIssue: (issue: unknown) => void };
-      path: string[];
-      message: string;
-    }) => {
-      if (
-        policy === "open" &&
-        (!allowFrom || !allowFrom.map(String).includes("*"))
-      ) {
-        ctx.addIssue({ code: "custom", path, message });
-      }
-    },
   };
 });
 

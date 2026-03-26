@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (must be before channel.ts import) ─────────────────────────────
 
-vi.mock("openclaw/plugin-sdk/compat", () => ({
+vi.mock("openclaw/plugin-sdk/channel-config-helpers", () => ({
   createScopedAccountConfigAccessors: ({ resolveAllowFrom, formatAllowFrom, resolveDefaultTo }: Record<string, unknown>) => ({
     resolveAllowFrom,
     formatAllowFrom,
@@ -15,11 +15,20 @@ vi.mock("openclaw/plugin-sdk/compat", () => ({
   }),
   createScopedDmSecurityResolver: () => vi.fn(),
   collectAllowlistProviderRestrictSendersWarnings: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("openclaw/plugin-sdk/channel-config-schema", () => ({
   buildChannelConfigSchema: (schema: unknown) => schema,
+}));
+
+vi.mock("openclaw/plugin-sdk/channel-status", () => ({
   buildComputedAccountStatusSnapshot: vi.fn(
     (params: Record<string, unknown>) => ({ ...params }),
   ),
   buildTokenChannelStatusSummary: vi.fn().mockReturnValue({}),
+}));
+
+vi.mock("openclaw/plugin-sdk/account-id", () => ({
   DEFAULT_ACCOUNT_ID: "default",
 }));
 

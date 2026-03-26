@@ -1,17 +1,18 @@
+import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
+import { issuePairingChallenge } from "openclaw/plugin-sdk/conversation-runtime";
+import { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
 import {
-  createScopedPairingAccess,
-  issuePairingChallenge,
-  logInboundDrop,
   readStoreAllowFromForDmPolicy,
-  resolveControlCommandGate,
+  resolveEffectiveAllowFromLists,
+} from "openclaw/plugin-sdk/channel-policy";
+import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
+import {
   resolveAllowlistProviderRuntimeGroupPolicy,
   resolveDefaultGroupPolicy,
-  resolveEffectiveAllowFromLists,
   GROUP_POLICY_BLOCKED_LABEL,
   warnMissingProviderGroupPolicyFallbackOnce,
-  type OpenClawConfig,
-  type RuntimeEnv,
-} from "openclaw/plugin-sdk/compat";
+} from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
 import { loadChannelRuntimeCompat } from "./channel-runtime-compat.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
@@ -93,7 +94,7 @@ export async function handleVkInbound(params: {
 }): Promise<void> {
   const { message, account, config, runtime, statusSink } = params;
   const core = getVkRuntime();
-  const pairing = createScopedPairingAccess({
+  const pairing = createChannelPairingController({
     core,
     channel: CHANNEL_ID,
     accountId: account.accountId,

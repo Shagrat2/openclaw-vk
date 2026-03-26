@@ -1,8 +1,5 @@
-import {
-  buildChannelConfigSchema,
-  type ChannelPlugin,
-  type OpenClawConfig,
-} from "openclaw/plugin-sdk/compat";
+import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
+import type { ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   listVkAccountIds,
   resolveDefaultVkAccountId,

@@ -1,4 +1,5 @@
-import type { DmPolicy, GroupPolicy } from "openclaw/plugin-sdk/compat";
+export type DmPolicy = "pairing" | "allowlist" | "open" | "disabled";
+type GroupPolicy = "open" | "disabled" | "allowlist";
 
 export type VkAccountConfig = {
   name?: string;

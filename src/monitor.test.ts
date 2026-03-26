@@ -7,8 +7,11 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
   tryReadSecretFileSync: vi.fn(),
 }));
 
-vi.mock("openclaw/plugin-sdk/compat", () => ({
+vi.mock("openclaw/plugin-sdk/account-id", () => ({
   normalizeAccountId: (id?: string) => id?.trim() || "default",
+}));
+
+vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
   createPluginRuntimeStore: (errorMsg: string) => {
     let runtime: unknown;
     return {

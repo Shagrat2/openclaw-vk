@@ -1,9 +1,8 @@
 import {
   DEFAULT_ACCOUNT_ID,
   tryReadSecretFileSync,
-  type OpenClawConfig,
 } from "openclaw/plugin-sdk/core";
-import { normalizeAccountId } from "openclaw/plugin-sdk/compat";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import type { ResolvedVkAccount, VkAccountConfig, VkConfig, CoreConfig } from "./types.js";
 export type { ResolvedVkAccount } from "./types.js";
 
