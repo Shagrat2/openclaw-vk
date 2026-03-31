@@ -1,6 +1,6 @@
 {
   "name": "@openclaw-vk/vk",
-  "version": "2026.3.27",
+  "version": "2026.4.1-beta.1",
   "description": "OpenClaw VK (VKontakte) channel plugin",
   "author": {
     "name": "Pavel Frankov",
@@ -36,7 +36,6 @@
     "src/accounts.ts",
     "src/channel.setup.ts",
     "src/channel.ts",
-    "src/channel-runtime-compat.ts",
     "src/config-schema.ts",
     "src/inbound.ts",
     "src/keyboard.ts",

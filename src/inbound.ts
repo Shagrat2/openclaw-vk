@@ -5,6 +5,11 @@ import {
   readStoreAllowFromForDmPolicy,
   resolveEffectiveAllowFromLists,
 } from "openclaw/plugin-sdk/channel-policy";
+import {
+  createReplyPrefixOptions,
+  createTypingCallbacks,
+  logTypingFailure,
+} from "openclaw/plugin-sdk/channel-runtime";
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
 import {
   resolveAllowlistProviderRuntimeGroupPolicy,
@@ -13,7 +18,6 @@ import {
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/config-runtime";
 import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
-import { loadChannelRuntimeCompat } from "./channel-runtime-compat.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
   resolveVkInboundBodyText,
@@ -349,8 +353,6 @@ export async function handleVkInbound(params: {
   const onDispatchError = (err: unknown, info: { kind: string }) => {
     runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
   };
-  const { createReplyPrefixOptions, createTypingCallbacks, logTypingFailure } =
-    await loadChannelRuntimeCompat();
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
       await sendTypingVk(String(message.peerId), account);

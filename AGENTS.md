@@ -20,7 +20,6 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 - `src/setup-surface.ts`: setup UI/runtime bridge used by setup entry
 - `src/accounts.ts`: account resolution and normalization helpers
 - `src/runtime.ts`: runtime singleton access (`getVkRuntime` / `setVkRuntime`)
-- `src/channel-runtime-compat.ts`: fallback loader for `channel-runtime` helpers on older OpenClaw releases
 - `src/monitor.ts`: VK updates polling and inbound event bridge
 - `src/inbound.ts`: inbound normalization, policy checks, dispatch to OpenClaw runtime
 - `src/send.ts`: outbound messaging via VK API
@@ -42,7 +41,7 @@ Run from this repo root:
 
 Expected checkpoints:
 - tests stay green
-- pack output includes `src/media.ts`, `src/channel-runtime-compat.ts`, and all runtime entrypoints
+- pack output includes `src/media.ts` and all runtime entrypoints
 
 Important:
 - inspecting a sibling OpenClaw checkout can tell you about the bundled VK extension there, not necessarily about this external plugin package. Do not treat that as proof that the package in this repo is valid.
