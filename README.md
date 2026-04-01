@@ -2,7 +2,7 @@
 <img width="500" src="https://github.com/user-attachments/assets/1bb97849-8aa0-46dc-b3de-90e4bcf10d38"/>
 
 Плагин [OpenClaw](https://github.com/openclaw/openclaw) для работы с ВКонтакте. Подключает AI-агента к сообществам VK через Bots Long Poll API — бот принимает и отвечает на сообщения в личных диалогах и групповых беседах.  
-Минимальная требуемая версия OpenClaw: **v2026.3.24**
+Минимальная требуемая версия OpenClaw: **v2026.3.28**
 
 ## Быстрый старт
 
@@ -31,6 +31,27 @@ openclaw plugins enable vk
 ```
 
 > Только для локальной разработки: `openclaw plugins install ~/path/to/openclaw-vk`
+
+Примечание про `plugins.allow`:
+- Если `plugins.allow` отсутствует или пуст, OpenClaw обычно подхватывает внешний плагин `vk` автоматически после `openclaw plugins enable vk` и включённого `channels.vk.enabled`.
+- Если у вас уже используется явный allowlist плагинов (`plugins.allow` не пуст), добавьте туда `"vk"` вручную. Команда `openclaw plugins enable vk` сейчас не дописывает `plugins.allow` автоматически.
+
+Пример для конфигураций с явным allowlist:
+
+```json
+{
+  "plugins": {
+    "allow": ["vk"]
+  },
+  "channels": {
+    "vk": {
+      "enabled": true,
+      "token": "<ВАШ_ТОКЕН>",
+      "dmPolicy": "pairing"
+    }
+  }
+}
+```
 
 ### 3. Настройка
 

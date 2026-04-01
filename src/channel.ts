@@ -1,9 +1,8 @@
 import {
-  createScopedAccountConfigAccessors,
-  createScopedChannelConfigBase,
-  createScopedDmSecurityResolver,
+  adaptScopedAccountAccessor,
+  createScopedChannelConfigAdapter,
 } from "openclaw/plugin-sdk/channel-config-helpers";
-import { collectAllowlistProviderRestrictSendersWarnings } from "openclaw/plugin-sdk/channel-policy";
+import { createRestrictSendersChannelSecurity } from "openclaw/plugin-sdk/channel-policy";
 import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 import {
   buildComputedAccountStatusSnapshot,
@@ -43,9 +42,12 @@ const meta = {
   systemImage: "message.fill",
 };
 
-const vkConfigAccessors = createScopedAccountConfigAccessors({
-  resolveAccount: ({ cfg, accountId }) =>
-    resolveVkAccount({ cfg, accountId: accountId ?? undefined }),
+const vkConfigAdapter = createScopedChannelConfigAdapter<ResolvedVkAccount, ResolvedVkAccount, OpenClawConfig>({
+  sectionKey: "vk",
+  listAccountIds: (cfg) => listVkAccountIds(cfg),
+  resolveAccount: adaptScopedAccountAccessor((params) => resolveVkAccount(params)),
+  defaultAccountId: (cfg) => resolveDefaultVkAccountId(cfg),
+  clearBaseFields: ["tokenFile"],
   resolveAllowFrom: (account: ResolvedVkAccount) => account.config.allowFrom,
   formatAllowFrom: (allowFrom) =>
     allowFrom
@@ -55,21 +57,20 @@ const vkConfigAccessors = createScopedAccountConfigAccessors({
   resolveDefaultTo: (account: ResolvedVkAccount) => account.config.defaultTo,
 });
 
-const vkConfigBase = createScopedChannelConfigBase<ResolvedVkAccount, OpenClawConfig>({
-  sectionKey: "vk",
-  listAccountIds: (cfg) => listVkAccountIds(cfg),
-  resolveAccount: (cfg, accountId) => resolveVkAccount({ cfg, accountId: accountId ?? undefined }),
-  defaultAccountId: (cfg) => resolveDefaultVkAccountId(cfg),
-  clearBaseFields: ["tokenFile"],
-});
-
-const resolveVkDmPolicy = createScopedDmSecurityResolver<ResolvedVkAccount>({
+const vkSecurityAdapter = createRestrictSendersChannelSecurity<ResolvedVkAccount>({
   channelKey: "vk",
-  resolvePolicy: (account) => account.config.dmPolicy,
-  resolveAllowFrom: (account) => account.config.allowFrom,
-  policyPathSuffix: "dmPolicy",
+  resolveDmPolicy: (account) => account.config.dmPolicy,
+  resolveDmAllowFrom: (account) => account.config.allowFrom,
+  resolveGroupPolicy: (account) => account.config.groupPolicy,
+  surface: "VK group chats",
+  openScope: "any member in group chats",
+  groupPolicyPath: "channels.vk.groupPolicy",
+  groupAllowFromPath: "channels.vk.groupAllowFrom",
+  mentionGated: false,
+  providerConfigPresent: (cfg) =>
+    (cfg.channels as Record<string, unknown> | undefined)?.vk !== undefined,
   approveHint: "openclaw pairing approve vk <code>",
-  normalizeEntry: (raw) => raw.replace(/^vk:(?:user:)?/i, ""),
+  normalizeDmEntry: (raw) => raw.replace(/^vk:(?:user:)?/i, ""),
 });
 
 export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
@@ -114,7 +115,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   reload: { configPrefixes: ["channels.vk"] },
   configSchema: buildChannelConfigSchema(VkConfigSchema),
   config: {
-    ...vkConfigBase,
+    ...vkConfigAdapter,
     isConfigured: (account) => Boolean(account.token?.trim()),
     describeAccount: (account) => ({
       accountId: account.accountId,
@@ -123,24 +124,8 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       configured: Boolean(account.token?.trim()),
       tokenSource: account.tokenSource ?? undefined,
     }),
-    ...vkConfigAccessors,
   },
-  security: {
-    resolveDmPolicy: resolveVkDmPolicy,
-    collectWarnings: ({ account, cfg }) => {
-      return collectAllowlistProviderRestrictSendersWarnings({
-        cfg,
-        providerConfigPresent:
-          (cfg.channels as Record<string, unknown> | undefined)?.vk !== undefined,
-        configuredGroupPolicy: account.config.groupPolicy,
-        surface: "VK group chats",
-        openScope: "any member in group chats",
-        groupPolicyPath: "channels.vk.groupPolicy",
-        groupAllowFromPath: "channels.vk.groupAllowFrom",
-        mentionGated: false,
-      });
-    },
-  },
+  security: vkSecurityAdapter,
   groups: {
     resolveRequireMention: ({ cfg, accountId, groupId }) => {
       const account = resolveVkAccount({

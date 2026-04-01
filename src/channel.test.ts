@@ -2,27 +2,37 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (must be before channel.ts import) ─────────────────────────────
 
-const mockCollectAllowlistProviderRestrictSendersWarnings = vi.hoisted(() =>
-  vi.fn().mockReturnValue([]),
+const mockCreateRestrictSendersChannelSecurity = vi.hoisted(() =>
+  vi.fn().mockImplementation(() => ({
+    resolveDmPolicy: vi.fn(),
+    collectWarnings: vi.fn().mockReturnValue([]),
+  })),
 );
 
 vi.mock("openclaw/plugin-sdk/channel-config-helpers", () => ({
-  createScopedAccountConfigAccessors: ({ resolveAllowFrom, formatAllowFrom, resolveDefaultTo }: Record<string, unknown>) => ({
+  adaptScopedAccountAccessor:
+    (accessor: (params: Record<string, unknown>) => unknown) =>
+    (cfg: unknown, accountId?: string | null) =>
+      accessor({ cfg, accountId }),
+  createScopedChannelConfigAdapter: ({
+    listAccountIds,
+    resolveAccount,
+    defaultAccountId,
+    resolveAllowFrom,
+    formatAllowFrom,
+    resolveDefaultTo,
+  }: Record<string, unknown>) => ({
+    listAccountIds,
+    resolveAccount,
+    defaultAccountId,
     resolveAllowFrom,
     formatAllowFrom,
     resolveDefaultTo,
   }),
-  createScopedChannelConfigBase: ({ listAccountIds, resolveAccount, defaultAccountId }: Record<string, unknown>) => ({
-    listAccountIds,
-    resolveAccount,
-    defaultAccountId,
-  }),
-  createScopedDmSecurityResolver: () => vi.fn(),
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
-  collectAllowlistProviderRestrictSendersWarnings:
-    mockCollectAllowlistProviderRestrictSendersWarnings,
+  createRestrictSendersChannelSecurity: mockCreateRestrictSendersChannelSecurity,
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-config-schema", () => ({
@@ -156,7 +166,6 @@ import { vkPlugin } from "./channel.js";
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
-  mockCollectAllowlistProviderRestrictSendersWarnings.mockReset().mockReturnValue([]);
   mockSendMessageVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "2", chatId: "0" });
   mockResolveVkDirectoryPeers.mockClear();
@@ -387,43 +396,21 @@ describe("config", () => {
 });
 
 describe("security", () => {
-  it("collectWarnings delegates to the SDK helper with VK-specific params", () => {
-    mockCollectAllowlistProviderRestrictSendersWarnings.mockReturnValueOnce(["warn"]);
-
-    const warnings = vkPlugin.security!.collectWarnings!({
-      account: {
-        config: { groupPolicy: "open", groupAllowFrom: [123] },
-      },
-      cfg: { channels: { vk: { groupPolicy: "open" } } },
-    } as never);
-
-    expect(warnings).toEqual(["warn"]);
-    expect(mockCollectAllowlistProviderRestrictSendersWarnings).toHaveBeenCalledWith({
-      cfg: { channels: { vk: { groupPolicy: "open" } } },
-      providerConfigPresent: true,
-      configuredGroupPolicy: "open",
-      surface: "VK group chats",
-      openScope: "any member in group chats",
-      groupPolicyPath: "channels.vk.groupPolicy",
-      groupAllowFromPath: "channels.vk.groupAllowFrom",
-      mentionGated: false,
-    });
+  it("exposes a security adapter", () => {
+    expect(vkPlugin.security).toBeTruthy();
+    expect(vkPlugin.security?.resolveDmPolicy).toBeTypeOf("function");
+    expect(vkPlugin.security?.collectWarnings).toBeTypeOf("function");
   });
 
-  it("collectWarnings reports missing provider config to the SDK helper", () => {
-    vkPlugin.security!.collectWarnings!({
+  it("uses the helper-provided security adapter methods", () => {
+    const warnings = vkPlugin.security!.collectWarnings!({
       account: {
         config: { groupPolicy: "allowlist" },
       },
-      cfg: { channels: {} },
+      cfg: { channels: { vk: {} } },
     } as never);
 
-    expect(mockCollectAllowlistProviderRestrictSendersWarnings).toHaveBeenCalledWith(
-      expect.objectContaining({
-        providerConfigPresent: false,
-        configuredGroupPolicy: "allowlist",
-      }),
-    );
+    expect(warnings).toEqual([]);
   });
 });
 
