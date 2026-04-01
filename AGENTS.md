@@ -218,6 +218,20 @@ If you only unpack the tarball and skip `npm install --omit=dev --ignore-scripts
 Error: Cannot find module 'zod'
 ```
 
+## Changelog Maintenance
+
+- Keep `CHANGELOG.md` up to date for release-relevant changes. Changelog entries must be written in Russian.
+- Changelog format must be tag-based: each tag section summarizes changes from the previous tag to the current tag. Section heading is the tag name only (e.g. `## v2026.4.1`) — no separate date, since the version already encodes it.
+- **UX-first principle:** every item leads with what the user sees or can do differently — not the mechanism behind it. Start from the observable effect, then add just enough context to locate the relevant setting if needed. Example: "Bold and italic text in agent replies now renders correctly in VK" — not "Added format_data conversion" or "Implemented VkFormatItem mapping". A good entry passes this test: would a user who only runs `openclaw` and chats via VK understand it without reading the code?
+- Changelog section headings must be in Russian: `Добавлено`, `Улучшено`, `Исправлено`, `Сопровождение`, `Для разработки`.
+- Only log changes that are meaningful to someone deciding whether to update: new capabilities, fixed problems, or raised minimum version. Skip everything else — internal refactors, test additions, `.gitignore`, style fixes. If a release contains only such changes, the entire release section can be omitted or reduced to a single `Сопровождение` line without `Кому важно` / `Что проверить`.
+- For substantive changes, each release entry must include two operational sections:
+  - `Кому важно` — name a specific scenario or user type, not just "all users". Example: "Users whose agent replies include formatted text". When it genuinely affects everyone, say what they will notice differently.
+  - `Что проверить после обновления` — concrete steps tied to VK channel behavior (pairing, allowlists, group policy, token, gateway restart, plugin status). Not "check that the plugin works" but "send a reply with `**bold**` text and confirm it appears bold in VK".
+- User impact ("why it matters") must always appear in the entry body. Implementation motivation ("why it was built") is included only when clearly supported by evidence (commit message, code comment) — do not guess.
+- Avoid terms users would not recognise: internal module names, SDK function names, file paths. Retain terms users encounter directly: `dmPolicy`, `groupPolicy`, `pairing`, `token`, `openclaw gateway restart`, `openclaw channels status`.
+- If an item maps to a single commit, append only a short commit hash (no URL).
+
 ## Practical Rules For Future Changes
 - Keep VK plugin behavior aligned with OpenClaw channel policy patterns (pairing, allowlists, group policy).
 - Keep manifest/schema valid and minimal; never remove `configSchema` from `openclaw.plugin.json`.
