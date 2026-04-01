@@ -1,5 +1,6 @@
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
+import { renderVkMarkdown, trimVkFormattedMessage, type VkFormatData } from "./format.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
@@ -104,8 +105,13 @@ async function withVkRetry<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-function trimVkMessageText(text?: string): string {
-  return text?.slice(0, VK_MESSAGE_TEXT_LIMIT) ?? "";
+function prepareVkMessage(text: string): { text: string; formatData?: VkFormatData } {
+  const rendered = renderVkMarkdown(text);
+  const trimmed = trimVkFormattedMessage(rendered, VK_MESSAGE_TEXT_LIMIT);
+  if (!trimmed.formatData || trimmed.formatData.items.length === 0) {
+    return { text: trimmed.text };
+  }
+  return { text: trimmed.text, formatData: trimmed.formatData };
 }
 
 function resolveVkKeyboard(opts: SendVkOptions): string | undefined {
@@ -197,14 +203,20 @@ async function sendVkApiMessage(params: {
 }): Promise<SendVkResult> {
   const vk = getOrCreateVk(params.account.token);
   const keyboard = resolveVkKeyboard(params.opts ?? {});
+  const formatted = prepareVkMessage(params.message);
+  const formatData =
+    formatted.formatData && formatted.formatData.items.length > 0
+      ? JSON.stringify(formatted.formatData)
+      : undefined;
   const messageId = await withVkRetry(async () => {
     return await vk.api.messages.send({
       peer_id: params.peerId,
-      message: trimVkMessageText(params.message),
+      message: formatted.text,
       random_id: getRandomId(),
       ...(params.attachment ? { attachment: params.attachment } : {}),
       ...(keyboard ? { keyboard } : {}),
       ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
+      ...(formatData ? { format_data: formatData } : {}),
     });
   });
 

@@ -113,6 +113,34 @@ describe("sendMessageVk", () => {
     expect(result).toEqual({ messageId: "42", chatId: "123456" });
   });
 
+  it("adds format_data when markdown formatting is present", async () => {
+    mockMessagesSend.mockResolvedValueOnce(99);
+
+    await sendMessageVk(
+      "123456",
+      "**bold** and *italic* and ***both*** with [link](https://example.com)",
+      { cfg },
+    );
+
+    const call = mockMessagesSend.mock.calls[0][0];
+    expect(call.message).toBe("bold and italic and both with link");
+    expect(call.format_data).toBeDefined();
+    const formatData = JSON.parse(call.format_data as string) as {
+      version: number;
+      items: Array<{ type: string; offset: number; length: number; url?: string }>;
+    };
+    expect(formatData.version).toBe(1);
+    expect(formatData.items).toEqual(
+      expect.arrayContaining([
+        { type: "bold", offset: 0, length: 4 },
+        { type: "italic", offset: 9, length: 6 },
+        { type: "bold", offset: 20, length: 4 },
+        { type: "italic", offset: 20, length: 4 },
+        { type: "url", offset: 30, length: 4, url: "https://example.com" },
+      ]),
+    );
+  });
+
   it("throws when peer ID is not a number", async () => {
     await expect(
       sendMessageVk("not-a-number", "text", { cfg }),
