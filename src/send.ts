@@ -1,6 +1,11 @@
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
-import { renderVkMarkdown, trimVkFormattedMessage, type VkFormatData } from "./format.js";
+import {
+  collapseBlankLinesBeforeVkCodeFences,
+  renderVkMarkdown,
+  trimVkFormattedMessage,
+  type VkFormatData,
+} from "./format.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
@@ -106,7 +111,7 @@ async function withVkRetry<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 function prepareVkMessage(text: string): { text: string; formatData?: VkFormatData } {
-  const rendered = renderVkMarkdown(text);
+  const rendered = renderVkMarkdown(collapseBlankLinesBeforeVkCodeFences(text));
   const trimmed = trimVkFormattedMessage(rendered, VK_MESSAGE_TEXT_LIMIT);
   if (!trimmed.formatData || trimmed.formatData.items.length === 0) {
     return { text: trimmed.text };

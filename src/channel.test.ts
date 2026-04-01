@@ -396,10 +396,29 @@ describe("config", () => {
 });
 
 describe("security", () => {
-  it("exposes a security adapter", () => {
-    expect(vkPlugin.security).toBeTruthy();
+  it("exposes a security adapter with callable methods", () => {
     expect(vkPlugin.security?.resolveDmPolicy).toBeTypeOf("function");
     expect(vkPlugin.security?.collectWarnings).toBeTypeOf("function");
+  });
+
+  it("wires VK-specific settings into the shared security helper", () => {
+    const params = mockCreateRestrictSendersChannelSecurity.mock.calls[0]?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(params).toEqual(
+      expect.objectContaining({
+        channelKey: "vk",
+        surface: "VK group chats",
+        groupPolicyPath: "channels.vk.groupPolicy",
+        groupAllowFromPath: "channels.vk.groupAllowFrom",
+        mentionGated: false,
+        approveHint: "openclaw pairing approve vk <code>",
+      }),
+    );
+
+    const normalizeDmEntry = params?.normalizeDmEntry;
+    expect(normalizeDmEntry).toBeTypeOf("function");
+    expect((normalizeDmEntry as (raw: string) => string)("vk:user:12345")).toBe("12345");
   });
 
   it("uses the helper-provided security adapter methods", () => {
@@ -919,8 +938,9 @@ describe("gateway", () => {
       const writtenCfg = mockWriteConfigFile.mock.calls[0][0] as Record<string, unknown>;
       const vk = (writtenCfg.channels as Record<string, Record<string, unknown>>).vk;
       const accounts = vk.accounts as Record<string, unknown>;
-      expect(accounts.sales).toBeUndefined();
-      expect(accounts.support).toBeDefined();
+      expect(accounts).toEqual({
+        support: { token: "support-tok" },
+      });
     });
 
     it("removes accounts section when last named account is deleted", async () => {

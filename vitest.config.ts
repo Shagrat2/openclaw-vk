@@ -13,6 +13,10 @@ export default defineConfig({
         "src/setup-surface.ts",
       ],
       reporter: ["text", "text-summary"],
+      thresholds: {
+        statements: 95,
+        lines: 95,
+      },
     },
   },
 });

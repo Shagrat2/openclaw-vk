@@ -85,6 +85,38 @@ vi.mock("vk-io", () => ({
 const TOKEN = "test-token";
 const cfg = { channels: { vk: { token: TOKEN } } } as never;
 
+type VkSendCall = Record<string, unknown> & {
+  message?: string;
+  format_data?: string;
+  keyboard?: string;
+};
+
+type VkFormatDataPayload = {
+  version: number;
+  items: Array<{ type: string; offset: number; length: number; url?: string }>;
+};
+
+type VkKeyboardPayload = {
+  one_time: boolean;
+  buttons: Array<Array<{ action: { label: string; payload: string }; color: string }>>;
+};
+
+function getSendCall(index = 0): VkSendCall {
+  const call = mockMessagesSend.mock.calls[index]?.[0] as VkSendCall | undefined;
+  expect(call).toBeDefined();
+  return call as VkSendCall;
+}
+
+function parseVkFormatData(value: unknown): VkFormatDataPayload {
+  expect(value).toBeTypeOf("string");
+  return JSON.parse(value as string) as VkFormatDataPayload;
+}
+
+function parseVkKeyboard(value: unknown): VkKeyboardPayload {
+  expect(value).toBeTypeOf("string");
+  return JSON.parse(value as string) as VkKeyboardPayload;
+}
+
 describe("sendMessageVk", () => {
   beforeEach(() => {
     clearVkInstances();
@@ -122,13 +154,9 @@ describe("sendMessageVk", () => {
       { cfg },
     );
 
-    const call = mockMessagesSend.mock.calls[0][0];
+    const call = getSendCall();
     expect(call.message).toBe("bold and italic and both with link");
-    expect(call.format_data).toBeDefined();
-    const formatData = JSON.parse(call.format_data as string) as {
-      version: number;
-      items: Array<{ type: string; offset: number; length: number; url?: string }>;
-    };
+    const formatData = parseVkFormatData(call.format_data);
     expect(formatData.version).toBe(1);
     expect(formatData.items).toEqual(
       expect.arrayContaining([
@@ -202,11 +230,11 @@ describe("sendMessageVk", () => {
       buttons: [[{ text: "Browse providers", callback_data: "/models", style: "primary" }]],
     });
 
-    expect(mockMessagesSend).toHaveBeenCalledWith(
-      expect.objectContaining({
-        keyboard: expect.any(String),
-      }),
-    );
+    const call = getSendCall();
+    const keyboard = parseVkKeyboard(call.keyboard);
+    expect(keyboard.one_time).toBe(true);
+    expect(keyboard.buttons[0]?.[0]?.action.label).toBe("Browse providers");
+    expect(keyboard.buttons[0]?.[0]?.action.payload).toBe(JSON.stringify({ oc: "/models" }));
   });
 
   it("reuses the same VK instance for the same token", async () => {
@@ -503,12 +531,11 @@ describe("sendPayloadVk", () => {
     );
 
     expect(result).toEqual({ messageId: "22", chatId: "123" });
-    expect(mockMessagesSend).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: "Select a provider:",
-        keyboard: expect.any(String),
-      }),
-    );
+    const call = getSendCall();
+    expect(call.message).toBe("Select a provider:");
+    const keyboard = parseVkKeyboard(call.keyboard);
+    expect(keyboard.buttons[0]?.[0]?.action.label).toBe("OpenAI");
+    expect(keyboard.buttons[0]?.[0]?.action.payload).toBe(JSON.stringify({ oc: "/models openai" }));
   });
 
   it("enriches parsed model text with keyboard buttons containing correct labels", async () => {
@@ -526,11 +553,8 @@ describe("sendPayloadVk", () => {
       { cfg },
     );
 
-    const call = mockMessagesSend.mock.calls[0][0];
-    expect(call.keyboard).toBeDefined();
-    const parsed = JSON.parse(call.keyboard as string) as {
-      buttons: Array<Array<{ action: { label: string; payload: string } }>>;
-    };
+    const call = getSendCall();
+    const parsed = parseVkKeyboard(call.keyboard);
     const labels = parsed.buttons.flat().map((b) => b.action.label);
     expect(labels).toContain("anthropic");
     expect(labels).toContain("openai");
@@ -580,18 +604,15 @@ describe("sendPayloadVk", () => {
     );
 
     expect(mockMessagesSend).toHaveBeenCalledTimes(2);
-    expect(mockMessagesSend.mock.calls[0][0]).toEqual(
-      expect.objectContaining({
-        message: "chunk-1",
-      }),
-    );
-    expect(mockMessagesSend.mock.calls[0][0]).not.toHaveProperty("keyboard");
-    expect(mockMessagesSend.mock.calls[1][0]).toEqual(
-      expect.objectContaining({
-        message: "chunk-2",
-        keyboard: expect.any(String),
-      }),
-    );
+    const firstCall = getSendCall(0);
+    expect(firstCall.message).toBe("chunk-1");
+    expect(firstCall).not.toHaveProperty("keyboard");
+
+    const secondCall = getSendCall(1);
+    expect(secondCall.message).toBe("chunk-2");
+    const keyboard = parseVkKeyboard(secondCall.keyboard);
+    expect(keyboard.buttons[0]?.[0]?.action.label).toBe("OpenAI");
+    expect(keyboard.buttons[0]?.[0]?.action.payload).toBe(JSON.stringify({ oc: "/models openai" }));
   });
 
   it("sends image media through VK upload flow instead of appending a link to text", async () => {

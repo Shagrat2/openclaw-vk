@@ -398,13 +398,15 @@ describe("resolveVkInboundResolvedMedia", () => {
       filePathHint: "IMG_0001.HEIC",
       maxBytes: 20 * 1024 * 1024,
     });
-    expect(saveMediaBuffer).toHaveBeenCalledWith(
-      expect.any(Buffer),
-      "image/heic",
-      "inbound",
-      20 * 1024 * 1024,
-      "IMG_0001.HEIC",
-    );
+    const saveCall = saveMediaBuffer.mock.calls[0] as
+      | [Buffer, string, string, number, string]
+      | undefined;
+    expect(saveCall).toBeDefined();
+    expect(saveCall![0]).toEqual(Buffer.from("heic-image"));
+    expect(saveCall![1]).toBe("image/heic");
+    expect(saveCall![2]).toBe("inbound");
+    expect(saveCall![3]).toBe(20 * 1024 * 1024);
+    expect(saveCall![4]).toBe("IMG_0001.HEIC");
     expect(resolveVkInboundResolvedMediaPaths(result)).toEqual([
       "/tmp/openclaw/media/inbound/photo.heic",
     ]);

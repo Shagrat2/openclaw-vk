@@ -145,7 +145,9 @@ describe("patchVkAccountConfig", () => {
       patch: { token: "new" },
     });
     const vk = (result.channels as Record<string, Record<string, unknown>>).vk;
-    expect(vk.accounts).toBeDefined();
+    expect(vk.accounts).toEqual({
+      sales: { token: "new" },
+    });
   });
 });
 
@@ -231,7 +233,7 @@ describe("vkSetupAdapter", () => {
         accountId: "default",
         input: {},
       });
-      expect(err).toBeTruthy();
+      expect(err).toBe("VK requires a community access token (or --use-env).");
     });
 
     it("accepts input with token", () => {
@@ -305,6 +307,31 @@ describe("vkSetupAdapter", () => {
       const sales = (vk.accounts as Record<string, Record<string, unknown>>).sales;
       expect(sales.token).toBe("sales-tok");
       expect(sales.enabled).toBe(true);
+    });
+
+    it("keeps default account enabled even when input has no token fields", () => {
+      const result = vkSetupAdapter.applyAccountConfig({
+        cfg: baseCfg,
+        accountId: "default",
+        input: {},
+      });
+      const vk = (result.channels as Record<string, Record<string, unknown>>).vk;
+      expect(vk.enabled).toBe(true);
+      expect(vk.token).toBeUndefined();
+      expect(vk.tokenFile).toBeUndefined();
+    });
+
+    it("keeps named account enabled even when input has no token fields", () => {
+      const result = vkSetupAdapter.applyAccountConfig({
+        cfg: baseCfg,
+        accountId: "sales",
+        input: {},
+      });
+      const vk = (result.channels as Record<string, Record<string, unknown>>).vk;
+      const sales = (vk.accounts as Record<string, Record<string, unknown>>).sales;
+      expect(sales.enabled).toBe(true);
+      expect(sales.token).toBeUndefined();
+      expect(sales.tokenFile).toBeUndefined();
     });
   });
 

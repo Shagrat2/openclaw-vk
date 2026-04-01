@@ -17,6 +17,37 @@ export type VkFormattedMessage = {
   formatData?: VkFormatData;
 };
 
+export function collapseBlankLinesBeforeVkCodeFences(text: string): string {
+  if (!text) {
+    return "";
+  }
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const normalized: string[] = [];
+  let inFence = false;
+
+  for (const line of lines) {
+    const trimmed = line.trimStart();
+    const isFence = trimmed.startsWith("```");
+
+    if (isFence && !inFence) {
+      while (normalized.length > 0 && normalized[normalized.length - 1].trim() === "") {
+        normalized.pop();
+      }
+      normalized.push(line);
+      inFence = true;
+      continue;
+    }
+
+    normalized.push(line);
+
+    if (isFence && inFence) {
+      inFence = false;
+    }
+  }
+
+  return normalized.join("\n");
+}
+
 function mergeFormatItems(items: VkFormatItem[]): VkFormatItem[] {
   if (items.length === 0) {
     return items;
@@ -72,6 +103,62 @@ export function renderVkMarkdown(markdown: string): VkFormattedMessage {
     return -1;
   };
 
+  const findClosingSingleEmphasis = (
+    text: string,
+    marker: "*" | "_",
+    start: number,
+  ) => {
+    let index = start;
+    while (index < text.length) {
+      if (text[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (text[index] !== marker) {
+        index += 1;
+        continue;
+      }
+
+      const prevSame = text[index - 1] === marker;
+      const nextSame = text[index + 1] === marker;
+      const secondInPair = prevSame && text[index - 2] !== marker;
+      if (nextSame || secondInPair) {
+        index += 1;
+        continue;
+      }
+
+      return index;
+    }
+    return -1;
+  };
+
+  const findClosingLinkDestination = (text: string, start: number) => {
+    let index = start;
+    let nestedParens = 0;
+    while (index < text.length) {
+      const ch = text[index];
+      if (ch === "\\") {
+        index += 2;
+        continue;
+      }
+      if (ch === "(") {
+        nestedParens += 1;
+        index += 1;
+        continue;
+      }
+      if (ch === ")") {
+        if (nestedParens === 0) {
+          return index;
+        }
+        nestedParens -= 1;
+        index += 1;
+        continue;
+      }
+      index += 1;
+    }
+    return -1;
+  };
+
   const parseInline = (text: string, baseOffset: number) => {
     let local = "";
     const localItems: VkFormatItem[] = [];
@@ -95,10 +182,22 @@ export function renderVkMarkdown(markdown: string): VkFormattedMessage {
         }
       }
 
+      if (ch === "`") {
+        const close = findClosing(text, "`", index + 1);
+        if (close > index) {
+          appendLocal(text.slice(index, close + 1));
+          index = close + 1;
+          continue;
+        }
+        appendLocal(ch);
+        index += 1;
+        continue;
+      }
+
       if (ch === "[") {
         const closeBracket = findClosing(text, "]", index + 1);
         if (closeBracket > index && text[closeBracket + 1] === "(") {
-          const closeParen = findClosing(text, ")", closeBracket + 2);
+          const closeParen = findClosingLinkDestination(text, closeBracket + 2);
           if (closeParen > closeBracket + 1) {
             const label = text.slice(index + 1, closeBracket);
             const url = text.slice(closeBracket + 2, closeParen);
@@ -157,7 +256,7 @@ export function renderVkMarkdown(markdown: string): VkFormattedMessage {
           index += 1;
           continue;
         }
-        const close = findClosing(text, ch, index + 1);
+        const close = findClosingSingleEmphasis(text, ch, index + 1);
         if (close > index) {
           const beforeClose = text[close - 1] ?? "";
           if (beforeClose && !isWhitespace(beforeClose)) {
@@ -218,24 +317,16 @@ export function renderVkMarkdown(markdown: string): VkFormattedMessage {
 
   let index = 0;
   let inCodeBlock = false;
-  let inInlineCode = false;
 
   while (index < source.length) {
-    if (!inInlineCode && source.startsWith("```", index)) {
+    if (source.startsWith("```", index)) {
       inCodeBlock = !inCodeBlock;
       append("```");
       index += 3;
       continue;
     }
 
-    if (!inCodeBlock && source[index] === "`") {
-      inInlineCode = !inInlineCode;
-      append("`");
-      index += 1;
-      continue;
-    }
-
-    if (inCodeBlock || inInlineCode) {
+    if (inCodeBlock) {
       append(source[index]);
       index += 1;
       continue;
@@ -245,16 +336,11 @@ export function renderVkMarkdown(markdown: string): VkFormattedMessage {
     if (nextFence === -1) {
       nextFence = source.length;
     }
-    let nextTick = source.indexOf("`", index);
-    if (nextTick === -1) {
-      nextTick = source.length;
-    }
-    const next = Math.min(nextFence, nextTick);
-    const chunk = source.slice(index, next);
+    const chunk = source.slice(index, nextFence);
     const parsed = parseInline(chunk, output.length);
     append(parsed.text);
     items.push(...parsed.items);
-    index = next;
+    index = nextFence;
   }
 
   const mergedItems = mergeFormatItems(items);

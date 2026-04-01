@@ -721,13 +721,24 @@ describe("dispatch payload", () => {
     });
 
     const dispatchCall = getDispatchCall(runtime);
-    expect(dispatchCall.dispatcherOptions.typingCallbacks).toBeDefined();
-    expect(dispatchCall.dispatcherOptions.onReplyStart).toBeDefined();
+    const typingCallbacks = dispatchCall.dispatcherOptions.typingCallbacks as
+      | { onReplyStart: unknown }
+      | undefined;
+    const onReplyStart = dispatchCall.dispatcherOptions.onReplyStart as (() => Promise<void>) | undefined;
+    expect(typingCallbacks?.onReplyStart).toBeTypeOf("function");
+    expect(onReplyStart).toBeTypeOf("function");
+    expect(dispatchCall.dispatcherOptions.typingCallbacks).toBe(
+      mockCreateTypingCallbacks.mock.results[0]?.value,
+    );
 
     expect(mockSendTypingVk).toHaveBeenCalledWith(
       String(SENDER_ID),
       expect.objectContaining({ accountId: "default" }),
     );
+
+    const callsBeforeSecondStart = mockSendTypingVk.mock.calls.length;
+    await onReplyStart?.();
+    expect(mockSendTypingVk).toHaveBeenCalledTimes(callsBeforeSecondStart);
   });
 
   it("marks the inbound message as read before dispatching", async () => {
@@ -1160,18 +1171,19 @@ describe("dispatch payload", () => {
   it("records inbound activity before dispatching", async () => {
     const runtime = installRuntime();
     const statusSink = vi.fn();
+    const message = makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID });
 
     await handleVkInbound({
-      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      message,
       account: makeAccount({ config: { dmPolicy: "open" } }),
       config: baseCfg(),
       runtime: createVkRuntimeEnv(),
       statusSink,
     });
 
-    expect(statusSink).toHaveBeenCalledWith(
-      expect.objectContaining({ lastInboundAt: expect.any(Number) }),
-    );
+    const statusUpdate = statusSink.mock.calls[0]?.[0] as { lastInboundAt?: number } | undefined;
+    expect(statusUpdate?.lastInboundAt).toBeTypeOf("number");
+    expect(statusUpdate!.lastInboundAt).toBe(message.timestamp);
     expect(vi.mocked(runtime.channel.session.recordInboundSession)).toHaveBeenCalledOnce();
     expect(vi.mocked(runtime.channel.session.recordInboundSession)).toHaveBeenCalledWith(
       expect.objectContaining({

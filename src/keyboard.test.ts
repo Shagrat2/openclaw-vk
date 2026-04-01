@@ -8,6 +8,21 @@ import {
   resolveVkCommandFromPayload,
 } from "./keyboard.js";
 
+type VkKeyboardJson = {
+  one_time: boolean;
+  buttons: Array<Array<{ action: { label: string; payload: string }; color: string }>>;
+};
+
+function parseKeyboardJson(raw: string | undefined): VkKeyboardJson {
+  expect(raw).toBeTypeOf("string");
+  return JSON.parse(raw as string) as VkKeyboardJson;
+}
+
+function requireValue<T>(value: T | undefined): T {
+  expect(value).toBeDefined();
+  return value as T;
+}
+
 describe("buildVkButtonsFromTextMenu", () => {
   it("builds provider buttons from /models provider list text", () => {
     const buttons = buildVkButtonsFromTextMenu(
@@ -108,8 +123,7 @@ describe("buildVkButtonsFromTextMenu", () => {
       ].join("\n"),
     );
 
-    expect(buttons).toBeDefined();
-    const callbacks = buttons!.flat().map((b) => b.callback_data);
+    const callbacks = requireValue(buttons).flat().map((b) => b.callback_data);
     expect(callbacks).toContain("/think off");
     expect(callbacks).toContain("/think medium");
     // Ensure it's /think, not /thinking
@@ -184,12 +198,7 @@ describe("buildVkKeyboard", () => {
     const keyboard = buildVkKeyboard([
       [{ text: "Browse providers", callback_data: "/models", style: "primary" }],
     ]);
-    expect(keyboard).toBeDefined();
-
-    const parsed = JSON.parse(keyboard ?? "{}") as {
-      one_time: boolean;
-      buttons: Array<Array<{ action: { label: string; payload: string }; color: string }>>;
-    };
+    const parsed = parseKeyboardJson(keyboard);
     expect(parsed.one_time).toBe(true);
     expect(parsed.buttons[0]?.[0]?.action.label).toBe("Browse providers");
     expect(parsed.buttons[0]?.[0]?.color).toBe("primary");
@@ -212,9 +221,7 @@ describe("buildVkKeyboard", () => {
       ],
     ]);
 
-    const parsed = JSON.parse(keyboard ?? "{}") as {
-      buttons: Array<Array<{ action: { label: string } }>>;
-    };
+    const parsed = parseKeyboardJson(keyboard);
     expect(parsed.buttons).toHaveLength(1);
     expect(parsed.buttons[0]).toHaveLength(1);
     expect(parsed.buttons[0]?.[0]?.action.label.length).toBeLessThanOrEqual(40);
@@ -332,7 +339,7 @@ describe("buildVkKeyboard edge cases", () => {
     const keyboard = buildVkKeyboard([
       [{ text: "OK", callback_data: "/ok", style: "success" }],
     ]);
-    const parsed = JSON.parse(keyboard!);
+    const parsed = parseKeyboardJson(keyboard);
     expect(parsed.buttons[0][0].color).toBe("positive");
   });
 
@@ -340,7 +347,7 @@ describe("buildVkKeyboard edge cases", () => {
     const keyboard = buildVkKeyboard([
       [{ text: "Cancel", callback_data: "/cancel", style: "danger" }],
     ]);
-    const parsed = JSON.parse(keyboard!);
+    const parsed = parseKeyboardJson(keyboard);
     expect(parsed.buttons[0][0].color).toBe("negative");
   });
 
@@ -348,7 +355,7 @@ describe("buildVkKeyboard edge cases", () => {
     const keyboard = buildVkKeyboard([
       [{ text: "Test", callback_data: "/test" }],
     ]);
-    const parsed = JSON.parse(keyboard!);
+    const parsed = parseKeyboardJson(keyboard);
     expect(parsed.buttons[0][0].color).toBe("secondary");
   });
 });
@@ -381,13 +388,11 @@ describe("buildVkButtonsFromTextMenu edge cases", () => {
         "Switch: /model <provider/model>",
       ].join("\n"),
     );
-    expect(buttons).toBeDefined();
-    const navRow = buttons!.find((row) =>
+    const navRow = requireValue(buttons).find((row) =>
       row.some((btn) => btn.text === "Next" || btn.text === "Prev"),
     );
-    expect(navRow).toBeDefined();
-    expect(navRow!.some((btn) => btn.text === "Prev")).toBe(false);
-    expect(navRow!.some((btn) => btn.text === "Next")).toBe(true);
+    expect(navRow?.some((btn) => btn.text === "Prev")).toBe(false);
+    expect(navRow?.some((btn) => btn.text === "Next")).toBe(true);
   });
 
   it("builds last-page model buttons (has Prev, no Next)", () => {
@@ -399,12 +404,10 @@ describe("buildVkButtonsFromTextMenu edge cases", () => {
         "Switch: /model <provider/model>",
       ].join("\n"),
     );
-    expect(buttons).toBeDefined();
-    const navRow = buttons!.find((row) =>
+    const navRow = requireValue(buttons).find((row) =>
       row.some((btn) => btn.text === "Next" || btn.text === "Prev"),
     );
-    expect(navRow).toBeDefined();
-    expect(navRow!.some((btn) => btn.text === "Prev")).toBe(true);
-    expect(navRow!.some((btn) => btn.text === "Next")).toBe(false);
+    expect(navRow?.some((btn) => btn.text === "Prev")).toBe(true);
+    expect(navRow?.some((btn) => btn.text === "Next")).toBe(false);
   });
 });
