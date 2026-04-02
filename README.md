@@ -13,6 +13,7 @@
 3. Откройте **Управление → Работа с API → Ключи доступа**, нажмите *Создать ключ* и выберите права:
    - **Сообщения сообщества**
    - **Управление сообществом** (необходимо для Bots Long Poll API)
+   - **Фотографии** / `photos` (обязательно для исходящих изображений, включая результаты image-edit)
    - **Документы** / `docs` (обязательно для исходящих файлов, TTS audio и голосовых сообщений, потому что VK upload идёт через `docs.getMessagesUploadServer`)
 4. Откройте **Управление → Работа с API → Long Poll API**:
    - Включите Long Poll API.
@@ -177,7 +178,7 @@ openclaw channels status --json --probe
 
 **Статус `running: false` при `configured: true`** — неверный токен. Подробности в поле `lastError` вывода команды статуса.
 
-**`APIError: Code №15 - Access denied: no access to call this method. It cannot be called with current scopes.` при отправке аудио/документов** — у текущего community token нет права `docs`.
+**`APIError: Code №15 - Access denied: no access to call this method. It cannot be called with current scopes.` при отправке изображений/аудио/документов** — у текущего community token нет прав `photos` и/или `docs`.
 
 Как исправить:
 1. Откройте сообщество во ВКонтакте.
@@ -186,6 +187,7 @@ openclaw channels status --json --probe
 4. В списке прав обязательно отметьте:
    - **Сообщения сообщества** / `messages`
    - **Управление сообществом** / `manage`
+   - **Фотографии** / `photos`
    - **Документы** / `docs`
 5. Подтвердите создание ключа в мобильном приложении VK.
 6. Обновите `channels.vk.token` в `~/.openclaw/openclaw.json`.
@@ -195,14 +197,23 @@ openclaw channels status --json --probe
    ```
 
 Проверка:
+- `photos.getMessagesUploadServer` требует право `photos` и используется для исходящих изображений.
 - `docs.getMessagesUploadServer` требует право `docs` и используется для `doc` и `audio_message`, поэтому без него исходящие файлы и голосовые не отправятся.
 - Исходящие `audio/*` вложения плагин отправляет как `audio_message` (голосовое). Если нужен обычный файл, используйте `forceDocument`.
 - Текущие права токена можно проверить через `groups.getTokenPermissions`.
-- Если после обновления токена `groups.getTokenPermissions` показывает только `messages` и `manage`, создайте новый ключ заново и убедитесь, что `docs` отмечен при создании.
+- Если после обновления токена `groups.getTokenPermissions` показывает только `messages` и `manage`, создайте новый ключ заново и убедитесь, что `photos` и `docs` отмечены при создании.
+
+Отдельный симптом:
+- **`APIError: Code №100 - One of the parameters specified was missing or invalid: photo is undefined`** при отправке картинки по URL. Это означает, что исходный URL недоступен для загрузки как изображение (часто 404/403, редирект на HTML или временная ссылка без публичного доступа).
+  Плагин пытается автоматически:
+  1. повторить отправку через локальный upload (скачать URL на стороне OpenClaw и загрузить в VK как файл),
+  2. если скачать не удалось, отправить текст + исходный URL, чтобы сообщение не терялось в очереди.
+  Чтобы изображение ушло именно вложением, URL должен быть публичным, отдавать `image/*` и быть доступным с хоста OpenClaw (проверьте `curl -I <url>` прямо на сервере).
 
 Официальная документация VK:
 - Настройки community token: <https://dev.vk.com/ru/api/access-token/community-token/in-community-settings>
 - Проверка прав токена: <https://dev.vk.com/ru/method/groups.getTokenPermissions>
+- Upload для изображений: <https://dev.vk.com/ru/method/photos.getMessagesUploadServer>
 - Upload для документов и голосовых: <https://dev.vk.com/ru/method/docs.getMessagesUploadServer>
 
 **Бот не отвечает, ошибок нет** — сообщения отклоняются политиками доступа. Проверьте `dmPolicy`, `allowFrom` и `requireMention`. Логи: `~/.openclaw/logs/commands.log` (фильтруйте по `"source":"vk"`).

@@ -57,6 +57,7 @@ const mockGroupsGetById = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] }),
 );
 const mockGetRandomId = vi.hoisted(() => vi.fn().mockReturnValue(99999));
+const mockFetch = vi.hoisted(() => vi.fn());
 
 vi.mock("vk-io", () => ({
   // Must use a regular function (not an arrow) so `new VK(...)` works.
@@ -81,6 +82,7 @@ vi.mock("vk-io", () => ({
   }),
   getRandomId: mockGetRandomId,
 }));
+vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
 
 const TOKEN = "test-token";
 const cfg = { channels: { vk: { token: TOKEN } } } as never;
@@ -117,21 +119,22 @@ function parseVkKeyboard(value: unknown): VkKeyboardPayload {
   return JSON.parse(value as string) as VkKeyboardPayload;
 }
 
-describe("sendMessageVk", () => {
-  beforeEach(() => {
-    clearVkInstances();
-    mockMessagesSend.mockReset();
-    mockMessagesMarkAsRead.mockReset().mockResolvedValue(1);
-    mockSetActivity.mockReset().mockResolvedValue(1);
-    mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
-    mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
-    mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
-    mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
-    mockChunkMarkdownText.mockReset().mockImplementation((text: string) => [text]);
-    // Reset the constructor call count so per-test assertions stay isolated.
-    vi.mocked(VK).mockClear();
-  });
+beforeEach(() => {
+  clearVkInstances();
+  mockMessagesSend.mockReset();
+  mockMessagesMarkAsRead.mockReset().mockResolvedValue(1);
+  mockSetActivity.mockReset().mockResolvedValue(1);
+  mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
+  mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
+  mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
+  mockChunkMarkdownText.mockReset().mockImplementation((text: string) => [text]);
+  mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
+  // Reset constructor counters between tests.
+  vi.mocked(VK).mockClear();
+});
 
+describe("sendMessageVk", () => {
   it("sends a text message and returns messageId + chatId", async () => {
     mockMessagesSend.mockResolvedValueOnce(42);
 
@@ -639,6 +642,227 @@ describe("sendPayloadVk", () => {
     );
   });
 
+  it("retries image upload with downloaded buffer when VK rejects URL source", async () => {
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError).mockResolvedValueOnce("photo321_654");
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: () => "image/png",
+      },
+      arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
+    } as Response);
+    mockMessagesSend.mockResolvedValueOnce(34);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "34", chatId: "123" });
+    expect(mockFetch).toHaveBeenCalledWith("https://example.com/photo.png", expect.any(Object));
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+    expect(mockUploadPhoto.mock.calls[0]?.[0]).toEqual({
+      peer_id: 123,
+      source: { value: "https://example.com/photo.png" },
+    });
+    expect(mockUploadPhoto.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({
+        peer_id: 123,
+        source: expect.objectContaining({ value: expect.any(Buffer) }),
+      }),
+    );
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "caption",
+        attachment: "photo321_654",
+      }),
+    );
+  });
+
+  it("falls back to URL text when VK rejects URL photo and remote download fails", async () => {
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
+    mockFetch.mockRejectedValueOnce(new Error("download failed"));
+    mockMessagesSend.mockResolvedValueOnce(35);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "35", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "caption\nhttps://example.com/photo.png",
+      }),
+    );
+    expect(getSendCall(mockMessagesSend.mock.calls.length - 1)).not.toHaveProperty("attachment");
+  });
+
+  it("falls back to URL text when fetched URL is not an image content-type", async () => {
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: () => "text/html; charset=utf-8",
+      },
+      arrayBuffer: async () => Buffer.from("<html>not image</html>").buffer,
+    } as Response);
+    mockMessagesSend.mockResolvedValueOnce(36);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "36", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "caption\nhttps://example.com/photo.png",
+      }),
+    );
+    expect(getSendCall(mockMessagesSend.mock.calls.length - 1)).not.toHaveProperty("attachment");
+  });
+
+  it("falls back to document upload when photo upload is denied by token scopes", async () => {
+    const scopeError = Object.assign(
+      new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
+      { code: 15 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(scopeError);
+    mockUploadDocument.mockResolvedValueOnce("doc123_789");
+    mockMessagesSend.mockResolvedValueOnce(29);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "29", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: { value: "https://example.com/photo.png" },
+    });
+    expect(mockUploadDocument).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: { value: "https://example.com/photo.png" },
+      title: "photo.png",
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "caption",
+        attachment: "doc123_789",
+      }),
+    );
+  });
+
+  it("falls back to URL text when both photo and document uploads are denied by token scopes", async () => {
+    const scopeError = Object.assign(
+      new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
+      { code: 15 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(scopeError);
+    mockUploadDocument.mockRejectedValueOnce(scopeError);
+    mockMessagesSend.mockResolvedValueOnce(30);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "30", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: { value: "https://example.com/photo.png" },
+      }),
+    );
+    expect(mockUploadDocument).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: { value: "https://example.com/photo.png" },
+        title: "photo.png",
+      }),
+    );
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "caption\nhttps://example.com/photo.png",
+      }),
+    );
+    expect(getSendCall(mockMessagesSend.mock.calls.length - 1)).not.toHaveProperty(
+      "attachment",
+    );
+  });
+
+  it("sends explanatory text fallback when media has no public URL and upload is denied", async () => {
+    const scopeError = Object.assign(
+      new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
+      { code: 15 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(scopeError);
+    mockUploadDocument.mockRejectedValueOnce(scopeError);
+    mockMessagesSend.mockResolvedValueOnce(33);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "data:image/png;base64,iVBORw0KGgo=",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "33", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({ value: expect.any(Buffer) }),
+      }),
+    );
+    expect(mockUploadDocument).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({ value: expect.any(Buffer) }),
+      }),
+    );
+    const fallbackCall = getSendCall(mockMessagesSend.mock.calls.length - 1);
+    expect(fallbackCall.message).toContain("caption");
+    expect(fallbackCall.message).toContain(
+      "Attachment generated, but VK token lacks media upload scopes (photos/docs).",
+    );
+    expect(fallbackCall).not.toHaveProperty("attachment");
+  });
+
   it("sends audio media through VK audio_message upload flow", async () => {
     mockMessagesSend.mockResolvedValueOnce(28);
 
@@ -660,6 +884,55 @@ describe("sendPayloadVk", () => {
       expect.objectContaining({
         message: "voice caption",
         attachment: "audio_message123_789",
+      }),
+    );
+  });
+
+  it("sends remaining text chunks after media as plain messages", async () => {
+    mockChunkMarkdownText.mockReturnValueOnce(["caption", "tail-1", "tail-2"]);
+    mockMessagesSend.mockResolvedValue(31);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption tail",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "31", chatId: "123" });
+    expect(getSendCall(0).message).toBe("caption");
+    expect(getSendCall(1).message).toBe("tail-1");
+    expect(getSendCall(2).message).toBe("tail-2");
+  });
+
+  it("falls back to URL text when document upload is denied by token scopes", async () => {
+    const scopeError = Object.assign(
+      new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
+      { code: 15 },
+    );
+    mockUploadDocument.mockRejectedValueOnce(scopeError);
+    mockMessagesSend.mockResolvedValueOnce(32);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "doc caption",
+        mediaUrl: "https://example.com/report.pdf",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "32", chatId: "123" });
+    expect(mockUploadDocument).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: { value: "https://example.com/report.pdf" },
+      title: "report.pdf",
+    });
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "doc caption\nhttps://example.com/report.pdf",
       }),
     );
   });
@@ -1055,6 +1328,38 @@ describe("applyVkAllowlistConfigEdit", () => {
     }
   });
 
+  it("targets default account when accounts map already exists", () => {
+    const parsedConfig: Record<string, unknown> = {
+      channels: {
+        vk: {
+          accounts: {
+            default: {
+              allowFrom: ["111"],
+            },
+          },
+        },
+      },
+    };
+    const result = applyVkAllowlistConfigEdit({
+      cfg: {} as never,
+      parsedConfig,
+      scope: "dm",
+      action: "add",
+      entry: "222",
+    });
+
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.pathLabel).toBe("channels.vk.accounts.default.allowFrom");
+      expect(result.writeTarget).toEqual({
+        kind: "account",
+        scope: { channelId: "vk", accountId: "default" },
+      });
+      const vk = (parsedConfig as any).channels.vk;
+      expect(vk.accounts.default.allowFrom).toEqual(["111", "222"]);
+    }
+  });
+
   it("deletes the key when removing the last entry", () => {
     const parsedConfig: Record<string, unknown> = {
       channels: { vk: { allowFrom: ["123"] } },
@@ -1143,12 +1448,6 @@ describe("resolveVkDirectoryGroups", () => {
 // ── Retry logic ─────────────────────────────────────────────────────────────
 
 describe("retry logic", () => {
-  beforeEach(() => {
-    clearVkInstances();
-    mockMessagesSend.mockReset();
-    vi.mocked(VK).mockClear();
-  });
-
   it("retries on VK error code 6 (too many requests)", async () => {
     const error = Object.assign(new Error("Too many requests"), { code: 6 });
     mockMessagesSend.mockRejectedValueOnce(error).mockResolvedValueOnce(42);
@@ -1156,6 +1455,24 @@ describe("retry logic", () => {
     const result = await sendMessageVk("123", "hello", { cfg });
     expect(result.messageId).toBe("42");
     expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the same random_id across retries for idempotent sends", async () => {
+    const error = Object.assign(new Error("Too many requests"), { code: 6 });
+    mockGetRandomId.mockReset().mockReturnValueOnce(1001).mockReturnValueOnce(1002);
+    mockMessagesSend.mockRejectedValueOnce(error).mockResolvedValueOnce(42);
+
+    const result = await sendMessageVk("123", "hello", { cfg });
+
+    expect(result.messageId).toBe("42");
+    expect(mockGetRandomId).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(mockMessagesSend.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({ random_id: 1001 }),
+    );
+    expect(mockMessagesSend.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({ random_id: 1001 }),
+    );
   });
 
   it("retries on timeout-like error messages", async () => {

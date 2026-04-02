@@ -14,7 +14,10 @@ import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 const VK_MESSAGE_TEXT_LIMIT = 4096;
 const VK_TRANSIENT_RETRY_ATTEMPTS = 2;
 const VK_GROUP_CHAT_OFFSET = 2_000_000_000;
+const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 const DEFAULT_ACCOUNT_ID = "default";
+const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
+  "Attachment generated, but VK token lacks media upload scopes (photos/docs).";
 
 export type SendVkOptions = {
   cfg?: CoreConfig;
@@ -68,28 +71,89 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function isRetryableVkError(error: unknown): boolean {
+function readVkErrorCode(error: unknown): number | undefined {
   if (!error || typeof error !== "object") {
-    return false;
+    return undefined;
   }
   const record = error as Record<string, unknown>;
-  const errorCode =
-    typeof record.code === "number"
-      ? record.code
-      : typeof record.error_code === "number"
-        ? record.error_code
-        : undefined;
-  if (errorCode === 6 || errorCode === 9 || errorCode === 10) {
-    return true;
+  if (typeof record.code === "number") {
+    return record.code;
   }
-  const message = [
+  if (typeof record.error_code === "number") {
+    return record.error_code;
+  }
+  return undefined;
+}
+
+function readVkErrorMessage(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+  const record = error as Record<string, unknown>;
+  return [
     typeof record.message === "string" ? record.message : "",
     typeof record.name === "string" ? record.name : "",
     typeof record.description === "string" ? record.description : "",
   ]
     .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+    .join(" ");
+}
+
+function isVkScopeDeniedError(error: unknown): boolean {
+  if (readVkErrorCode(error) === 15) {
+    return true;
+  }
+  const message = readVkErrorMessage(error).toLowerCase();
+  return message.includes("access denied") && message.includes("scope");
+}
+
+function isVkPhotoSourceRejectedError(error: unknown): boolean {
+  if (readVkErrorCode(error) !== 100) {
+    return false;
+  }
+  const message = readVkErrorMessage(error).toLowerCase();
+  return message.includes("photo is undefined") || message.includes("photo undefined");
+}
+
+function isVkImageUploadFallbackError(error: unknown): boolean {
+  return isVkScopeDeniedError(error) || isVkPhotoSourceRejectedError(error);
+}
+
+function isHttpUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
+
+async function materializeRemoteVkPhotoSource(sourceUrl: string): Promise<Buffer | null> {
+  if (typeof fetch !== "function" || !isHttpUrl(sourceUrl)) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(sourceUrl, { signal: controller.signal });
+    if (!response.ok) {
+      return null;
+    }
+    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (contentType && !contentType.startsWith("image/")) {
+      return null;
+    }
+    const body = Buffer.from(await response.arrayBuffer());
+    return body.length > 0 ? body : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isRetryableVkError(error: unknown): boolean {
+  const errorCode = readVkErrorCode(error);
+  if (errorCode === 6 || errorCode === 9 || errorCode === 10) {
+    return true;
+  }
+  const message = readVkErrorMessage(error).toLowerCase();
   return /timeout|timed out|temporar|econnreset|socket hang up|too many requests|rate limit|429|5\d\d/.test(
     message,
   );
@@ -213,11 +277,12 @@ async function sendVkApiMessage(params: {
     formatted.formatData && formatted.formatData.items.length > 0
       ? JSON.stringify(formatted.formatData)
       : undefined;
+  const randomId = getRandomId();
   const messageId = await withVkRetry(async () => {
     return await vk.api.messages.send({
       peer_id: params.peerId,
       message: formatted.text,
-      random_id: getRandomId(),
+      random_id: randomId,
       ...(params.attachment ? { attachment: params.attachment } : {}),
       ...(keyboard ? { keyboard } : {}),
       ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
@@ -446,13 +511,73 @@ async function sendResolvedMediaVk(params: {
     mediaLocalRoots: params.opts.mediaLocalRoots,
     forceDocument: params.opts.forceDocument,
   });
+  const sourceUrl = isHttpUrl(media.mediaUrl) ? media.mediaUrl : undefined;
+
+  const sendSourceUrlFallback = async (): Promise<SendVkResult> => {
+    if (!sourceUrl) {
+      const fallbackText = params.caption?.trim()
+        ? `${params.caption.trim()}\n${VK_MEDIA_SCOPE_FALLBACK_NOTICE}`
+        : VK_MEDIA_SCOPE_FALLBACK_NOTICE;
+      return await sendMessageVk(params.to, fallbackText, params.opts);
+    }
+    const fallbackText = params.caption?.trim() ? `${params.caption.trim()}\n${sourceUrl}` : sourceUrl;
+    return await sendMessageVk(params.to, fallbackText, params.opts);
+  };
+
   if (media.kind === "image") {
-    return await sendPhotoVk(params.to, media.source, params.caption, params.opts);
+    let photoSource: string | Buffer = media.source;
+    let photoError: unknown;
+    try {
+      return await sendPhotoVk(params.to, photoSource, params.caption, params.opts);
+    } catch (error) {
+      photoError = error;
+    }
+
+    if (sourceUrl && typeof photoSource === "string" && isVkPhotoSourceRejectedError(photoError)) {
+      const materialized = await materializeRemoteVkPhotoSource(sourceUrl);
+      if (!materialized) {
+        return await sendSourceUrlFallback();
+      }
+      photoSource = materialized;
+      try {
+        return await sendPhotoVk(params.to, photoSource, params.caption, params.opts);
+      } catch (retryPhotoError) {
+        photoError = retryPhotoError;
+      }
+    }
+
+    const shouldFallbackToDocument = isVkImageUploadFallbackError(photoError);
+    if (!shouldFallbackToDocument) {
+      throw photoError;
+    }
+
+    try {
+      return await sendDocumentVk(params.to, photoSource, media.title, params.caption, params.opts);
+    } catch (documentError) {
+      if (!isVkImageUploadFallbackError(documentError)) {
+        throw documentError;
+      }
+      return await sendSourceUrlFallback();
+    }
   }
   if (media.kind === "audio_message") {
-    return await sendAudioMessageVk(params.to, media.source, media.title, params.caption, params.opts);
+    try {
+      return await sendAudioMessageVk(params.to, media.source, media.title, params.caption, params.opts);
+    } catch (audioError) {
+      if (!isVkScopeDeniedError(audioError)) {
+        throw audioError;
+      }
+      return await sendSourceUrlFallback();
+    }
   }
-  return await sendDocumentVk(params.to, media.source, media.title, params.caption, params.opts);
+  try {
+    return await sendDocumentVk(params.to, media.source, media.title, params.caption, params.opts);
+  } catch (documentError) {
+    if (!isVkScopeDeniedError(documentError)) {
+      throw documentError;
+    }
+    return await sendSourceUrlFallback();
+  }
 }
 
 async function sendPayloadMediaVk(params: {

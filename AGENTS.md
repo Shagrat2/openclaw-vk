@@ -224,11 +224,14 @@ Error: Cannot find module 'zod'
 - Changelog format must be tag-based: each tag section summarizes changes from the previous tag to the current tag. Section heading is the tag name only (e.g. `## v2026.4.1`) — no separate date, since the version already encodes it.
 - **UX-first principle:** every item leads with what the user sees or can do differently — not the mechanism behind it. Start from the observable effect, then add just enough context to locate the relevant setting if needed. Example: "Bold and italic text in agent replies now renders correctly in VK" — not "Added format_data conversion" or "Implemented VkFormatItem mapping". A good entry passes this test: would a user who only runs `openclaw` and chats via VK understand it without reading the code?
 - Changelog section headings must be in Russian: `Добавлено`, `Улучшено`, `Исправлено`, `Сопровождение`, `Для разработки`.
+- Before finalizing a release entry, compare the previous tag with current `HEAD` and ensure every **user-visible** change in that diff is reflected in the new section. Do not rely on memory.
+- Do not add meta/disclaimer lines in release sections (for example: "this section covers all changes between versions"). Start immediately with user-visible changes.
 - Only log changes that are meaningful to someone deciding whether to update: new capabilities, fixed problems, or raised minimum version. Skip everything else — internal refactors, test additions, `.gitignore`, style fixes. If a release contains only such changes, the entire release section can be omitted or reduced to a single `Сопровождение` line without `Кому важно` / `Что проверить`.
 - For substantive changes, each release entry must include two operational sections:
   - `Кому важно` — name a specific scenario or user type, not just "all users". Example: "Users whose agent replies include formatted text". When it genuinely affects everyone, say what they will notice differently.
   - `Что проверить после обновления` — concrete steps tied to VK channel behavior (pairing, allowlists, group policy, token, gateway restart, plugin status). Not "check that the plugin works" but "send a reply with `**bold**` text and confirm it appears bold in VK".
 - User impact ("why it matters") must always appear in the entry body. Implementation motivation ("why it was built") is included only when clearly supported by evidence (commit message, code comment) — do not guess.
+- Prefer plain UX language in the first sentence of each bullet. Error codes/method names are allowed only as secondary clarification in parentheses, not as the lead.
 - Avoid terms users would not recognise: internal module names, SDK function names, file paths. Retain terms users encounter directly: `dmPolicy`, `groupPolicy`, `pairing`, `token`, `openclaw gateway restart`, `openclaw channels status`.
 - If an item maps to a single commit, append only a short commit hash (no URL).
 
