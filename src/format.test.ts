@@ -6,13 +6,160 @@ import {
 } from "./format.js";
 
 describe("renderVkMarkdown", () => {
-  it("keeps text unchanged except bold/italic/link formatting", () => {
-    const input = ["# Title", "- item", "1. item", "~~strike~~"].join("\n");
+  const VK_SOLID_SEPARATOR = "─".repeat(3);
+
+  it("keeps unsupported markdown unchanged", () => {
+    const input = ["- item", "1. item", "~~strike~~"].join("\n");
 
     const result = renderVkMarkdown(input);
 
     expect(result.text).toBe(input);
     expect(result.formatData).toBeUndefined();
+  });
+
+  it("renders markdown hyphen separators as a solid 3-char line", () => {
+    const input = ["Before", "---", "After"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result).toEqual({
+      text: ["Before", VK_SOLID_SEPARATOR, "After"].join("\n"),
+    });
+  });
+
+  it("keeps markdown separators inside fenced code blocks untouched", () => {
+    const input = ["```md", "---", "```"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result).toEqual({ text: input });
+  });
+
+  it("renders h1-h3 as bold and h4-h6 as italic without hash prefixes", () => {
+    const input = ["# One", "## Two", "### Three", "#### Four", "##### Five", "###### Six", "Body"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result.text).toBe(["ONE", "Two", "Three", "Four", "Five", "Six", "Body"].join("\n"));
+    expect(result.formatData?.items).toEqual([
+      { type: "bold", offset: result.text.indexOf("ONE"), length: 3 },
+      { type: "bold", offset: result.text.indexOf("Two"), length: 3 },
+      { type: "bold", offset: result.text.indexOf("Three"), length: 5 },
+      { type: "italic", offset: result.text.indexOf("Four"), length: 4 },
+      { type: "italic", offset: result.text.indexOf("Five"), length: 4 },
+      { type: "italic", offset: result.text.indexOf("Six"), length: 3 },
+    ]);
+  });
+
+  it("renders h1 headings in uppercase for cyrillic content too", () => {
+    const result = renderVkMarkdown("# Привет, мир");
+
+    expect(result.text).toBe("ПРИВЕТ, МИР");
+    expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "ПРИВЕТ, МИР".length }]);
+  });
+
+  it("supports heading content with trailing marker sequence", () => {
+    const result = renderVkMarkdown("### Основная информация ###");
+
+    expect(result.text).toBe("Основная информация");
+    expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "Основная информация".length }]);
+  });
+
+  it("supports inline markdown inside headings", () => {
+    const result = renderVkMarkdown("### [docs](https://example.com) and *note*");
+
+    expect(result.text).toBe("docs and note");
+    expect(result.formatData?.items).toEqual(
+      expect.arrayContaining([
+        { type: "bold", offset: 0, length: "docs and note".length },
+        { type: "url", offset: 0, length: "docs".length, url: "https://example.com" },
+        { type: "italic", offset: "docs and ".length, length: "note".length },
+      ]),
+    );
+  });
+
+  it("does not treat hash-prefixed words as headings when whitespace is missing", () => {
+    expect(renderVkMarkdown("###Заголовок")).toEqual({ text: "###Заголовок" });
+  });
+
+  it("does not treat deeply indented lines as headings", () => {
+    expect(renderVkMarkdown("    ### not heading")).toEqual({ text: "    ### not heading" });
+  });
+
+  it("keeps headings inside fenced code blocks untouched", () => {
+    const input = ["```md", "### not heading", "```", "### heading"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result.text).toBe(["```md", "### not heading", "```", "heading"].join("\n"));
+    expect(result.formatData?.items).toEqual([
+      {
+        type: "bold",
+        offset: result.text.lastIndexOf("heading"),
+        length: "heading".length,
+      },
+    ]);
+  });
+
+  it("supports headings with up to three leading spaces", () => {
+    const result = renderVkMarkdown("   ### spaced heading");
+
+    expect(result.text).toBe("spaced heading");
+    expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "spaced heading".length }]);
+  });
+
+  it("renders h4 headings as italic and keeps inline markdown", () => {
+    const result = renderVkMarkdown("#### [docs](https://example.com) and **note**");
+
+    expect(result.text).toBe("docs and note");
+    expect(result.formatData?.items).toEqual(
+      expect.arrayContaining([
+        { type: "italic", offset: 0, length: "docs and note".length },
+        { type: "url", offset: 0, length: "docs".length, url: "https://example.com" },
+        { type: "bold", offset: "docs and ".length, length: "note".length },
+      ]),
+    );
+  });
+
+  it("replaces markdown checkboxes with square glyphs", () => {
+    const input = ["- [ ] todo", "- [x] done", "- [X] DONE"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result).toEqual({ text: ["□ todo", "■ done", "■ DONE"].join("\n") });
+  });
+
+  it("does not replace checkbox markers inside fenced code blocks", () => {
+    const input = ["```md", "- [ ] todo", "- [x] done", "```"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result).toEqual({ text: input });
+  });
+
+  it("renders markdown blockquotes as italic while preserving the quote prefix", () => {
+    const input = ["> quoted text", "> [docs](https://example.com) and **note**"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result.text).toBe(["> quoted text", "> docs and note"].join("\n"));
+    expect(result.formatData?.items).toEqual(
+      expect.arrayContaining([
+        { type: "italic", offset: 0, length: "> quoted text".length },
+        { type: "italic", offset: result.text.lastIndexOf(">"), length: "> docs and note".length },
+        {
+          type: "url",
+          offset: result.text.lastIndexOf("docs"),
+          length: "docs".length,
+          url: "https://example.com",
+        },
+        {
+          type: "bold",
+          offset: result.text.lastIndexOf("note"),
+          length: "note".length,
+        },
+      ]),
+    );
+  });
+
+  it("does not apply quote formatting inside fenced code blocks", () => {
+    const input = ["```md", "> quoted", "```"].join("\n");
+    const result = renderVkMarkdown(input);
+
+    expect(result).toEqual({ text: input });
   });
 
   it("extracts bold, italic, and bold+italic ranges", () => {
@@ -231,6 +378,113 @@ describe("renderVkMarkdown", () => {
 
     expect(result.text).toBe("ab");
     expect(result.formatData?.items).toEqual([{ type: "url", offset: 0, length: 2, url: "https://x" }]);
+  });
+
+  it("renders markdown tables as aligned text columns", () => {
+    const input = [
+      "| Name | Qty | Price |",
+      "| --- | --- | --- |",
+      "| A | 2 | 10.5 |",
+      "| Long | 100 | 3 |",
+    ].join("\n");
+
+    const result = renderVkMarkdown(input);
+
+    expect(result.text).toBe(
+      [
+        "Name | Qty | Price",
+        "A       |    2 |   10.5",
+        "Long  |  100 |       3",
+      ].join("\n"),
+    );
+    expect(result.formatData?.items).toEqual(
+      expect.arrayContaining([
+        { type: "bold", offset: result.text.indexOf("Name"), length: "Name".length },
+        { type: "bold", offset: result.text.indexOf("Qty"), length: "Qty".length },
+        { type: "bold", offset: result.text.indexOf("Price"), length: "Price".length },
+      ]),
+    );
+  });
+
+  it("centers non-edge table header columns while keeping edge headers non-centered", () => {
+    const input = [
+      "| Left | Middle | Right |",
+      "| --- | --- | --- |",
+      "| x | 1234567890 | y |",
+    ].join("\n");
+    const result = renderVkMarkdown(input);
+    const headerLine = result.text.split("\n")[0] ?? "";
+    const headerCells = headerLine.split(" | ");
+
+    expect(headerCells[1]?.trim()).toBe("Middle");
+    expect(headerCells[1]?.startsWith(" ")).toBe(true);
+    expect(headerCells[1]?.endsWith(" ")).toBe(true);
+    expect(headerLine.startsWith("Left |")).toBe(true);
+    expect(headerLine.endsWith("| Right")).toBe(true);
+  });
+
+  it("formats inline markdown inside table cells", () => {
+    const input = [
+      "| Col | Value |",
+      "| --- | --- |",
+      "| Link | [docs](https://example.com/docs) |",
+      "| Note | *ok* |",
+    ].join("\n");
+
+    const result = renderVkMarkdown(input);
+
+    expect(result.text).toBe(
+      [
+        "Col    | Value",
+        "Link  | docs ",
+        "Note | ok    ",
+      ].join("\n"),
+    );
+    expect(result.formatData?.items).toEqual(
+      expect.arrayContaining([
+        { type: "bold", offset: result.text.indexOf("Col"), length: "Col".length },
+        { type: "bold", offset: result.text.indexOf("Value"), length: "Value".length },
+        { type: "url", offset: result.text.indexOf("docs"), length: "docs".length, url: "https://example.com/docs" },
+        { type: "italic", offset: result.text.lastIndexOf("ok"), length: "ok".length },
+      ]),
+    );
+  });
+
+  it("does not parse tables inside fenced code blocks", () => {
+    const input = [
+      "```md",
+      "| Name | Qty |",
+      "| --- | --- |",
+      "| A | 2 |",
+      "```",
+    ].join("\n");
+
+    const result = renderVkMarkdown(input);
+
+    expect(result).toEqual({ text: input });
+  });
+
+  it("pads narrow glyph cells more than wide glyph cells with equal text length", () => {
+    const input = [
+      "| C | N |",
+      "| --- | --- |",
+      "| WWW | 1 |",
+      "| iii | 2 |",
+    ].join("\n");
+    const result = renderVkMarkdown(input);
+    const lines = result.text.split("\n");
+
+    const trailingSpaceCountBeforeFirstSeparator = (line: string): number => {
+      const separatorIndex = line.indexOf("|");
+      const beforeSeparator = separatorIndex === -1 ? line : line.slice(0, separatorIndex);
+      return beforeSeparator.length - beforeSeparator.replace(/\s+$/, "").length;
+    };
+
+    expect(lines[1]).toContain("WWW");
+    expect(lines[2]).toContain("iii");
+    expect(trailingSpaceCountBeforeFirstSeparator(lines[2])).toBeGreaterThan(
+      trailingSpaceCountBeforeFirstSeparator(lines[1]),
+    );
   });
 });
 

@@ -31,6 +31,22 @@ openclaw plugins install @openclaw-vk/vk
 openclaw plugins enable vk
 ```
 
+### 2.1 Обновление плагина
+
+```bash
+# Обновить VK-плагин
+openclaw plugins update vk
+
+# Или обновить все плагины
+openclaw plugins update --all
+openclaw plugins update @openclaw-vk/vk@latest
+
+# Установить конкретную версию
+openclaw plugins install @openclaw-vk/vk@2026.4.2
+openclaw gateway restart
+openclaw channels status --json --probe
+```
+
 > Только для локальной разработки: `openclaw plugins install ~/path/to/openclaw-vk`
 
 Примечание про `plugins.allow`:
