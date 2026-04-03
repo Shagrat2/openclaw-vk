@@ -56,6 +56,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "markdown-to-vk": "file:../markdown-to-vk",
     "markdown-it": "^14.1.1",
     "vk-io": "^4.10.1",
     "zod": "^3.25.76"

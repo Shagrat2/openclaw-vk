@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   collapseBlankLinesBeforeVkCodeFences,
+  createVkMarkdownPipeline,
+  markdownToVk,
   renderVkMarkdown,
   trimVkFormattedMessage,
 } from "./format.js";
+import { transformMarkdownHeadingBlock } from "markdown-to-vk";
 
 describe("renderVkMarkdown", () => {
   const VK_SOLID_SEPARATOR = "─".repeat(3);
@@ -485,6 +488,79 @@ describe("renderVkMarkdown", () => {
     expect(trailingSpaceCountBeforeFirstSeparator(lines[2])).toBeGreaterThan(
       trailingSpaceCountBeforeFirstSeparator(lines[1]),
     );
+  });
+});
+
+describe("markdownToVk", () => {
+  it("returns the same text and entities as renderVkMarkdown by default", () => {
+    const input = "### [docs](https://example.com) and **note**";
+
+    const raw = markdownToVk(input);
+    const wrapped = renderVkMarkdown(input);
+
+    expect(raw.text).toBe(wrapped.text);
+    expect(raw.items).toEqual(wrapped.formatData?.items ?? []);
+  });
+
+  it("supports a custom block pipeline through the pipeline option", () => {
+    const input = ["## Header", "---", "Body"].join("\n");
+    const result = markdownToVk(input, { pipeline: [transformMarkdownHeadingBlock] });
+
+    expect(result.text).toBe(["Header", "---", "Body"].join("\n"));
+    expect(result.items).toEqual([{ type: "bold", offset: 0, length: "Header".length }]);
+  });
+
+  it("createVkMarkdownPipeline reuses custom pipeline for multiple renders", () => {
+    const pipeline = createVkMarkdownPipeline({ pipeline: [transformMarkdownHeadingBlock] });
+
+    const first = pipeline.render("## One");
+    const second = pipeline.render("### Two");
+
+    expect(pipeline.pipeline).toEqual([transformMarkdownHeadingBlock]);
+    expect(first).toEqual({
+      text: "One",
+      items: [{ type: "bold", offset: 0, length: 3 }],
+    });
+    expect(second).toEqual({
+      text: "Two",
+      items: [{ type: "bold", offset: 0, length: 3 }],
+    });
+  });
+});
+
+describe("transformMarkdownHeadingBlock", () => {
+  it("can be tested in isolation with an explicit context", () => {
+    const result = transformMarkdownHeadingBlock({
+      chunk: "# Hi\n",
+      line: "# Hi",
+      lineStart: 0,
+      lineEnd: 4,
+      lineBreak: 4,
+      nextLine: null,
+      parseInline: (source) => ({ text: source, items: [] }),
+    });
+
+    expect(result).toEqual({
+      consumedTo: 5,
+      rendered: {
+        text: "HI\n",
+        items: [{ type: "bold", offset: 0, length: 2 }],
+      },
+    });
+  });
+
+  it("returns null for non-heading lines", () => {
+    const result = transformMarkdownHeadingBlock({
+      chunk: "plain",
+      line: "plain",
+      lineStart: 0,
+      lineEnd: 5,
+      lineBreak: -1,
+      nextLine: null,
+      parseInline: (source) => ({ text: source, items: [] }),
+    });
+
+    expect(result).toBeNull();
   });
 });
 
