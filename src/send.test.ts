@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { VK } from "vk-io";
 import {
@@ -14,6 +18,8 @@ import {
   resolveVkDirectoryPeers,
   sendDocumentVk,
   sendAudioMessageVk,
+  sendFormattedMediaVk,
+  sendFormattedTextVk,
   sendMessageVk,
   sendPayloadVk,
   sendPhotoVk,
@@ -29,15 +35,14 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
+  DEFAULT_ACCOUNT_ID: "default",
   normalizeAccountId: (id?: string) => id?.trim() || "default",
 }));
 
-const mockChunkMarkdownText = vi.hoisted(() => vi.fn((text: string) => [text]));
 const mockGetVkRuntime = vi.hoisted(() =>
   vi.fn().mockReturnValue({
     channel: {
       activity: { record: vi.fn() },
-      text: { chunkMarkdownText: mockChunkMarkdownText },
     },
     config: { loadConfig: vi.fn().mockReturnValue({}) },
   }),
@@ -128,7 +133,6 @@ beforeEach(() => {
   mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
   mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
   mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
-  mockChunkMarkdownText.mockReset().mockImplementation((text: string) => [text]);
   mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
   // Reset constructor counters between tests.
   vi.mocked(VK).mockClear();
@@ -195,14 +199,16 @@ describe("sendMessageVk", () => {
     ).rejects.toThrow("VK token not configured");
   });
 
-  it("truncates message text to 4096 characters", async () => {
-    mockMessagesSend.mockResolvedValueOnce(1);
+  it("sends long text in multiple 4096-character chunks", async () => {
+    mockMessagesSend.mockResolvedValueOnce(1).mockResolvedValueOnce(2);
     const longText = "a".repeat(5000);
 
-    await sendMessageVk("123", longText, { cfg });
+    const result = await sendMessageVk("123", longText, { cfg });
 
-    const sentText = mockMessagesSend.mock.calls[0][0].message as string;
-    expect(sentText.length).toBe(4096);
+    expect(result).toEqual({ messageId: "2", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(1).message).toBe("a".repeat(904));
   });
 
   it("includes reply_to when provided", async () => {
@@ -271,6 +277,139 @@ describe("sendMessageVk", () => {
     );
     expect(result.chatId).toBe(groupPeerId);
   });
+
+  it("treats markdown image syntax in text as outbound media", async () => {
+    mockMessagesSend.mockResolvedValueOnce(41);
+
+    const result = await sendMessageVk(
+      "123",
+      "Держи:\n\n![картинка](https://example.com/reply-back.jpg)",
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "41", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: "https://example.com/reply-back.jpg",
+        filename: "reply-back.jpg",
+        contentType: "image/jpeg",
+      },
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Держи:",
+        attachment: "photo123_456",
+      }),
+    );
+  });
+
+  it("treats local markdown file links in text as outbound documents", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-doc-"));
+    const filePath = join(tempDir, "artifact");
+    await writeFile(filePath, "hello");
+    mockMessagesSend.mockResolvedValueOnce(45);
+
+    const result = await sendMessageVk(
+      "123",
+      `Да — вот небольшой файл:\n\n[test-small.txt](${pathToFileURL(filePath).toString()})`,
+      { cfg, mediaLocalRoots: [tempDir] },
+    );
+
+    expect(result).toEqual({ messageId: "45", chatId: "123" });
+    expect(mockUploadDocument).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: expect.any(Buffer),
+        filename: "test-small.txt",
+        contentType: "text/plain",
+      },
+      title: "test-small.txt",
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Да — вот небольшой файл:",
+        attachment: "doc123_789",
+      }),
+    );
+  });
+});
+
+describe("sendFormattedTextVk", () => {
+  it("returns one delivery result per rendered VK chunk", async () => {
+    mockMessagesSend.mockResolvedValueOnce(1).mockResolvedValueOnce(2);
+
+    const result = await sendFormattedTextVk("123", `**${"a".repeat(5000)}**`, { cfg });
+
+    expect(result).toEqual([
+      { messageId: "1", chatId: "123" },
+      { messageId: "2", chatId: "123" },
+    ]);
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(parseVkFormatData(getSendCall(0).format_data).items).toEqual([
+      { type: "bold", offset: 0, length: 4096 },
+    ]);
+    expect(getSendCall(1).message).toBe("a".repeat(904));
+    expect(parseVkFormatData(getSendCall(1).format_data).items).toEqual([
+      { type: "bold", offset: 0, length: 904 },
+    ]);
+  });
+
+  it("routes markdown image syntax through media delivery instead of plain text", async () => {
+    mockMessagesSend.mockResolvedValueOnce(43);
+
+    const result = await sendFormattedTextVk(
+      "123",
+      "Держи:\n\n![картинка](https://example.com/reply-back.jpg)",
+      { cfg },
+    );
+
+    expect(result).toEqual([{ messageId: "43", chatId: "123" }]);
+    expect(mockUploadPhoto).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: "https://example.com/reply-back.jpg",
+        filename: "reply-back.jpg",
+        contentType: "image/jpeg",
+      },
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Держи:",
+        attachment: "photo123_456",
+      }),
+    );
+  });
+
+  it("routes local markdown file links through document delivery", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-doc-"));
+    const filePath = join(tempDir, "artifact");
+    await writeFile(filePath, "hello");
+    mockMessagesSend.mockResolvedValueOnce(46);
+
+    const result = await sendFormattedTextVk(
+      "123",
+      `Да — вот небольшой файл:\n\n[test-small.txt](${pathToFileURL(filePath).toString()})`,
+      { cfg, mediaLocalRoots: [tempDir] },
+    );
+
+    expect(result).toEqual([{ messageId: "46", chatId: "123" }]);
+    expect(mockUploadDocument).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: expect.any(Buffer),
+        filename: "test-small.txt",
+        contentType: "text/plain",
+      },
+      title: "test-small.txt",
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Да — вот небольшой файл:",
+        attachment: "doc123_789",
+      }),
+    );
+  });
 });
 
 // ── sendPhotoVk ──────────────────────────────────────────────────────────────
@@ -312,13 +451,17 @@ describe("sendPhotoVk", () => {
     );
   });
 
-  it("truncates caption to 4096 characters", async () => {
-    mockMessagesSend.mockResolvedValueOnce(1);
+  it("sends long photo captions as attachment text plus tail chunks", async () => {
+    mockMessagesSend.mockResolvedValueOnce(1).mockResolvedValueOnce(2);
 
-    await sendPhotoVk("123", "src", "a".repeat(5000), { cfg });
+    const result = await sendPhotoVk("123", "src", "a".repeat(5000), { cfg });
 
-    const sentText = mockMessagesSend.mock.calls[0][0].message as string;
-    expect(sentText.length).toBe(4096);
+    expect(result).toEqual({ messageId: "2", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(0).attachment).toBe("photo123_456");
+    expect(getSendCall(1).message).toBe("a".repeat(904));
+    expect(getSendCall(1)).not.toHaveProperty("attachment");
   });
 
   it("throws when token is not configured", async () => {
@@ -351,7 +494,7 @@ describe("sendDocumentVk", () => {
 
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 456,
-      source: { value: Buffer.from("pdf") },
+      source: { value: Buffer.from("pdf"), filename: "report.pdf" },
       title: "report.pdf",
     });
     expect(mockMessagesSend).toHaveBeenCalledWith(
@@ -404,7 +547,10 @@ describe("sendAudioMessageVk", () => {
 
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 456,
-      source: { value: "https://example.com/voice.mp3" },
+      source: {
+        value: "https://example.com/voice.mp3",
+        filename: "voice.mp3",
+      },
       title: "voice.mp3",
     });
     expect(mockMessagesSend).toHaveBeenCalledWith(
@@ -415,6 +561,28 @@ describe("sendAudioMessageVk", () => {
       }),
     );
     expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+});
+
+describe("sendFormattedMediaVk", () => {
+  it("sends media with the first formatted chunk and returns the final tail result", async () => {
+    mockMessagesSend.mockResolvedValueOnce(1).mockResolvedValueOnce(2);
+
+    const result = await sendFormattedMediaVk("123", "a".repeat(5000), "https://example.com/img.png", { cfg });
+
+    expect(result).toEqual({ messageId: "2", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: "https://example.com/img.png",
+        filename: "img.png",
+        contentType: "image/png",
+      },
+    });
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(0).attachment).toBe("photo123_456");
+    expect(getSendCall(1).message).toBe("a".repeat(904));
+    expect(getSendCall(1)).not.toHaveProperty("attachment");
   });
 });
 
@@ -591,12 +759,12 @@ describe("sendPayloadVk", () => {
 
   it("sends chunked text and only attaches the keyboard to the final chunk", async () => {
     mockMessagesSend.mockResolvedValue(22);
-    mockChunkMarkdownText.mockReturnValueOnce(["chunk-1", "chunk-2"]);
+    const text = "a".repeat(4100);
 
     await sendPayloadVk(
       "123",
       {
-        text: "chunked",
+        text,
         channelData: {
           vk: {
             buttons: [[{ text: "OpenAI", callback_data: "/models openai", style: "primary" }]],
@@ -608,11 +776,11 @@ describe("sendPayloadVk", () => {
 
     expect(mockMessagesSend).toHaveBeenCalledTimes(2);
     const firstCall = getSendCall(0);
-    expect(firstCall.message).toBe("chunk-1");
+    expect(firstCall.message).toBe("a".repeat(4096));
     expect(firstCall).not.toHaveProperty("keyboard");
 
     const secondCall = getSendCall(1);
-    expect(secondCall.message).toBe("chunk-2");
+    expect(secondCall.message).toBe("a".repeat(4));
     const keyboard = parseVkKeyboard(secondCall.keyboard);
     expect(keyboard.buttons[0]?.[0]?.action.label).toBe("OpenAI");
     expect(keyboard.buttons[0]?.[0]?.action.payload).toBe(JSON.stringify({ oc: "/models openai" }));
@@ -632,7 +800,11 @@ describe("sendPayloadVk", () => {
 
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
-      source: { value: "https://example.com/photo.png" },
+      source: {
+        value: "https://example.com/photo.png",
+        filename: "photo.png",
+        contentType: "image/png",
+      },
     });
     expect(mockMessagesSend).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -671,7 +843,11 @@ describe("sendPayloadVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
     expect(mockUploadPhoto.mock.calls[0]?.[0]).toEqual({
       peer_id: 123,
-      source: { value: "https://example.com/photo.png" },
+      source: {
+        value: "https://example.com/photo.png",
+        filename: "photo.png",
+        contentType: "image/png",
+      },
     });
     expect(mockUploadPhoto.mock.calls[1]?.[0]).toEqual(
       expect.objectContaining({
@@ -685,6 +861,44 @@ describe("sendPayloadVk", () => {
         attachment: "photo321_654",
       }),
     );
+  });
+
+  it("falls through to document upload when both URL photo attempts are rejected", async () => {
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError).mockRejectedValueOnce(invalidPhotoError);
+    mockUploadDocument.mockResolvedValueOnce("doc321_654");
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: () => "image/png",
+      },
+      arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
+    } as Response);
+    mockMessagesSend.mockResolvedValueOnce(38);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "caption",
+        mediaUrl: "https://example.com/photo.png",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "38", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+    expect(mockUploadDocument).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: expect.any(Buffer),
+        filename: "photo.png",
+        contentType: "image/png",
+      },
+      title: "photo.png",
+    });
   });
 
   it("falls back to URL text when VK rejects URL photo and remote download fails", async () => {
@@ -714,6 +928,22 @@ describe("sendPayloadVk", () => {
       }),
     );
     expect(getSendCall(mockMessagesSend.mock.calls.length - 1)).not.toHaveProperty("attachment");
+  });
+
+  it("rethrows non-fallback photo upload errors", async () => {
+    const photoError = new Error("photo upload exploded");
+    mockUploadPhoto.mockRejectedValueOnce(photoError);
+
+    await expect(
+      sendPayloadVk(
+        "123",
+        {
+          text: "caption",
+          mediaUrl: "https://example.com/photo.png",
+        },
+        { cfg },
+      ),
+    ).rejects.toThrow("photo upload exploded");
   });
 
   it("falls back to URL text when fetched URL is not an image content-type", async () => {
@@ -771,11 +1001,19 @@ describe("sendPayloadVk", () => {
     expect(result).toEqual({ messageId: "29", chatId: "123" });
     expect(mockUploadPhoto).toHaveBeenCalledWith({
       peer_id: 123,
-      source: { value: "https://example.com/photo.png" },
+      source: {
+        value: "https://example.com/photo.png",
+        filename: "photo.png",
+        contentType: "image/png",
+      },
     });
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 123,
-      source: { value: "https://example.com/photo.png" },
+      source: {
+        value: "https://example.com/photo.png",
+        filename: "photo.png",
+        contentType: "image/png",
+      },
       title: "photo.png",
     });
     expect(mockMessagesSend).toHaveBeenCalledWith(
@@ -807,12 +1045,20 @@ describe("sendPayloadVk", () => {
     expect(result).toEqual({ messageId: "30", chatId: "123" });
     expect(mockUploadPhoto).toHaveBeenCalledWith(
       expect.objectContaining({
-        source: { value: "https://example.com/photo.png" },
+        source: {
+          value: "https://example.com/photo.png",
+          filename: "photo.png",
+          contentType: "image/png",
+        },
       }),
     );
     expect(mockUploadDocument).toHaveBeenCalledWith(
       expect.objectContaining({
-        source: { value: "https://example.com/photo.png" },
+        source: {
+          value: "https://example.com/photo.png",
+          filename: "photo.png",
+          contentType: "image/png",
+        },
         title: "photo.png",
       }),
     );
@@ -824,6 +1070,27 @@ describe("sendPayloadVk", () => {
     expect(getSendCall(mockMessagesSend.mock.calls.length - 1)).not.toHaveProperty(
       "attachment",
     );
+  });
+
+  it("rethrows non-fallback errors from document upload after photo rejection", async () => {
+    const scopeError = Object.assign(
+      new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
+      { code: 15 },
+    );
+    const documentError = new Error("document upload exploded");
+    mockUploadPhoto.mockRejectedValueOnce(scopeError);
+    mockUploadDocument.mockRejectedValueOnce(documentError);
+
+    await expect(
+      sendPayloadVk(
+        "123",
+        {
+          text: "caption",
+          mediaUrl: "https://example.com/photo.png",
+        },
+        { cfg },
+      ),
+    ).rejects.toThrow("document upload exploded");
   });
 
   it("sends explanatory text fallback when media has no public URL and upload is denied", async () => {
@@ -877,7 +1144,11 @@ describe("sendPayloadVk", () => {
 
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 123,
-      source: { value: "https://example.com/voice.mp3" },
+      source: {
+        value: "https://example.com/voice.mp3",
+        filename: "voice.mp3",
+        contentType: "audio/mpeg",
+      },
       title: "voice.mp3",
     });
     expect(mockMessagesSend).toHaveBeenCalledWith(
@@ -888,23 +1159,68 @@ describe("sendPayloadVk", () => {
     );
   });
 
-  it("sends remaining text chunks after media as plain messages", async () => {
-    mockChunkMarkdownText.mockReturnValueOnce(["caption", "tail-1", "tail-2"]);
-    mockMessagesSend.mockResolvedValue(31);
+  it("falls back to URL text when audio_message upload is denied by token scopes", async () => {
+    const scopeError = Object.assign(
+      new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
+      { code: 15 },
+    );
+    mockUploadAudioMessage.mockRejectedValueOnce(scopeError);
+    mockMessagesSend.mockResolvedValueOnce(37);
 
     const result = await sendPayloadVk(
       "123",
       {
-        text: "caption tail",
+        text: "voice caption",
+        mediaUrl: "https://example.com/voice.mp3",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "37", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "voice caption\nhttps://example.com/voice.mp3",
+      }),
+    );
+  });
+
+  it("rethrows non-scope audio_message upload errors", async () => {
+    const audioError = new Error("audio upload exploded");
+    mockUploadAudioMessage.mockRejectedValueOnce(audioError);
+
+    await expect(
+      sendPayloadVk(
+        "123",
+        {
+          text: "voice caption",
+          mediaUrl: "https://example.com/voice.mp3",
+        },
+        { cfg },
+      ),
+    ).rejects.toThrow("audio upload exploded");
+  });
+
+  it("sends remaining text chunks after media as plain messages", async () => {
+    mockMessagesSend.mockResolvedValue(31);
+    const text = "a".repeat(9000);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text,
         mediaUrl: "https://example.com/photo.png",
       },
       { cfg },
     );
 
     expect(result).toEqual({ messageId: "31", chatId: "123" });
-    expect(getSendCall(0).message).toBe("caption");
-    expect(getSendCall(1).message).toBe("tail-1");
-    expect(getSendCall(2).message).toBe("tail-2");
+    expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(0).attachment).toBe("photo123_456");
+    expect(getSendCall(1).message).toBe("a".repeat(4096));
+    expect(getSendCall(1)).not.toHaveProperty("attachment");
+    expect(getSendCall(2).message).toBe("a".repeat(808));
+    expect(getSendCall(2)).not.toHaveProperty("attachment");
   });
 
   it("falls back to URL text when document upload is denied by token scopes", async () => {
@@ -927,7 +1243,11 @@ describe("sendPayloadVk", () => {
     expect(result).toEqual({ messageId: "32", chatId: "123" });
     expect(mockUploadDocument).toHaveBeenCalledWith({
       peer_id: 123,
-      source: { value: "https://example.com/report.pdf" },
+      source: {
+        value: "https://example.com/report.pdf",
+        filename: "report.pdf",
+        contentType: "application/pdf",
+      },
       title: "report.pdf",
     });
     expect(mockMessagesSend).toHaveBeenLastCalledWith(
@@ -935,6 +1255,95 @@ describe("sendPayloadVk", () => {
         message: "doc caption\nhttps://example.com/report.pdf",
       }),
     );
+  });
+
+  it("uses remote metadata to keep document filenames on extensionless URLs", async () => {
+    const cancel = vi.fn();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === "content-type"
+            ? "application/pdf"
+            : name.toLowerCase() === "content-disposition"
+              ? 'attachment; filename="report.pdf"'
+              : null,
+      },
+      body: { cancel },
+    } as Response);
+    mockMessagesSend.mockResolvedValueOnce(47);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "doc caption",
+        mediaUrl: "https://example.com/download?id=42",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "47", chatId: "123" });
+    expect(mockUploadDocument).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: "https://example.com/download?id=42",
+        filename: "report.pdf",
+        contentType: "application/pdf",
+      },
+      title: "report.pdf",
+    });
+    expect(cancel).toHaveBeenCalled();
+  });
+
+  it("rethrows non-scope document upload errors", async () => {
+    const documentError = new Error("document upload exploded");
+    mockUploadDocument.mockRejectedValueOnce(documentError);
+
+    await expect(
+      sendPayloadVk(
+        "123",
+        {
+          text: "doc caption",
+          mediaUrl: "https://example.com/report.pdf",
+        },
+        { cfg },
+      ),
+    ).rejects.toThrow("document upload exploded");
+  });
+
+  it("resolves relative local document paths against mediaLocalRoots", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-relative-doc-"));
+    const cwd = process.cwd();
+    const otherDir = await mkdtemp(join(tmpdir(), "openclaw-vk-relative-cwd-"));
+    try {
+      await writeFile(join(tempDir, "test-file.pdf"), Buffer.from("pdf"));
+      mockMessagesSend.mockResolvedValueOnce(48);
+      process.chdir(otherDir);
+
+      const result = await sendPayloadVk(
+        "123",
+        {
+          text: "doc caption",
+          mediaUrl: "./test-file.pdf",
+        },
+        { cfg, mediaLocalRoots: [tempDir] },
+      );
+
+      expect(result).toEqual({ messageId: "48", chatId: "123" });
+      expect(mockUploadDocument).toHaveBeenCalledWith({
+        peer_id: 123,
+        source: {
+          value: expect.any(Buffer),
+          filename: "test-file.pdf",
+          contentType: "application/pdf",
+        },
+        title: "test-file.pdf",
+      });
+    } finally {
+      process.chdir(cwd);
+      await rm(tempDir, { recursive: true, force: true });
+      await rm(otherDir, { recursive: true, force: true });
+    }
   });
 
   it("deduplicates mediaUrls", async () => {
@@ -968,7 +1377,11 @@ describe("sendPayloadVk", () => {
 
     expect(mockUploadPhoto).toHaveBeenCalledWith(
       expect.objectContaining({
-        source: { value: "https://example.com/used.png" },
+        source: {
+          value: "https://example.com/used.png",
+          filename: "used.png",
+          contentType: "image/png",
+        },
       }),
     );
   });
@@ -984,6 +1397,40 @@ describe("sendPayloadVk", () => {
 
     expect(mockMessagesSend).toHaveBeenCalledWith(
       expect.objectContaining({ reply_to: 77 }),
+    );
+  });
+
+  it("extracts markdown image syntax from payload text and sends it as media", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-image-"));
+    const filePath = join(tempDir, "reply-back.jpg");
+    await writeFile(filePath, Buffer.from([1, 2, 3, 4]));
+    mockMessagesSend.mockResolvedValueOnce(44);
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: `Держи:\n\n![картинка](${pathToFileURL(filePath).toString()})`,
+      },
+      {
+        cfg,
+        mediaLocalRoots: [tempDir],
+      },
+    );
+
+    expect(result).toEqual({ messageId: "44", chatId: "123" });
+    expect(mockUploadPhoto).toHaveBeenCalledWith({
+      peer_id: 123,
+      source: {
+        value: expect.any(Buffer),
+        filename: "reply-back.jpg",
+        contentType: "image/jpeg",
+      },
+    });
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Держи:",
+        attachment: "photo123_456",
+      }),
     );
   });
 });
@@ -1523,11 +1970,35 @@ describe("retry logic", () => {
     expect(result.messageId).toBe("42");
   });
 
+  it("retries on AbortError (connection dropped by VK upload server)", async () => {
+    const error = Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+    mockMessagesSend.mockRejectedValueOnce(error).mockResolvedValueOnce(42);
+
+    const result = await sendMessageVk("123", "hello", { cfg });
+    expect(result.messageId).toBe("42");
+  });
+
+  it("retries on Not Allowed (VK upload server rate-limit)", async () => {
+    const error = new Error("Not Allowed");
+    mockMessagesSend.mockRejectedValueOnce(error).mockResolvedValueOnce(42);
+
+    const result = await sendMessageVk("123", "hello", { cfg });
+    expect(result.messageId).toBe("42");
+  });
+
+  it("retries on Gateway Time-out (hyphenated timeout from VK proxy)", async () => {
+    const error = new Error("Gateway Time-out");
+    mockMessagesSend.mockRejectedValueOnce(error).mockResolvedValueOnce(42);
+
+    const result = await sendMessageVk("123", "hello", { cfg });
+    expect(result.messageId).toBe("42");
+  });
+
   it("gives up after max retry attempts", async () => {
     const error = Object.assign(new Error("rate limit"), { code: 6 });
     mockMessagesSend.mockRejectedValue(error);
 
     await expect(sendMessageVk("123", "hello", { cfg })).rejects.toThrow("rate limit");
-    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(3);
   });
 });

@@ -59,6 +59,15 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
 const mockSendMessageVk = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ messageId: "1", chatId: "0" }),
 );
+const mockSendFormattedTextVk = vi.hoisted(() =>
+  vi.fn().mockResolvedValue([
+    { messageId: "f-1", chatId: "0" },
+    { messageId: "f-2", chatId: "0" },
+  ]),
+);
+const mockSendFormattedMediaVk = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ messageId: "fm-1", chatId: "0" }),
+);
 const mockSendPayloadVk = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ messageId: "2", chatId: "0" }),
 );
@@ -112,6 +121,8 @@ const mockIsVkGroupPeerId = vi.hoisted(() =>
 );
 vi.mock("./send.js", () => ({
   sendMessageVk: mockSendMessageVk,
+  sendFormattedTextVk: mockSendFormattedTextVk,
+  sendFormattedMediaVk: mockSendFormattedMediaVk,
   sendPayloadVk: mockSendPayloadVk,
   isVkGroupPeerId: mockIsVkGroupPeerId,
   resolveVkDirectoryPeers: mockResolveVkDirectoryPeers,
@@ -167,6 +178,11 @@ import { vkPlugin } from "./channel.js";
 
 beforeEach(() => {
   mockSendMessageVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
+  mockSendFormattedTextVk.mockReset().mockResolvedValue([
+    { messageId: "f-1", chatId: "0" },
+    { messageId: "f-2", chatId: "0" },
+  ]);
+  mockSendFormattedMediaVk.mockReset().mockResolvedValue({ messageId: "fm-1", chatId: "0" });
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "2", chatId: "0" });
   mockResolveVkDirectoryPeers.mockClear();
   mockResolveVkDirectoryGroups.mockClear();
@@ -209,6 +225,21 @@ describe("plugin metadata", () => {
 
   it("watches channels.vk config prefix for reload", () => {
     expect(vkPlugin.reload?.configPrefixes).toEqual(["channels.vk"]);
+  });
+
+  it("formats allowFrom entries by stripping VK user prefixes and blanks", () => {
+    expect(
+      vkPlugin.config.formatAllowFrom?.([" vk:user:123 ", "vk:456", " ", 789] as never),
+    ).toEqual(["123", "456", "789"]);
+  });
+
+  it("marks provider config as present only when channels.vk exists", () => {
+    const params = mockCreateRestrictSendersChannelSecurity.mock.calls[0]?.[0] as
+      | { providerConfigPresent?: (cfg: unknown) => boolean }
+      | undefined;
+
+    expect(params?.providerConfigPresent?.({ channels: { vk: {} } })).toBe(true);
+    expect(params?.providerConfigPresent?.({ channels: { telegram: {} } })).toBe(false);
   });
 });
 
@@ -744,7 +775,7 @@ describe("outbound", () => {
     expect(result.channel).toBe("vk");
   });
 
-  it("sendText passes replyToId through to VK", async () => {
+  it("sendText delegates plain text delivery directly to VK", async () => {
     const result = await vkPlugin.outbound!.sendText({
       cfg: {},
       to: "123",
@@ -753,16 +784,16 @@ describe("outbound", () => {
       replyToId: "55",
     } as never);
 
-    expect(mockSendPayloadVk).toHaveBeenCalledWith(
-      "123",
-      { text: "hello", replyToId: "55" },
-      expect.objectContaining({ accountId: "default" }),
-    );
-    expect(result.channel).toBe("vk");
+    expect(mockSendMessageVk).toHaveBeenCalledWith("123", "hello", {
+      cfg: {},
+      accountId: "default",
+      replyTo: "55",
+    });
+    expect(result).toEqual({ channel: "vk", messageId: "1", chatId: "0" });
   });
 
-  it("sendMedia passes forceDocument and mediaLocalRoots through to VK", async () => {
-    await vkPlugin.outbound!.sendMedia({
+  it("sendMedia delegates formatted media delivery directly to VK", async () => {
+    const result = await vkPlugin.outbound!.sendMedia({
       cfg: {},
       to: "123",
       text: "caption",
@@ -773,51 +804,19 @@ describe("outbound", () => {
       replyToId: "88",
     } as never);
 
-    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+    expect(mockSendFormattedMediaVk).toHaveBeenCalledWith(
       "123",
-      { text: "caption", mediaUrl: "https://example.com/img.png", replyToId: "88" },
-      expect.objectContaining({
+      "caption",
+      "https://example.com/img.png",
+      {
+        cfg: {},
+        accountId: "default",
         mediaLocalRoots: ["/data"],
+        replyTo: "88",
         forceDocument: true,
-      }),
+      },
     );
-  });
-
-  it("sendText falls back to sendMessageVk when sendPayloadVk returns null", async () => {
-    mockSendPayloadVk.mockResolvedValueOnce(null);
-
-    const result = await vkPlugin.outbound!.sendText({
-      cfg: {},
-      to: "123",
-      text: "hello",
-      accountId: "default",
-    } as never);
-
-    expect(mockSendMessageVk).toHaveBeenCalledWith("123", "hello", {
-      cfg: {},
-      accountId: "default",
-      replyTo: undefined,
-    });
-    expect(result.channel).toBe("vk");
-  });
-
-  it("sendMedia falls back to sendMessageVk when sendPayloadVk returns null", async () => {
-    mockSendPayloadVk.mockResolvedValueOnce(null);
-
-    const result = await vkPlugin.outbound!.sendMedia({
-      cfg: {},
-      to: "123",
-      text: "caption",
-      mediaUrl: "https://example.com/img.png",
-      accountId: "default",
-    } as never);
-
-    expect(mockSendMessageVk).toHaveBeenCalledWith("123", "caption", {
-      cfg: {},
-      accountId: "default",
-      replyTo: undefined,
-    });
-    expect(result.channel).toBe("vk");
+    expect(result).toEqual({ channel: "vk", messageId: "fm-1", chatId: "0" });
   });
 
   it("sendPayload returns empty messageId when sendPayloadVk returns null", async () => {
@@ -833,16 +832,63 @@ describe("outbound", () => {
     expect(result).toEqual({ channel: "vk", messageId: "", chatId: "123" });
   });
 
-  it("textChunkLimit is 4096", () => {
-    expect(vkPlugin.outbound!.textChunkLimit).toBe(4096);
+  it("sendFormattedText delegates markdown-aware delivery to VK", async () => {
+    const result = await vkPlugin.outbound!.sendFormattedText!({
+      cfg: {},
+      to: "123",
+      text: "**hello**",
+      accountId: "default",
+      replyToId: "55",
+    } as never);
+
+    expect(mockSendFormattedTextVk).toHaveBeenCalledWith("123", "**hello**", {
+      cfg: {},
+      accountId: "default",
+      replyTo: "55",
+    });
+    expect(result).toEqual([
+      { channel: "vk", messageId: "f-1", chatId: "0" },
+      { channel: "vk", messageId: "f-2", chatId: "0" },
+    ]);
+  });
+
+  it("sendFormattedMedia delegates markdown-aware caption delivery to VK", async () => {
+    const result = await vkPlugin.outbound!.sendFormattedMedia!({
+      cfg: {},
+      to: "123",
+      text: "**caption**",
+      mediaUrl: "https://example.com/img.png",
+      accountId: "default",
+      mediaLocalRoots: ["/data"],
+      replyToId: "88",
+      forceDocument: true,
+    } as never);
+
+    expect(mockSendFormattedMediaVk).toHaveBeenCalledWith(
+      "123",
+      "**caption**",
+      "https://example.com/img.png",
+      {
+        cfg: {},
+        accountId: "default",
+        mediaLocalRoots: ["/data"],
+        replyTo: "88",
+        forceDocument: true,
+      },
+    );
+    expect(result).toEqual({ channel: "vk", messageId: "fm-1", chatId: "0" });
   });
 
   it("deliveryMode is direct", () => {
     expect(vkPlugin.outbound!.deliveryMode).toBe("direct");
   });
 
-  it("chunkerMode is markdown", () => {
-    expect(vkPlugin.outbound!.chunkerMode).toBe("markdown");
+  it("textChunkLimit matches VK outbound limit", () => {
+    expect(vkPlugin.outbound!.textChunkLimit).toBe(4096);
+  });
+
+  it("does not advertise VK as markdown-capable to OpenClaw", () => {
+    expect(vkPlugin.meta?.markdownCapable).toBeUndefined();
   });
 
   it("shouldSkipPlainTextSanitization returns true when channelData is present", () => {
@@ -861,23 +907,15 @@ describe("outbound", () => {
     ).toBe(false);
   });
 
-  it("resolveEffectiveTextChunkLimit caps at 4096", () => {
+  it("sanitizes plain text using OpenClaw outbound rules", () => {
     expect(
-      vkPlugin.outbound!.resolveEffectiveTextChunkLimit!({ fallbackLimit: 8000 } as never),
-    ).toBe(4096);
+      vkPlugin.outbound!.sanitizeText!({
+        text: "hello<br><b>world</b>",
+        payload: { text: "hello<br><b>world</b>" } as never,
+      }),
+    ).toBe("hello\n*world*");
   });
 
-  it("resolveEffectiveTextChunkLimit uses smaller fallback when below 4096", () => {
-    expect(
-      vkPlugin.outbound!.resolveEffectiveTextChunkLimit!({ fallbackLimit: 2000 } as never),
-    ).toBe(2000);
-  });
-
-  it("resolveEffectiveTextChunkLimit defaults to 4096 when no fallback", () => {
-    expect(
-      vkPlugin.outbound!.resolveEffectiveTextChunkLimit!({ fallbackLimit: undefined } as never),
-    ).toBe(4096);
-  });
 });
 
 // ── Gateway ──────────────────────────────────────────────────────────────────
@@ -973,6 +1011,37 @@ describe("gateway", () => {
       expect(vk.accounts).toBeUndefined();
     });
 
+    it("preserves other channel sections when removing vk from channels", async () => {
+      const mockWriteConfigFile = vi.fn();
+      mockGetVkRuntime.mockReturnValue({
+        config: { writeConfigFile: mockWriteConfigFile },
+        logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
+      });
+      mockResolveVkAccount.mockReturnValue({
+        accountId: "default",
+        token: "",
+        tokenSource: "none",
+        config: {},
+      });
+
+      await vkPlugin.gateway!.logoutAccount({
+        accountId: "default",
+        cfg: {
+          channels: {
+            vk: { token: "tok" },
+            telegram: { token: "other" },
+          },
+        },
+      } as never);
+
+      const writtenCfg = mockWriteConfigFile.mock.calls[0]?.[0] as {
+        channels?: Record<string, unknown>;
+      };
+      expect(writtenCfg.channels).toEqual({
+        telegram: { token: "other" },
+      });
+    });
+
     it("does not write config when nothing to clear", async () => {
       const mockWriteConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
@@ -993,6 +1062,28 @@ describe("gateway", () => {
 
       expect(result.cleared).toBe(false);
       expect(mockWriteConfigFile).not.toHaveBeenCalled();
+    });
+
+    it("removes channels section when VK was the only configured channel", async () => {
+      const mockWriteConfigFile = vi.fn();
+      mockGetVkRuntime.mockReturnValue({
+        config: { writeConfigFile: mockWriteConfigFile },
+        logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
+      });
+      mockResolveVkAccount.mockReturnValue({
+        accountId: "default",
+        token: "",
+        tokenSource: "none",
+        config: {},
+      });
+
+      await vkPlugin.gateway!.logoutAccount({
+        accountId: "default",
+        cfg: { channels: { vk: { token: "tok" } } },
+      } as never);
+
+      const writtenCfg = mockWriteConfigFile.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(writtenCfg.channels).toBeUndefined();
     });
 
     it("reports loggedOut=true when tokenSource is none after clearing", async () => {

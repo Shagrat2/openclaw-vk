@@ -28,6 +28,16 @@ const AUDIO_EXTENSIONS = new Set([
 
 const DATA_URL_DEFAULT_NAME = "attachment.bin";
 const DEFAULT_VK_INBOUND_MEDIA_MAX_BYTES = 20 * 1024 * 1024;
+const OUTBOUND_REMOTE_METADATA_TIMEOUT_MS = 5_000;
+const GENERIC_OUTBOUND_EXTENSIONS = new Set([".bin", ".dat"]);
+const OUTBOUND_NAME_QUERY_KEYS = ["filename", "file", "name", "download"];
+const OUTBOUND_MIME_QUERY_KEYS = [
+  "response-content-type",
+  "response-content_type",
+  "content-type",
+  "mime",
+  "mimetype",
+];
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".aac": "audio/aac",
   ".bmp": "image/bmp",
@@ -44,6 +54,22 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   ".ogg": "audio/ogg",
   ".opus": "audio/opus",
   ".pdf": "application/pdf",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".json": "application/json",
+  ".csv": "text/csv",
+  ".tsv": "text/tab-separated-values",
+  ".log": "text/plain",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".zip": "application/zip",
+  ".tar": "application/x-tar",
+  ".gz": "application/gzip",
+  ".tgz": "application/gzip",
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".tif": "image/tiff",
@@ -52,12 +78,33 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   ".webm": "video/webm",
   ".webp": "image/webp",
 };
+const PREFERRED_EXTENSION_BY_MIME: Record<string, string> = {
+  "application/json": ".json",
+  "application/pdf": ".pdf",
+  "audio/aac": ".aac",
+  "audio/flac": ".flac",
+  "audio/mpeg": ".mp3",
+  "audio/mp4": ".m4a",
+  "audio/ogg": ".ogg",
+  "audio/opus": ".opus",
+  "audio/wav": ".wav",
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+  "text/csv": ".csv",
+  "text/markdown": ".md",
+  "text/plain": ".txt",
+  "text/tab-separated-values": ".tsv",
+  "video/mp4": ".mp4",
+  "video/webm": ".webm",
+};
 
 export type VkResolvedOutboundMedia = {
   kind: "image" | "document" | "audio_message";
   source: string | Buffer;
   title: string;
   mediaUrl: string;
+  mimeType?: string;
 };
 
 function readString(record: Record<string, unknown>, key: string): string | undefined {
@@ -96,13 +143,69 @@ function extensionFromMimeType(value?: string): string | undefined {
   return entry?.[0];
 }
 
+function preferredExtensionFromMimeType(value?: string): string | undefined {
+  const normalized = value?.trim().toLowerCase().split(";")[0];
+  if (!normalized) {
+    return undefined;
+  }
+  return PREFERRED_EXTENSION_BY_MIME[normalized] ?? extensionFromMimeType(normalized);
+}
+
+function decodeComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeFileNameCandidate(value?: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = decodeComponent(value.trim());
+  if (!trimmed) {
+    return undefined;
+  }
+  const normalized = basename(trimmed.replaceAll("\\", "/")).trim();
+  return normalized || undefined;
+}
+
+function extractFilenameFromContentDisposition(value?: string): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  const starMatch = normalized.match(/filename\*\s*=\s*([^;]+)/i);
+  const regularMatch = normalized.match(/filename\s*=\s*([^;]+)/i);
+  const rawValue = starMatch?.[1] ?? regularMatch?.[1];
+  if (!rawValue) {
+    return undefined;
+  }
+
+  const unquoted = rawValue.trim().replace(/^['"]|['"]$/g, "");
+  const encodedValue = unquoted.includes("''") ? unquoted.split("''").slice(1).join("''") : unquoted;
+  return normalizeFileNameCandidate(encodedValue);
+}
+
+function mimeFromQueryParams(params: URLSearchParams): string | undefined {
+  for (const key of OUTBOUND_MIME_QUERY_KEYS) {
+    const value = params.get(key)?.trim().toLowerCase();
+    if (value) {
+      return value.split(";")[0];
+    }
+  }
+  return undefined;
+}
+
 function mimeFromUrl(value?: string): string | undefined {
   if (!value) {
     return undefined;
   }
   try {
     const parsed = new URL(value);
-    return mimeFromExtension(extname(parsed.pathname));
+    return mimeFromExtension(extname(parsed.pathname)) ?? mimeFromQueryParams(parsed.searchParams);
   } catch {
     return mimeFromExtension(extname(value));
   }
@@ -531,12 +634,47 @@ function isDataUrl(value: string): boolean {
 function inferDocumentNameFromUrl(value: string): string {
   try {
     const parsed = new URL(value);
-    const pathname = parsed.pathname.trim();
-    const name = basename(pathname);
-    return name || "attachment";
+    const nameFromDisposition = extractFilenameFromContentDisposition(
+      parsed.searchParams.get("response-content-disposition") ?? undefined,
+    );
+    if (nameFromDisposition) {
+      return nameFromDisposition;
+    }
+
+    for (const key of OUTBOUND_NAME_QUERY_KEYS) {
+      const candidate = normalizeFileNameCandidate(parsed.searchParams.get(key) ?? undefined);
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    return normalizeFileNameCandidate(parsed.pathname) ?? "attachment";
   } catch {
-    return basename(value) || "attachment";
+    return normalizeFileNameCandidate(value) ?? "attachment";
   }
+}
+
+function hasUsefulOutboundExtension(value: string): boolean {
+  const extension = extname(value).trim().toLowerCase();
+  return Boolean(extension) && !GENERIC_OUTBOUND_EXTENSIONS.has(extension);
+}
+
+function normalizeOutboundTitle(value: string | undefined, mimeType?: string): string {
+  const normalized = normalizeFileNameCandidate(value) ?? "attachment";
+  const extension = extname(normalized).trim().toLowerCase();
+  const preferredExtension = preferredExtensionFromMimeType(mimeType);
+  if (!preferredExtension) {
+    return normalized;
+  }
+  if (!extension) {
+    return `${normalized}${preferredExtension}`;
+  }
+  if (!GENERIC_OUTBOUND_EXTENSIONS.has(extension)) {
+    return normalized;
+  }
+
+  const base = normalized.slice(0, -extension.length).trim() || "attachment";
+  return `${base}${preferredExtension}`;
 }
 
 function inferOutboundKind(params: {
@@ -572,32 +710,64 @@ function decodeDataUrl(dataUrl: string): { buffer: Buffer; mimeType?: string; na
   const buffer = isBase64
     ? Buffer.from(body, "base64")
     : Buffer.from(decodeURIComponent(body), "utf8");
-  const extension =
-    mimeType === "image/png"
-      ? ".png"
-      : mimeType === "image/jpeg"
-        ? ".jpg"
-        : mimeType === "image/webp"
-          ? ".webp"
-          : mimeType === "audio/mpeg"
-            ? ".mp3"
-            : mimeType === "audio/ogg"
-              ? ".ogg"
-              : mimeType === "audio/opus"
-                ? ".opus"
-                : mimeType === "audio/wav"
-                  ? ".wav"
-                  : mimeType === "audio/aac"
-                    ? ".aac"
-                    : mimeType === "audio/flac"
-                      ? ".flac"
-                      : mimeType === "audio/mp4"
-                        ? ".m4a"
-          : mimeType === "application/pdf"
-            ? ".pdf"
-            : "";
+  const extension = preferredExtensionFromMimeType(mimeType) ?? "";
   const name = extension ? `attachment${extension}` : DATA_URL_DEFAULT_NAME;
   return { buffer, mimeType, name };
+}
+
+async function readRemoteMediaMetadata(
+  mediaUrl: string,
+): Promise<{ title?: string; mimeType?: string }> {
+  if (typeof fetch !== "function") {
+    return {};
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OUTBOUND_REMOTE_METADATA_TIMEOUT_MS);
+  let headResponse: Response | undefined;
+  let getResponse: Response | undefined;
+
+  try {
+    try {
+      headResponse = await fetch(mediaUrl, {
+        method: "HEAD",
+        signal: controller.signal,
+      });
+    } catch {
+      headResponse = undefined;
+    }
+
+    let mimeType =
+      headResponse?.ok === true
+        ? headResponse.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || undefined
+        : undefined;
+    let title =
+      headResponse?.ok === true
+        ? extractFilenameFromContentDisposition(headResponse.headers.get("content-disposition") ?? undefined)
+        : undefined;
+
+    if (!mimeType || !title) {
+      try {
+        getResponse = await fetch(mediaUrl, {
+          method: "GET",
+          signal: controller.signal,
+        });
+      } catch {
+        getResponse = undefined;
+      }
+
+      if (getResponse?.ok) {
+        mimeType ||= getResponse.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() || undefined;
+        title ||= extractFilenameFromContentDisposition(getResponse.headers.get("content-disposition") ?? undefined);
+      }
+    }
+
+    return { title, mimeType };
+  } finally {
+    clearTimeout(timeout);
+    void headResponse?.body?.cancel?.();
+    void getResponse?.body?.cancel?.();
+  }
 }
 
 async function resolveAllowedLocalPath(
@@ -605,18 +775,9 @@ async function resolveAllowedLocalPath(
   mediaLocalRoots?: readonly string[],
 ): Promise<string> {
   const normalizedInput = input.startsWith("file://") ? fileURLToPath(input) : input;
-  const absolutePath = isAbsolute(normalizedInput)
-    ? normalizedInput
-    : resolvePath(normalizedInput);
-  const resolvedPath = await realpath(absolutePath);
-
-  if (!mediaLocalRoots?.length) {
-    return resolvedPath;
-  }
-
   const resolvedRoots = (
     await Promise.all(
-      mediaLocalRoots.map(async (root) => {
+      (mediaLocalRoots ?? []).map(async (root) => {
         const trimmed = root?.trim();
         if (!trimmed) {
           return null;
@@ -630,10 +791,46 @@ async function resolveAllowedLocalPath(
     )
   ).filter((entry): entry is string => Boolean(entry));
 
-  const isAllowed = resolvedRoots.some(
-    (root) => resolvedPath === root || resolvedPath.startsWith(`${root}${sep}`),
-  );
-  if (!isAllowed) {
+  const hasRootRestrictions = Boolean(mediaLocalRoots?.length);
+  const isWithinAllowedRoot = (resolvedPath: string) =>
+    resolvedRoots.some((root) => resolvedPath === root || resolvedPath.startsWith(`${root}${sep}`));
+
+  // Relative MEDIA paths should resolve from an allowed root/workspace, not the gateway cwd.
+  if (!isAbsolute(normalizedInput) && hasRootRestrictions) {
+    for (const root of resolvedRoots) {
+      const candidatePath = resolvePath(root, normalizedInput);
+      try {
+        const resolvedCandidate = await realpath(candidatePath);
+        if (isWithinAllowedRoot(resolvedCandidate)) {
+          return resolvedCandidate;
+        }
+      } catch {
+        // Try the next allowed root.
+      }
+    }
+
+    if (resolvedRoots.length === 0) {
+      throw new Error(`Local media path is outside allowed roots: ${input}`);
+    }
+
+    const attemptedPath = resolvePath(resolvedRoots[0], normalizedInput);
+    const resolvedAttemptedPath = await realpath(attemptedPath);
+    if (!isWithinAllowedRoot(resolvedAttemptedPath)) {
+      throw new Error(`Local media path is outside allowed roots: ${input}`);
+    }
+    return resolvedAttemptedPath;
+  }
+
+  const absolutePath = isAbsolute(normalizedInput)
+    ? normalizedInput
+    : resolvePath(normalizedInput);
+  const resolvedPath = await realpath(absolutePath);
+
+  if (!hasRootRestrictions) {
+    return resolvedPath;
+  }
+
+  if (!isWithinAllowedRoot(resolvedPath)) {
     throw new Error(`Local media path is outside allowed roots: ${input}`);
   }
 
@@ -644,48 +841,74 @@ export async function loadVkOutboundMedia(params: {
   mediaUrl: string;
   mediaLocalRoots?: readonly string[];
   forceDocument?: boolean;
+  preferredName?: string;
+  preferredMimeType?: string;
 }): Promise<VkResolvedOutboundMedia> {
   const mediaUrl = params.mediaUrl.trim();
   if (!mediaUrl) {
     throw new Error("Missing media URL");
   }
 
+  const preferredName = params.preferredName?.trim() || undefined;
+  const preferredMimeType =
+    params.preferredMimeType?.trim().toLowerCase() ||
+    mimeFromExtension(extname(preferredName ?? ""));
+
   if (isDataUrl(mediaUrl)) {
     const decoded = decodeDataUrl(mediaUrl);
+    const mimeType = preferredMimeType ?? decoded.mimeType;
+    const title = normalizeOutboundTitle(preferredName ?? decoded.name, mimeType);
     return {
       kind: inferOutboundKind({
-        name: decoded.name,
-        mimeType: decoded.mimeType,
+        name: title,
+        mimeType,
         forceDocument: params.forceDocument,
       }),
       source: decoded.buffer,
-      title: decoded.name,
+      title,
       mediaUrl,
+      mimeType,
     };
   }
 
   if (isHttpMediaUrl(mediaUrl)) {
-    const title = inferDocumentNameFromUrl(mediaUrl);
+    const inferredTitle = preferredName ?? inferDocumentNameFromUrl(mediaUrl);
+    let mimeType = preferredMimeType ?? mimeFromUrl(mediaUrl);
+    let title = normalizeOutboundTitle(inferredTitle, mimeType);
+    mimeType ??= mimeFromExtension(extname(title));
+
+    if (!preferredName && (!mimeType || !hasUsefulOutboundExtension(title))) {
+      const remoteMetadata = await readRemoteMediaMetadata(mediaUrl);
+      mimeType ||= remoteMetadata.mimeType;
+      title = normalizeOutboundTitle(remoteMetadata.title ?? inferredTitle, mimeType);
+      mimeType ??= mimeFromExtension(extname(title));
+    }
+
     return {
       kind: inferOutboundKind({
         name: title,
+        mimeType,
         forceDocument: params.forceDocument,
       }),
       source: mediaUrl,
       title,
       mediaUrl,
+      mimeType,
     };
   }
 
   const localPath = await resolveAllowedLocalPath(mediaUrl, params.mediaLocalRoots);
-  const title = basename(localPath) || "attachment";
+  const mimeType = preferredMimeType ?? mimeFromExtension(extname(localPath));
+  const title = normalizeOutboundTitle(preferredName ?? (basename(localPath) || "attachment"), mimeType);
   return {
     kind: inferOutboundKind({
       name: title,
+      mimeType,
       forceDocument: params.forceDocument,
     }),
     source: await readFile(localPath),
     title,
     mediaUrl: localPath,
+    mimeType,
   };
 }

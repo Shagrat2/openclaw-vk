@@ -1,23 +1,32 @@
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import {
-  collapseBlankLinesBeforeVkCodeFences,
-  renderVkMarkdown,
-  trimVkFormattedMessage,
-  type VkFormatData,
+  renderVkMarkdownChunks,
+  type VkPreparedFormattedMessage,
 } from "./format.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
+import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
+export {
+  applyVkAllowlistConfigEdit,
+  isVkGroupPeerId,
+  normalizeVkDirectoryEntries,
+  normalizeVkSenderAllowEntry,
+  normalizeVkTargetId,
+  readVkAllowlistConfig,
+  resolveVkDirectoryGroups,
+  resolveVkDirectoryPeers,
+} from "./send-support.js";
 
 const VK_MESSAGE_TEXT_LIMIT = 4096;
-const VK_TRANSIENT_RETRY_ATTEMPTS = 2;
-const VK_GROUP_CHAT_OFFSET = 2_000_000_000;
+const VK_TRANSIENT_RETRY_ATTEMPTS = 3;
 const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
   "Attachment generated, but VK token lacks media upload scopes (photos/docs).";
+const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
 export type SendVkOptions = {
   cfg?: CoreConfig;
@@ -40,6 +49,12 @@ export type VkOutboundPayloadLike = {
   mediaUrls?: string[];
   replyToId?: string;
   channelData?: Record<string, unknown>;
+};
+
+type VkOutboundMediaReference = {
+  url: string;
+  title?: string;
+  mimeType?: string;
 };
 
 type VkClientState = {
@@ -154,7 +169,7 @@ function isRetryableVkError(error: unknown): boolean {
     return true;
   }
   const message = readVkErrorMessage(error).toLowerCase();
-  return /timeout|timed out|temporar|econnreset|socket hang up|too many requests|rate limit|429|5\d\d/.test(
+  return /time-?out|timed out|temporar|econnreset|socket hang up|too many requests|rate limit|not allowed|abort|429|5\d\d/.test(
     message,
   );
 }
@@ -174,62 +189,199 @@ async function withVkRetry<T>(operation: () => Promise<T>): Promise<T> {
   }
 }
 
-function prepareVkMessage(text: string): { text: string; formatData?: VkFormatData } {
-  const rendered = renderVkMarkdown(collapseBlankLinesBeforeVkCodeFences(text));
-  const trimmed = trimVkFormattedMessage(rendered, VK_MESSAGE_TEXT_LIMIT);
-  if (!trimmed.formatData || trimmed.formatData.items.length === 0) {
-    return { text: trimmed.text };
+function getLastSendResult(results: readonly SendVkResult[]): SendVkResult | null {
+  return results.length > 0 ? (results[results.length - 1] ?? null) : null;
+}
+
+function buildVkUploadSource(params: {
+  source: string | Buffer;
+  filename?: string;
+  contentType?: string;
+}): { value: string | Buffer; filename?: string; contentType?: string } {
+  return {
+    value: params.source,
+    ...(params.filename ? { filename: params.filename } : {}),
+    ...(params.contentType ? { contentType: params.contentType } : {}),
+  };
+}
+
+function prepareVkMessageChunks(text: string): VkPreparedFormattedMessage[] {
+  return renderVkMarkdownChunks(text, { chunkSize: VK_MESSAGE_TEXT_LIMIT }).filter((chunk) => chunk.text.length > 0);
+}
+
+function toPreparedVkMessages(
+  message: string | VkPreparedFormattedMessage | undefined,
+): VkPreparedFormattedMessage[] {
+  if (!message) {
+    return [{ text: "" }];
   }
-  return { text: trimmed.text, formatData: trimmed.formatData };
+  if (typeof message !== "string") {
+    return [message];
+  }
+
+  const chunks = prepareVkMessageChunks(message);
+  return chunks.length > 0 ? chunks : [{ text: "" }];
 }
 
 function resolveVkKeyboard(opts: SendVkOptions): string | undefined {
   return opts.clearKeyboard === true ? buildVkKeyboardRemoval() : buildVkKeyboard(opts.buttons);
 }
 
-function buildVkMessageChunks(text: string): string[] {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return [];
-  }
-
-  const chunker =
-    (getVkRuntime().channel as { text?: { chunkMarkdownText?: (text: string, limit: number) => string[] } })
-      .text?.chunkMarkdownText;
-  if (typeof chunker === "function") {
-    try {
-      const chunks = chunker(trimmed, VK_MESSAGE_TEXT_LIMIT)
-        .map((chunk) => chunk.trim())
-        .filter(Boolean);
-      if (chunks.length > 0) {
-        return chunks;
-      }
-    } catch {
-      // Fall back to fixed-width chunks.
+function dedupeVkMediaReferences(
+  refs: VkOutboundMediaReference[],
+): VkOutboundMediaReference[] {
+  const byUrl = new Map<string, VkOutboundMediaReference>();
+  for (const ref of refs) {
+    const normalizedUrl = ref.url.trim();
+    if (!normalizedUrl) {
+      continue;
     }
+    const existing = byUrl.get(normalizedUrl);
+    if (!existing) {
+      byUrl.set(normalizedUrl, { ...ref, url: normalizedUrl });
+      continue;
+    }
+    byUrl.set(normalizedUrl, {
+      url: normalizedUrl,
+      title: existing.title ?? ref.title,
+      mimeType: existing.mimeType ?? ref.mimeType,
+    });
   }
-
-  const chunks: string[] = [];
-  for (let start = 0; start < trimmed.length; start += VK_MESSAGE_TEXT_LIMIT) {
-    chunks.push(trimmed.slice(start, start + VK_MESSAGE_TEXT_LIMIT));
-  }
-  return chunks;
+  return Array.from(byUrl.values());
 }
 
-function resolvePayloadMediaUrls(payload: VkOutboundPayloadLike): string[] {
+function resolvePayloadMediaReferences(payload: VkOutboundPayloadLike): VkOutboundMediaReference[] {
   const rawUrls = payload.mediaUrls?.length
     ? payload.mediaUrls
     : payload.mediaUrl
       ? [payload.mediaUrl]
       : [];
-  return Array.from(
-    new Set(
-      rawUrls
-        .filter((entry): entry is string => typeof entry === "string")
-        .map((entry) => entry.trim())
-        .filter(Boolean),
-    ),
+  return dedupeVkMediaReferences(
+    rawUrls
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((url) => ({ url })),
   );
+}
+
+function isLikelyVkMediaReference(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (isHttpUrl(trimmed) || /^data:/i.test(trimmed) || trimmed.startsWith("file://")) {
+    return true;
+  }
+  if (
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("./") ||
+    trimmed.startsWith("../") ||
+    /^[A-Za-z]:[\\/]/.test(trimmed)
+  ) {
+    return true;
+  }
+  return /\.(?:apng|avif|bmp|gif|heic|heif|jpeg|jpg|png|webp|aac|flac|m4a|mp3|oga|ogg|opus|wav|pdf|mp4|webm)(?:$|[?#])/i.test(
+    trimmed,
+  );
+}
+
+function isLikelyVkAttachmentLinkTarget(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (
+    trimmed.startsWith("file://") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("./") ||
+    trimmed.startsWith("../") ||
+    /^data:/i.test(trimmed) ||
+    /^[A-Za-z]:[\\/]/.test(trimmed)
+  ) {
+    return true;
+  }
+
+  return /\.(?:txt|md|json|csv|tsv|log|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|png|jpg|jpeg|webp|gif|mp3|wav|ogg|opus|mp4|webm)(?:$|[?#])/i.test(
+    trimmed,
+  );
+}
+
+function isLikelyVkAttachmentTitle(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return /\.(?:txt|md|json|csv|tsv|log|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|tar|gz|tgz|png|jpg|jpeg|webp|gif|mp3|wav|ogg|opus|mp4|webm)$/i.test(
+    trimmed,
+  );
+}
+
+function resolveVkMarkdownAttachmentPayload(text: string): {
+  text: string;
+  mediaRefs: VkOutboundMediaReference[];
+} {
+  const mediaRefs: VkOutboundMediaReference[] = [];
+  const stripped = text.replace(MARKDOWN_LINK_RE, (fullMatch, bang: string, label: string, rawUrl: string) => {
+    const candidate = rawUrl.trim();
+    const shouldExtract =
+      bang === "!"
+        ? isLikelyVkMediaReference(candidate)
+        : isLikelyVkAttachmentLinkTarget(candidate);
+
+    if (!shouldExtract) {
+      return fullMatch;
+    }
+    const trimmedLabel = label.trim();
+    mediaRefs.push({
+      url: candidate,
+      ...(bang !== "!" && isLikelyVkAttachmentTitle(trimmedLabel)
+        ? { title: trimmedLabel }
+        : {}),
+    });
+    return "";
+  });
+
+  const normalizedText = stripped
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return {
+    text: normalizedText,
+    mediaRefs: dedupeVkMediaReferences(mediaRefs),
+  };
+}
+
+function resolveVkPayloadParts(
+  payload: VkOutboundPayloadLike,
+  opts: SendVkOptions,
+): {
+  text: string;
+  mediaRefs: VkOutboundMediaReference[];
+  buttons: VkReplyButtons | undefined;
+  replyTo: string | undefined;
+  clearKeyboard: boolean;
+} {
+  const parsedText = resolveVkMarkdownAttachmentPayload(payload.text ?? "");
+  const text = parsedText.text;
+  const mediaRefs = dedupeVkMediaReferences([
+    ...resolvePayloadMediaReferences(payload),
+    ...parsedText.mediaRefs,
+  ]);
+  const buttons = opts.buttons ?? resolveVkButtonsFromPayload(payload);
+  const replyTo = payload.replyToId ?? opts.replyTo;
+  const clearKeyboard = opts.clearKeyboard === true && !buttons;
+
+  return {
+    text,
+    mediaRefs,
+    buttons,
+    replyTo,
+    clearKeyboard,
+  };
 }
 
 function recordOutboundActivity(accountId: string): void {
@@ -266,22 +418,21 @@ async function sendVkApiMessage(params: {
   to: string;
   peerId: number;
   account: ResolvedVkAccount;
-  message: string;
+  formatted: VkPreparedFormattedMessage;
   attachment?: string;
   opts?: SendVkOptions;
 }): Promise<SendVkResult> {
   const vk = getOrCreateVk(params.account.token);
   const keyboard = resolveVkKeyboard(params.opts ?? {});
-  const formatted = prepareVkMessage(params.message);
   const formatData =
-    formatted.formatData && formatted.formatData.items.length > 0
-      ? JSON.stringify(formatted.formatData)
+    params.formatted.formatData && params.formatted.formatData.items.length > 0
+      ? JSON.stringify(params.formatted.formatData)
       : undefined;
   const randomId = getRandomId();
   const messageId = await withVkRetry(async () => {
     return await vk.api.messages.send({
       peer_id: params.peerId,
-      message: formatted.text,
+      message: params.formatted.text,
       random_id: randomId,
       ...(params.attachment ? { attachment: params.attachment } : {}),
       ...(keyboard ? { keyboard } : {}),
@@ -326,25 +477,23 @@ export async function sendMessageVk(
   text: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
-  const { account, peerId, to: normalizedTo } = resolveSendTarget({
-    cfg: opts.cfg,
-    accountId: opts.accountId,
+  const parsed = resolveVkMarkdownAttachmentPayload(text);
+  const results = await sendPayloadResultsVk({
     to,
-  });
-  return await sendVkApiMessage({
-    to: normalizedTo,
-    peerId,
-    account,
-    message: text,
+    text: parsed.text,
+    mediaRefs: parsed.mediaRefs,
     opts,
   });
+
+  return getLastSendResult(results) ?? { messageId: "", chatId: normalizeVkTargetId(to) };
 }
 
 export async function sendPhotoVk(
   to: string,
   photoSource: string | Buffer,
-  text?: string,
+  text?: string | VkPreparedFormattedMessage,
   opts: SendVkOptions = {},
+  uploadMeta?: { filename?: string; contentType?: string },
 ): Promise<SendVkResult> {
   const { account, peerId, to: normalizedTo } = resolveSendTarget({
     cfg: opts.cfg,
@@ -355,26 +504,50 @@ export async function sendPhotoVk(
   const attachment = await withVkRetry(async () => {
     return await vk.upload.messagePhoto({
       peer_id: peerId,
-      source: { value: photoSource },
+      source: buildVkUploadSource({
+        source: photoSource,
+        filename: uploadMeta?.filename,
+        contentType: uploadMeta?.contentType,
+      }),
     });
   });
-
-  return await sendVkApiMessage({
+  const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
+  const firstResult = await sendVkApiMessage({
     to: normalizedTo,
     peerId,
     account,
-    message: text ?? "",
+    formatted: firstChunk ?? { text: "" },
     attachment: String(attachment),
-    opts,
+    opts: {
+      ...opts,
+      buttons: tailChunks.length === 0 ? opts.buttons : undefined,
+      clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
+    },
   });
+
+  if (tailChunks.length === 0) {
+    return firstResult;
+  }
+
+  const tailResults = await sendMessageChunksVk({
+    to: normalizedTo,
+    chunks: tailChunks,
+    opts: {
+      ...opts,
+      replyTo: undefined,
+    },
+  });
+
+  return getLastSendResult(tailResults) ?? firstResult;
 }
 
 export async function sendDocumentVk(
   to: string,
   docSource: string | Buffer,
   title: string,
-  text?: string,
+  text?: string | VkPreparedFormattedMessage,
   opts: SendVkOptions = {},
+  uploadMeta?: { contentType?: string },
 ): Promise<SendVkResult> {
   const { account, peerId, to: normalizedTo } = resolveSendTarget({
     cfg: opts.cfg,
@@ -385,27 +558,51 @@ export async function sendDocumentVk(
   const attachment = await withVkRetry(async () => {
     return await vk.upload.messageDocument({
       peer_id: peerId,
-      source: { value: docSource },
+      source: buildVkUploadSource({
+        source: docSource,
+        filename: title,
+        contentType: uploadMeta?.contentType,
+      }),
       title,
     });
   });
-
-  return await sendVkApiMessage({
+  const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
+  const firstResult = await sendVkApiMessage({
     to: normalizedTo,
     peerId,
     account,
-    message: text ?? "",
+    formatted: firstChunk ?? { text: "" },
     attachment: String(attachment),
-    opts,
+    opts: {
+      ...opts,
+      buttons: tailChunks.length === 0 ? opts.buttons : undefined,
+      clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
+    },
   });
+
+  if (tailChunks.length === 0) {
+    return firstResult;
+  }
+
+  const tailResults = await sendMessageChunksVk({
+    to: normalizedTo,
+    chunks: tailChunks,
+    opts: {
+      ...opts,
+      replyTo: undefined,
+    },
+  });
+
+  return getLastSendResult(tailResults) ?? firstResult;
 }
 
 export async function sendAudioMessageVk(
   to: string,
   audioSource: string | Buffer,
   title: string,
-  text?: string,
+  text?: string | VkPreparedFormattedMessage,
   opts: SendVkOptions = {},
+  uploadMeta?: { contentType?: string },
 ): Promise<SendVkResult> {
   const { account, peerId, to: normalizedTo } = resolveSendTarget({
     cfg: opts.cfg,
@@ -416,19 +613,76 @@ export async function sendAudioMessageVk(
   const attachment = await withVkRetry(async () => {
     return await vk.upload.audioMessage({
       peer_id: peerId,
-      source: { value: audioSource },
+      source: buildVkUploadSource({
+        source: audioSource,
+        filename: title,
+        contentType: uploadMeta?.contentType,
+      }),
       title,
     });
   });
-
-  return await sendVkApiMessage({
+  const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
+  const firstResult = await sendVkApiMessage({
     to: normalizedTo,
     peerId,
     account,
-    message: text ?? "",
+    formatted: firstChunk ?? { text: "" },
     attachment: String(attachment),
+    opts: {
+      ...opts,
+      buttons: tailChunks.length === 0 ? opts.buttons : undefined,
+      clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
+    },
+  });
+
+  if (tailChunks.length === 0) {
+    return firstResult;
+  }
+
+  const tailResults = await sendMessageChunksVk({
+    to: normalizedTo,
+    chunks: tailChunks,
+    opts: {
+      ...opts,
+      replyTo: undefined,
+    },
+  });
+
+  return getLastSendResult(tailResults) ?? firstResult;
+}
+
+export async function sendFormattedTextVk(
+  to: string,
+  text: string,
+  opts: SendVkOptions = {},
+): Promise<SendVkResult[]> {
+  const parsed = resolveVkMarkdownAttachmentPayload(text);
+  return await sendPayloadResultsVk({
+    to,
+    text: parsed.text,
+    mediaRefs: parsed.mediaRefs,
     opts,
   });
+}
+
+export async function sendFormattedMediaVk(
+  to: string,
+  text: string,
+  mediaUrl: string,
+  opts: SendVkOptions = {},
+): Promise<SendVkResult> {
+  const result = await sendPayloadVk(
+    to,
+    {
+      text,
+      mediaUrl,
+    },
+    opts,
+  );
+  if (!result) {
+    throw new Error("VK formatted media delivery produced no result");
+  }
+  return result;
 }
 
 export async function sendTypingVk(to: string, account: ResolvedVkAccount): Promise<void> {
@@ -480,47 +734,64 @@ export async function markMessageReadVk(
 
 async function sendMessageChunksVk(params: {
   to: string;
-  chunks: string[];
+  chunks: VkPreparedFormattedMessage[];
   opts: SendVkOptions;
-}): Promise<SendVkResult | null> {
-  let lastResult: SendVkResult | null = null;
+}): Promise<SendVkResult[]> {
+  const { account, peerId, to: normalizedTo } = resolveSendTarget({
+    cfg: params.opts.cfg,
+    accountId: params.opts.accountId,
+    to: params.to,
+  });
+
+  const results: SendVkResult[] = [];
   for (let index = 0; index < params.chunks.length; index += 1) {
     const chunk = params.chunks[index];
-    if (!chunk) {
+    if (!chunk || !chunk.text) {
       continue;
     }
     const isLast = index === params.chunks.length - 1;
-    lastResult = await sendMessageVk(params.to, chunk, {
-      ...params.opts,
-      replyTo: index === 0 ? params.opts.replyTo : undefined,
-      buttons: isLast ? params.opts.buttons : undefined,
-      clearKeyboard: isLast ? params.opts.clearKeyboard : undefined,
+    const result = await sendVkApiMessage({
+      to: normalizedTo,
+      peerId,
+      account,
+      formatted: chunk,
+      opts: {
+        ...params.opts,
+        replyTo: index === 0 ? params.opts.replyTo : undefined,
+        buttons: isLast ? params.opts.buttons : undefined,
+        clearKeyboard: isLast ? params.opts.clearKeyboard : undefined,
+      },
     });
+    results.push(result);
   }
-  return lastResult;
+  return results;
 }
 
 async function sendResolvedMediaVk(params: {
   to: string;
-  mediaUrl: string;
-  caption?: string;
+  media: VkOutboundMediaReference;
+  caption?: VkPreparedFormattedMessage;
   opts: SendVkOptions;
 }): Promise<SendVkResult> {
   const media = await loadVkOutboundMedia({
-    mediaUrl: params.mediaUrl,
+    mediaUrl: params.media.url,
     mediaLocalRoots: params.opts.mediaLocalRoots,
     forceDocument: params.opts.forceDocument,
+    preferredName: params.media.title,
+    preferredMimeType: params.media.mimeType,
   });
   const sourceUrl = isHttpUrl(media.mediaUrl) ? media.mediaUrl : undefined;
 
   const sendSourceUrlFallback = async (): Promise<SendVkResult> => {
     if (!sourceUrl) {
-      const fallbackText = params.caption?.trim()
-        ? `${params.caption.trim()}\n${VK_MEDIA_SCOPE_FALLBACK_NOTICE}`
+      const captionText = params.caption?.text.trim();
+      const fallbackText = captionText
+        ? `${captionText}\n${VK_MEDIA_SCOPE_FALLBACK_NOTICE}`
         : VK_MEDIA_SCOPE_FALLBACK_NOTICE;
       return await sendMessageVk(params.to, fallbackText, params.opts);
     }
-    const fallbackText = params.caption?.trim() ? `${params.caption.trim()}\n${sourceUrl}` : sourceUrl;
+    const captionText = params.caption?.text.trim();
+    const fallbackText = captionText ? `${captionText}\n${sourceUrl}` : sourceUrl;
     return await sendMessageVk(params.to, fallbackText, params.opts);
   };
 
@@ -528,7 +799,10 @@ async function sendResolvedMediaVk(params: {
     let photoSource: string | Buffer = media.source;
     let photoError: unknown;
     try {
-      return await sendPhotoVk(params.to, photoSource, params.caption, params.opts);
+      return await sendPhotoVk(params.to, photoSource, params.caption, params.opts, {
+        filename: media.title,
+        contentType: media.mimeType,
+      });
     } catch (error) {
       photoError = error;
     }
@@ -540,7 +814,10 @@ async function sendResolvedMediaVk(params: {
       }
       photoSource = materialized;
       try {
-        return await sendPhotoVk(params.to, photoSource, params.caption, params.opts);
+        return await sendPhotoVk(params.to, photoSource, params.caption, params.opts, {
+          filename: media.title,
+          contentType: media.mimeType,
+        });
       } catch (retryPhotoError) {
         photoError = retryPhotoError;
       }
@@ -552,7 +829,9 @@ async function sendResolvedMediaVk(params: {
     }
 
     try {
-      return await sendDocumentVk(params.to, photoSource, media.title, params.caption, params.opts);
+      return await sendDocumentVk(params.to, photoSource, media.title, params.caption, params.opts, {
+        contentType: media.mimeType,
+      });
     } catch (documentError) {
       if (!isVkImageUploadFallbackError(documentError)) {
         throw documentError;
@@ -562,7 +841,9 @@ async function sendResolvedMediaVk(params: {
   }
   if (media.kind === "audio_message") {
     try {
-      return await sendAudioMessageVk(params.to, media.source, media.title, params.caption, params.opts);
+      return await sendAudioMessageVk(params.to, media.source, media.title, params.caption, params.opts, {
+        contentType: media.mimeType,
+      });
     } catch (audioError) {
       if (!isVkScopeDeniedError(audioError)) {
         throw audioError;
@@ -571,7 +852,9 @@ async function sendResolvedMediaVk(params: {
     }
   }
   try {
-    return await sendDocumentVk(params.to, media.source, media.title, params.caption, params.opts);
+    return await sendDocumentVk(params.to, media.source, media.title, params.caption, params.opts, {
+      contentType: media.mimeType,
+    });
   } catch (documentError) {
     if (!isVkScopeDeniedError(documentError)) {
       throw documentError;
@@ -582,21 +865,21 @@ async function sendResolvedMediaVk(params: {
 
 async function sendPayloadMediaVk(params: {
   to: string;
-  mediaUrls: string[];
+  mediaRefs: VkOutboundMediaReference[];
   text: string;
   opts: SendVkOptions;
-}): Promise<SendVkResult | null> {
-  const textChunks = buildVkMessageChunks(params.text);
+}): Promise<SendVkResult[]> {
+  const textChunks = prepareVkMessageChunks(params.text);
   let firstCaption = textChunks.shift();
-  let lastResult: SendVkResult | null = null;
+  const results: SendVkResult[] = [];
 
-  for (let index = 0; index < params.mediaUrls.length; index += 1) {
-    const mediaUrl = params.mediaUrls[index];
-    const isLastMedia = index === params.mediaUrls.length - 1;
+  for (let index = 0; index < params.mediaRefs.length; index += 1) {
+    const mediaRef = params.mediaRefs[index];
+    const isLastMedia = index === params.mediaRefs.length - 1;
     const shouldApplyKeyboard = isLastMedia && textChunks.length === 0;
-    lastResult = await sendResolvedMediaVk({
+    const result = await sendResolvedMediaVk({
       to: params.to,
-      mediaUrl,
+      media: mediaRef as VkOutboundMediaReference,
       caption: firstCaption,
       opts: {
         ...params.opts,
@@ -605,11 +888,12 @@ async function sendPayloadMediaVk(params: {
         clearKeyboard: shouldApplyKeyboard ? params.opts.clearKeyboard : undefined,
       },
     });
+    results.push(result);
     firstCaption = undefined;
   }
 
   if (textChunks.length > 0) {
-    const textResult = await sendMessageChunksVk({
+    const textResults = await sendMessageChunksVk({
       to: params.to,
       chunks: textChunks,
       opts: {
@@ -617,12 +901,31 @@ async function sendPayloadMediaVk(params: {
         replyTo: undefined,
       },
     });
-    if (textResult) {
-      lastResult = textResult;
-    }
+    results.push(...textResults);
   }
 
-  return lastResult;
+  return results;
+}
+
+async function sendPayloadResultsVk(params: {
+  to: string;
+  text: string;
+  mediaRefs: VkOutboundMediaReference[];
+  opts: SendVkOptions;
+}): Promise<SendVkResult[]> {
+  if (!params.text && params.mediaRefs.length === 0) {
+    return [];
+  }
+
+  if (params.mediaRefs.length > 0) {
+    return await sendPayloadMediaVk(params);
+  }
+
+  return await sendMessageChunksVk({
+    to: params.to,
+    chunks: prepareVkMessageChunks(params.text),
+    opts: params.opts,
+  });
 }
 
 export async function sendPayloadVk(
@@ -630,217 +933,21 @@ export async function sendPayloadVk(
   payload: VkOutboundPayloadLike,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult | null> {
-  const text = payload.text?.trim() ?? "";
-  const mediaUrls = resolvePayloadMediaUrls(payload);
-  const buttons = opts.buttons ?? resolveVkButtonsFromPayload(payload);
-  const replyTo = payload.replyToId ?? opts.replyTo;
-  const clearKeyboard = opts.clearKeyboard === true && !buttons;
+  const { text, mediaRefs, buttons, replyTo, clearKeyboard } = resolveVkPayloadParts(payload, opts);
 
-  if (!text && mediaUrls.length === 0) {
-    return null;
-  }
-
-  if (mediaUrls.length > 0) {
-    return await sendPayloadMediaVk({
+  return getLastSendResult(
+    await sendPayloadResultsVk({
       to,
-      mediaUrls,
       text,
+      mediaRefs,
       opts: {
         ...opts,
         replyTo,
         buttons,
         clearKeyboard,
       },
-    });
-  }
-
-  return await sendMessageChunksVk({
-    to,
-    chunks: buildVkMessageChunks(text),
-    opts: {
-      ...opts,
-      replyTo,
-      buttons,
-      clearKeyboard,
-    },
-  });
-}
-
-export function isVkGroupPeerId(peerId: string | number): boolean {
-  const numericPeerId = typeof peerId === "number" ? peerId : Number(peerId);
-  return Number.isFinite(numericPeerId) && numericPeerId >= VK_GROUP_CHAT_OFFSET;
-}
-
-export function normalizeVkTargetId(value: string | number): string {
-  return String(value).trim().replace(/^vk:(?:user:|chat:)?/i, "");
-}
-
-export function normalizeVkSenderAllowEntry(value: string | number): string {
-  return String(value).trim().replace(/^vk:(?:user:)?/i, "");
-}
-
-export function normalizeVkDirectoryEntries(
-  entries: Array<string | number>,
-  params: {
-    kind: "user" | "group";
-    query?: string | null;
-    limit?: number | null;
-  },
-): Array<{ kind: "user" | "group"; id: string }> {
-  const normalized = Array.from(
-    new Set(
-      entries
-        .map((entry) =>
-          params.kind === "group" ? normalizeVkTargetId(entry) : normalizeVkSenderAllowEntry(entry),
-        )
-        .filter(Boolean)
-        .filter((entry) => entry !== "*")
-        .filter((entry) =>
-          params.kind === "group" ? isVkGroupPeerId(entry) : !isVkGroupPeerId(entry),
-        ),
-    ),
+    }),
   );
-  const query = params.query?.trim().toLowerCase() ?? "";
-  const filtered = query
-    ? normalized.filter((entry) => entry.toLowerCase().includes(query))
-    : normalized;
-  const limit =
-    typeof params.limit === "number" && Number.isFinite(params.limit) && params.limit > 0
-      ? Math.floor(params.limit)
-      : undefined;
-  return filtered.slice(0, limit ?? filtered.length).map((id) => ({ kind: params.kind, id }));
-}
-
-export function readVkAllowlistConfig(account: ResolvedVkAccount) {
-  return {
-    dmAllowFrom: (account.config.allowFrom ?? []).map(String),
-    groupAllowFrom: (account.config.groupAllowFrom ?? []).map(String),
-    dmPolicy: account.config.dmPolicy,
-    groupPolicy: account.config.groupPolicy,
-    groupOverrides: Object.entries(account.config.groups ?? {})
-      .filter(([, groupConfig]) => Array.isArray(groupConfig?.allowFrom) && groupConfig.allowFrom.length > 0)
-      .map(([label, groupConfig]) => ({
-        label,
-        entries: (groupConfig?.allowFrom ?? []).map(String),
-      })),
-  };
-}
-
-export function applyVkAllowlistConfigEdit(params: {
-  cfg: CoreConfig;
-  parsedConfig: Record<string, unknown>;
-  accountId?: string | null;
-  scope: "dm" | "group";
-  action: "add" | "remove";
-  entry: string;
-}):
-  | {
-      kind: "ok";
-      changed: boolean;
-      pathLabel: string;
-      writeTarget:
-        | { kind: "channel"; scope: { channelId: "vk" } }
-        | { kind: "account"; scope: { channelId: "vk"; accountId: string } };
-    }
-  | { kind: "invalid-entry" } {
-  const normalizedEntry = normalizeVkSenderAllowEntry(params.entry);
-  if (!normalizedEntry) {
-    return { kind: "invalid-entry" };
-  }
-
-  const channels = (params.parsedConfig.channels ??= {}) as Record<string, unknown>;
-  const vk = ((channels.vk ??= {}) as Record<string, unknown>);
-  const normalizedAccountId =
-    typeof params.accountId === "string" && params.accountId.trim()
-      ? params.accountId.trim()
-      : DEFAULT_ACCOUNT_ID;
-  const hasAccounts =
-    Boolean(vk.accounts && typeof vk.accounts === "object") &&
-    Object.keys(vk.accounts as Record<string, unknown>).length > 0;
-  const useAccount = normalizedAccountId !== DEFAULT_ACCOUNT_ID || hasAccounts;
-
-  let targetRecord: Record<string, unknown>;
-  if (useAccount) {
-    const accounts = (vk.accounts ??= {}) as Record<string, unknown>;
-    const existing = accounts[normalizedAccountId];
-    if (!existing || typeof existing !== "object") {
-      accounts[normalizedAccountId] = {};
-    }
-    targetRecord = accounts[normalizedAccountId] as Record<string, unknown>;
-  } else {
-    targetRecord = vk;
-  }
-
-  const writePath = params.scope === "group" ? "groupAllowFrom" : "allowFrom";
-  const existing = Array.isArray(targetRecord[writePath])
-    ? (targetRecord[writePath] as unknown[])
-        .map((entry) => normalizeVkSenderAllowEntry(entry as string))
-        .filter(Boolean)
-    : [];
-  const hasEntry = existing.includes(normalizedEntry);
-  let next = existing;
-  let changed = false;
-
-  if (params.action === "add") {
-    if (!hasEntry) {
-      next = [...existing, normalizedEntry];
-      changed = true;
-    }
-  } else if (hasEntry) {
-    next = existing.filter((entry) => entry !== normalizedEntry);
-    changed = true;
-  }
-
-  if (changed) {
-    if (next.length > 0) {
-      targetRecord[writePath] = next;
-    } else {
-      delete targetRecord[writePath];
-    }
-  }
-
-  return {
-    kind: "ok",
-    changed,
-    pathLabel: useAccount
-      ? `channels.vk.accounts.${normalizedAccountId}.${writePath}`
-      : `channels.vk.${writePath}`,
-    writeTarget: useAccount
-      ? { kind: "account", scope: { channelId: "vk", accountId: normalizedAccountId } }
-      : { kind: "channel", scope: { channelId: "vk" } },
-  };
-}
-
-export function resolveVkDirectoryPeers(params: {
-  account: ResolvedVkAccount;
-  query?: string | null;
-  limit?: number | null;
-}) {
-  const entries = [
-    ...(params.account.config.allowFrom ?? []),
-    ...(params.account.config.defaultTo ? [params.account.config.defaultTo] : []),
-  ];
-  return normalizeVkDirectoryEntries(entries, {
-    kind: "user",
-    query: params.query,
-    limit: params.limit,
-  });
-}
-
-export function resolveVkDirectoryGroups(params: {
-  account: ResolvedVkAccount;
-  query?: string | null;
-  limit?: number | null;
-}) {
-  const entries = [
-    ...Object.keys(params.account.config.groups ?? {}).filter((entry) => entry !== "*"),
-    ...(params.account.config.defaultTo ? [params.account.config.defaultTo] : []),
-  ];
-  return normalizeVkDirectoryEntries(entries, {
-    kind: "group",
-    query: params.query,
-    limit: params.limit,
-  });
 }
 
 export function clearVkInstances(): void {

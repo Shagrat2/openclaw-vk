@@ -1,20 +1,30 @@
 import { describe, expect, it } from "vitest";
 import {
-  collapseBlankLinesBeforeVkCodeFences,
-  createVkMarkdownPipeline,
-  markdownToVk,
-  renderVkMarkdown,
-  trimVkFormattedMessage,
-} from "./format.js";
-import { transformMarkdownHeadingBlock } from "markdown-to-vk";
+  collapseBlankLinesBeforeCodeFencesTransform as collapseBlankLinesBeforeVkCodeFences,
+  headingTransform as transformMarkdownHeadingBlock,
+} from "markdown-to-vk";
+import { renderVkMarkdownChunks, type VkPreparedFormattedMessage } from "./format.js";
 
-describe("renderVkMarkdown", () => {
+function renderSingleVkMarkdownChunk(
+  markdown: string,
+  options?: Parameters<typeof renderVkMarkdownChunks>[1],
+): VkPreparedFormattedMessage {
+  const chunks = renderVkMarkdownChunks(markdown ?? "", options);
+  expect(chunks).toHaveLength(1);
+  return chunks[0] ?? { text: "" };
+}
+
+function splitRenderedTableRows(text: string): string[][] {
+  return text.split("\n").map((line) => line.split("|").map((cell) => cell.trim()));
+}
+
+describe("renderVkMarkdownChunks", () => {
   const VK_SOLID_SEPARATOR = "─".repeat(3);
 
   it("keeps unsupported markdown unchanged", () => {
     const input = ["- item", "1. item", "~~strike~~"].join("\n");
 
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe(input);
     expect(result.formatData).toBeUndefined();
@@ -22,23 +32,46 @@ describe("renderVkMarkdown", () => {
 
   it("renders markdown hyphen separators as a solid 3-char line", () => {
     const input = ["Before", "---", "After"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({
       text: ["Before", VK_SOLID_SEPARATOR, "After"].join("\n"),
     });
   });
 
+  it("splits long formatted output into markdown-to-vk chunks without recomputing offsets", () => {
+    const chunks = renderVkMarkdownChunks(`**${"a".repeat(5000)}**`);
+
+    expect(chunks).toEqual([
+      {
+        text: "a".repeat(4096),
+        formatData: { version: 1, items: [{ type: "bold", offset: 0, length: 4096 }] },
+      },
+      {
+        text: "a".repeat(904),
+        formatData: { version: 1, items: [{ type: "bold", offset: 0, length: 904 }] },
+      },
+    ]);
+  });
+
+  it("keeps custom pipelines without injecting the default table transform", () => {
+    const input = ["## Header", "---", "Body"].join("\n");
+    const result = renderSingleVkMarkdownChunk(input, { pipeline: [transformMarkdownHeadingBlock] });
+
+    expect(result.text).toBe(["Header", "---", "Body"].join("\n"));
+    expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "Header".length }]);
+  });
+
   it("keeps markdown separators inside fenced code blocks untouched", () => {
     const input = ["```md", "---", "```"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({ text: input });
   });
 
   it("renders h1-h3 as bold and h4-h6 as italic without hash prefixes", () => {
     const input = ["# One", "## Two", "### Three", "#### Four", "##### Five", "###### Six", "Body"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe(["ONE", "Two", "Three", "Four", "Five", "Six", "Body"].join("\n"));
     expect(result.formatData?.items).toEqual([
@@ -52,21 +85,21 @@ describe("renderVkMarkdown", () => {
   });
 
   it("renders h1 headings in uppercase for cyrillic content too", () => {
-    const result = renderVkMarkdown("# Привет, мир");
+    const result = renderSingleVkMarkdownChunk("# Привет, мир");
 
     expect(result.text).toBe("ПРИВЕТ, МИР");
     expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "ПРИВЕТ, МИР".length }]);
   });
 
   it("supports heading content with trailing marker sequence", () => {
-    const result = renderVkMarkdown("### Основная информация ###");
+    const result = renderSingleVkMarkdownChunk("### Основная информация ###");
 
     expect(result.text).toBe("Основная информация");
     expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "Основная информация".length }]);
   });
 
   it("supports inline markdown inside headings", () => {
-    const result = renderVkMarkdown("### [docs](https://example.com) and *note*");
+    const result = renderSingleVkMarkdownChunk("### [docs](https://example.com) and *note*");
 
     expect(result.text).toBe("docs and note");
     expect(result.formatData?.items).toEqual(
@@ -79,16 +112,16 @@ describe("renderVkMarkdown", () => {
   });
 
   it("does not treat hash-prefixed words as headings when whitespace is missing", () => {
-    expect(renderVkMarkdown("###Заголовок")).toEqual({ text: "###Заголовок" });
+    expect(renderSingleVkMarkdownChunk("###Заголовок")).toEqual({ text: "###Заголовок" });
   });
 
   it("does not treat deeply indented lines as headings", () => {
-    expect(renderVkMarkdown("    ### not heading")).toEqual({ text: "    ### not heading" });
+    expect(renderSingleVkMarkdownChunk("    ### not heading")).toEqual({ text: "    ### not heading" });
   });
 
   it("keeps headings inside fenced code blocks untouched", () => {
     const input = ["```md", "### not heading", "```", "### heading"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe(["```md", "### not heading", "```", "heading"].join("\n"));
     expect(result.formatData?.items).toEqual([
@@ -101,14 +134,14 @@ describe("renderVkMarkdown", () => {
   });
 
   it("supports headings with up to three leading spaces", () => {
-    const result = renderVkMarkdown("   ### spaced heading");
+    const result = renderSingleVkMarkdownChunk("   ### spaced heading");
 
     expect(result.text).toBe("spaced heading");
     expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: "spaced heading".length }]);
   });
 
   it("renders h4 headings as italic and keeps inline markdown", () => {
-    const result = renderVkMarkdown("#### [docs](https://example.com) and **note**");
+    const result = renderSingleVkMarkdownChunk("#### [docs](https://example.com) and **note**");
 
     expect(result.text).toBe("docs and note");
     expect(result.formatData?.items).toEqual(
@@ -122,21 +155,21 @@ describe("renderVkMarkdown", () => {
 
   it("replaces markdown checkboxes with square glyphs", () => {
     const input = ["- [ ] todo", "- [x] done", "- [X] DONE"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({ text: ["□ todo", "■ done", "■ DONE"].join("\n") });
   });
 
   it("does not replace checkbox markers inside fenced code blocks", () => {
     const input = ["```md", "- [ ] todo", "- [x] done", "```"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({ text: input });
   });
 
   it("renders markdown blockquotes as italic while preserving the quote prefix", () => {
     const input = ["> quoted text", "> [docs](https://example.com) and **note**"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe(["> quoted text", "> docs and note"].join("\n"));
     expect(result.formatData?.items).toEqual(
@@ -160,14 +193,14 @@ describe("renderVkMarkdown", () => {
 
   it("does not apply quote formatting inside fenced code blocks", () => {
     const input = ["```md", "> quoted", "```"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({ text: input });
   });
 
   it("extracts bold, italic, and bold+italic ranges", () => {
     const input = "A **bold** B *italic* C ***both*** D";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("A bold B italic C both D");
     expect(result.formatData?.items).toEqual(
@@ -182,7 +215,7 @@ describe("renderVkMarkdown", () => {
 
   it("supports italic wrapping bold with the same asterisk marker family", () => {
     const input = "*italic **bold** text*";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("italic bold text");
     expect(result.formatData?.items).toEqual(
@@ -195,7 +228,7 @@ describe("renderVkMarkdown", () => {
 
   it("supports italic wrapping bold with the same underscore marker family", () => {
     const input = "_italic __bold__ text_";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("italic bold text");
     expect(result.formatData?.items).toEqual(
@@ -208,7 +241,7 @@ describe("renderVkMarkdown", () => {
 
   it("formats links without altering other markdown", () => {
     const input = "See [**bold** link](https://example.com) now";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("See bold link now");
     expect(result.formatData?.items).toEqual(
@@ -226,7 +259,7 @@ describe("renderVkMarkdown", () => {
 
   it("keeps links valid when URL contains nested parentheses", () => {
     const input = "See [docs](https://example.com/path_(v2)) now";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("See docs now");
     expect(result.formatData?.items).toEqual(
@@ -243,7 +276,7 @@ describe("renderVkMarkdown", () => {
 
   it("does not format inside inline code", () => {
     const input = "Code `**no**` and **yes**";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("Code `**no**` and yes");
     expect(result.formatData?.items).toEqual(
@@ -254,7 +287,7 @@ describe("renderVkMarkdown", () => {
 
   it("keeps inline code literal but applies outer bold formatting", () => {
     const input = "**`/usr` — 58 ГБ**";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("`/usr` — 58 ГБ");
     expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: result.text.length }]);
@@ -262,7 +295,7 @@ describe("renderVkMarkdown", () => {
 
   it("keeps inline code literal but applies outer italic formatting", () => {
     const input = "*`/var` — 41 ГБ*";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("`/var` — 41 ГБ");
     expect(result.formatData?.items).toEqual([{ type: "italic", offset: 0, length: result.text.length }]);
@@ -270,7 +303,7 @@ describe("renderVkMarkdown", () => {
 
   it("keeps inline code literal but applies outer bold+italic formatting", () => {
     const input = "***`/tmp` — 7 ГБ***";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("`/tmp` — 7 ГБ");
     expect(result.formatData?.items).toEqual(
@@ -283,7 +316,7 @@ describe("renderVkMarkdown", () => {
 
   it("supports bold wrapper over inline-code link labels", () => {
     const input = "**[`/usr`](https://example.com/usr) — 58 ГБ**";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("`/usr` — 58 ГБ");
     expect(result.formatData?.items).toEqual(
@@ -296,7 +329,7 @@ describe("renderVkMarkdown", () => {
 
   it("does not parse emphasis markers inside inline code even under outer bold", () => {
     const input = "**`*not-italic*` and ok**";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("`*not-italic*` and ok");
     expect(result.formatData?.items).toEqual([{ type: "bold", offset: 0, length: result.text.length }]);
@@ -304,7 +337,7 @@ describe("renderVkMarkdown", () => {
 
   it("does not format inside fenced code blocks", () => {
     const input = ["```", "**no**", "```", "**yes**"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe(input.replace("**yes**", "yes"));
     expect(result.formatData?.items).toEqual(
@@ -315,7 +348,7 @@ describe("renderVkMarkdown", () => {
 
   it("does not format inside fenced code blocks with language", () => {
     const input = ["```ts", "**no**", "```", "**yes**"].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe(input.replace("**yes**", "yes"));
     expect(result.formatData?.items).toEqual(
@@ -326,7 +359,7 @@ describe("renderVkMarkdown", () => {
 
   it("keeps escaped emphasis markers inside italic content", () => {
     const input = "*a\\*b*";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("a*b");
     expect(result.formatData?.items).toEqual([{ type: "italic", offset: 0, length: 3 }]);
@@ -334,26 +367,26 @@ describe("renderVkMarkdown", () => {
 
   it("keeps escaped backticks inside inline code literal", () => {
     const input = "`a\\`b`";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({ text: "`a\\`b`" });
   });
 
   it("treats unclosed emphasis and inline code markers as plain text", () => {
-    expect(renderVkMarkdown("*abc")).toEqual({ text: "*abc" });
-    expect(renderVkMarkdown("`abc")).toEqual({ text: "`abc" });
+    expect(renderSingleVkMarkdownChunk("*abc")).toEqual({ text: "*abc" });
+    expect(renderSingleVkMarkdownChunk("`abc")).toEqual({ text: "`abc" });
   });
 
   it("treats malformed links and trailing escapes as plain text", () => {
-    expect(renderVkMarkdown("[x](https://example.com")).toEqual({
+    expect(renderSingleVkMarkdownChunk("[x](https://example.com")).toEqual({
       text: "[x](https://example.com",
     });
-    expect(renderVkMarkdown("abc\\")).toEqual({ text: "abc\\" });
+    expect(renderSingleVkMarkdownChunk("abc\\")).toEqual({ text: "abc\\" });
   });
 
   it("supports escaped closing parenthesis in markdown link URLs", () => {
     const input = "[x](https://example.com/a\\)b)";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("x");
     expect(result.formatData?.items).toEqual([
@@ -362,22 +395,22 @@ describe("renderVkMarkdown", () => {
   });
 
   it("does not parse emphasis when marker is followed by whitespace", () => {
-    expect(renderVkMarkdown("*** bold***")).toEqual({ text: "*** bold***" });
-    expect(renderVkMarkdown("** bold**")).toEqual({ text: "** bold**" });
+    expect(renderSingleVkMarkdownChunk("*** bold***")).toEqual({ text: "*** bold***" });
+    expect(renderSingleVkMarkdownChunk("** bold**")).toEqual({ text: "** bold**" });
   });
 
   it("does not parse single emphasis inside alphanumeric words", () => {
-    expect(renderVkMarkdown("a*b")).toEqual({ text: "a*b" });
+    expect(renderSingleVkMarkdownChunk("a*b")).toEqual({ text: "a*b" });
   });
 
   it("removes empty emphasis wrappers instead of leaking marker artifacts", () => {
-    expect(renderVkMarkdown("****")).toEqual({ text: "" });
-    expect(renderVkMarkdown("____")).toEqual({ text: "" });
+    expect(renderVkMarkdownChunks("****")).toEqual([]);
+    expect(renderVkMarkdownChunks("____")).toEqual([]);
   });
 
   it("merges adjacent URL ranges when consecutive links share the same destination", () => {
     const input = "[a](https://x)[b](https://x)";
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result.text).toBe("ab");
     expect(result.formatData?.items).toEqual([{ type: "url", offset: 0, length: 2, url: "https://x" }]);
@@ -391,15 +424,15 @@ describe("renderVkMarkdown", () => {
       "| Long | 100 | 3 |",
     ].join("\n");
 
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
+    const rows = splitRenderedTableRows(result.text);
 
-    expect(result.text).toBe(
-      [
-        "Name | Qty | Price",
-        "A       |    2 |   10.5",
-        "Long  |  100 |       3",
-      ].join("\n"),
-    );
+    expect(rows).toEqual([
+      ["Name", "Qty", "Price"],
+      ["A", "2", "10.5"],
+      ["Long", "100", "3"],
+    ]);
+    expect(result.text).toMatch(/[\u2006\u2009]/u);
     expect(result.formatData?.items).toEqual(
       expect.arrayContaining([
         { type: "bold", offset: result.text.indexOf("Name"), length: "Name".length },
@@ -409,21 +442,21 @@ describe("renderVkMarkdown", () => {
     );
   });
 
-  it("centers non-edge table header columns while keeping edge headers non-centered", () => {
+  it("adds visible padding around interior table headers", () => {
     const input = [
       "| Left | Middle | Right |",
       "| --- | --- | --- |",
       "| x | 1234567890 | y |",
     ].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
     const headerLine = result.text.split("\n")[0] ?? "";
-    const headerCells = headerLine.split(" | ");
+    const headerCells = headerLine.split("|");
 
+    expect(headerCells).toHaveLength(3);
+    expect(headerCells[0]?.trim()).toBe("Left");
     expect(headerCells[1]?.trim()).toBe("Middle");
-    expect(headerCells[1]?.startsWith(" ")).toBe(true);
-    expect(headerCells[1]?.endsWith(" ")).toBe(true);
-    expect(headerLine.startsWith("Left |")).toBe(true);
-    expect(headerLine.endsWith("| Right")).toBe(true);
+    expect(headerCells[2]?.trim()).toBe("Right");
+    expect(headerCells[1]).toMatch(/^\s+Middle\s+$/u);
   });
 
   it("formats inline markdown inside table cells", () => {
@@ -434,15 +467,16 @@ describe("renderVkMarkdown", () => {
       "| Note | *ok* |",
     ].join("\n");
 
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
+    const rows = splitRenderedTableRows(result.text);
 
-    expect(result.text).toBe(
-      [
-        "Col    | Value",
-        "Link  | docs ",
-        "Note | ok    ",
-      ].join("\n"),
-    );
+    expect(rows).toEqual([
+      ["Col", "Value"],
+      ["Link", "docs"],
+      ["Note", "ok"],
+    ]);
+    expect(result.text).not.toContain("https://example.com/docs");
+    expect(result.text).not.toContain("*ok*");
     expect(result.formatData?.items).toEqual(
       expect.arrayContaining([
         { type: "bold", offset: result.text.indexOf("Col"), length: "Col".length },
@@ -462,7 +496,7 @@ describe("renderVkMarkdown", () => {
       "```",
     ].join("\n");
 
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
 
     expect(result).toEqual({ text: input });
   });
@@ -474,7 +508,7 @@ describe("renderVkMarkdown", () => {
       "| WWW | 1 |",
       "| iii | 2 |",
     ].join("\n");
-    const result = renderVkMarkdown(input);
+    const result = renderSingleVkMarkdownChunk(input);
     const lines = result.text.split("\n");
 
     const trailingSpaceCountBeforeFirstSeparator = (line: string): number => {
@@ -488,43 +522,6 @@ describe("renderVkMarkdown", () => {
     expect(trailingSpaceCountBeforeFirstSeparator(lines[2])).toBeGreaterThan(
       trailingSpaceCountBeforeFirstSeparator(lines[1]),
     );
-  });
-});
-
-describe("markdownToVk", () => {
-  it("returns the same text and entities as renderVkMarkdown by default", () => {
-    const input = "### [docs](https://example.com) and **note**";
-
-    const raw = markdownToVk(input);
-    const wrapped = renderVkMarkdown(input);
-
-    expect(raw.text).toBe(wrapped.text);
-    expect(raw.items).toEqual(wrapped.formatData?.items ?? []);
-  });
-
-  it("supports a custom block pipeline through the pipeline option", () => {
-    const input = ["## Header", "---", "Body"].join("\n");
-    const result = markdownToVk(input, { pipeline: [transformMarkdownHeadingBlock] });
-
-    expect(result.text).toBe(["Header", "---", "Body"].join("\n"));
-    expect(result.items).toEqual([{ type: "bold", offset: 0, length: "Header".length }]);
-  });
-
-  it("createVkMarkdownPipeline reuses custom pipeline for multiple renders", () => {
-    const pipeline = createVkMarkdownPipeline({ pipeline: [transformMarkdownHeadingBlock] });
-
-    const first = pipeline.render("## One");
-    const second = pipeline.render("### Two");
-
-    expect(pipeline.pipeline).toEqual([transformMarkdownHeadingBlock]);
-    expect(first).toEqual({
-      text: "One",
-      items: [{ type: "bold", offset: 0, length: 3 }],
-    });
-    expect(second).toEqual({
-      text: "Two",
-      items: [{ type: "bold", offset: 0, length: 3 }],
-    });
   });
 });
 
@@ -639,76 +636,5 @@ describe("collapseBlankLinesBeforeVkCodeFences", () => {
         "```",
       ].join("\n"),
     );
-  });
-});
-
-describe("trimVkFormattedMessage", () => {
-  it("returns empty text when limit is zero or negative", () => {
-    expect(trimVkFormattedMessage({ text: "hello" }, 0)).toEqual({ text: "" });
-    expect(trimVkFormattedMessage({ text: "hello" }, -5)).toEqual({ text: "" });
-  });
-
-  it("returns the same object when message already fits within limit", () => {
-    const message = {
-      text: "hello",
-      formatData: { version: 1 as const, items: [{ type: "bold" as const, offset: 0, length: 5 }] },
-    };
-
-    const trimmed = trimVkFormattedMessage(message, 5);
-    expect(trimmed).toBe(message);
-  });
-
-  it("trims plain text when no format data exists", () => {
-    expect(trimVkFormattedMessage({ text: "hello world" }, 5)).toEqual({ text: "hello" });
-  });
-
-  it("trims and clamps format ranges to the new text limit", () => {
-    const message = {
-      text: "hello world",
-      formatData: {
-        version: 1 as const,
-        items: [
-          { type: "bold" as const, offset: 0, length: 5 },
-          { type: "italic" as const, offset: 6, length: 5 },
-          { type: "url" as const, offset: 6, length: 5, url: "https://example.com" },
-        ],
-      },
-    };
-
-    expect(trimVkFormattedMessage(message, 8)).toEqual({
-      text: "hello wo",
-      formatData: {
-        version: 1,
-        items: [
-          { type: "bold", offset: 0, length: 5 },
-          { type: "italic", offset: 6, length: 2 },
-          { type: "url", offset: 6, length: 2, url: "https://example.com" },
-        ],
-      },
-    });
-  });
-
-  it("removes format data when all items fall outside the trimmed text", () => {
-    const message = {
-      text: "hello world",
-      formatData: {
-        version: 1 as const,
-        items: [{ type: "bold" as const, offset: 8, length: 3 }],
-      },
-    };
-
-    expect(trimVkFormattedMessage(message, 5)).toEqual({ text: "hello" });
-  });
-
-  it("drops zero-length formatting items produced after trimming", () => {
-    const message = {
-      text: "abcd",
-      formatData: {
-        version: 1 as const,
-        items: [{ type: "bold" as const, offset: 1, length: 0 }],
-      },
-    };
-
-    expect(trimVkFormattedMessage(message, 2)).toEqual({ text: "ab" });
   });
 });

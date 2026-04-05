@@ -42,7 +42,7 @@ openclaw plugins update --all
 openclaw plugins update @openclaw-vk/vk@latest
 
 # Установить конкретную версию
-openclaw plugins install @openclaw-vk/vk@2026.4.2
+openclaw plugins install @openclaw-vk/vk@2026.4.4
 openclaw gateway restart
 openclaw channels status --json --probe
 ```

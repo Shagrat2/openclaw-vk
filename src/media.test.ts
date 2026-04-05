@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
+import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import {
   extractVkInboundAttachments,
   loadVkOutboundMedia,
@@ -14,6 +14,13 @@ import {
   resolveVkInboundMediaUrls,
   resolveVkInboundReplyContext,
 } from "./media.js";
+
+const mockFetch = vi.fn();
+vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
+
+beforeEach(() => {
+  mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
+});
 
 // ── extractVkInboundAttachments ─────────────────────────────────────────────
 
@@ -512,6 +519,64 @@ describe("loadVkOutboundMedia", () => {
     expect(result.title).toBe("report.pdf");
   });
 
+  it("uses filename query hints for HTTP URLs without a pathname extension", async () => {
+    const result = await loadVkOutboundMedia({
+      mediaUrl: "https://example.com/download?id=42&filename=report.pdf",
+    });
+    expect(result.kind).toBe("document");
+    expect(result.title).toBe("report.pdf");
+    expect(result.mimeType).toBe("application/pdf");
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("recovers the real file name from remote headers for extensionless HTTP URLs", async () => {
+    const cancel = vi.fn();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === "content-type"
+            ? "application/pdf"
+            : name.toLowerCase() === "content-disposition"
+              ? 'attachment; filename="monthly-report.pdf"'
+              : null,
+      },
+      body: { cancel },
+    } as unknown as Response);
+
+    const result = await loadVkOutboundMedia({
+      mediaUrl: "https://example.com/download/42",
+    });
+
+    expect(result.kind).toBe("document");
+    expect(result.title).toBe("monthly-report.pdf");
+    expect(result.mimeType).toBe("application/pdf");
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://example.com/download/42",
+      expect.objectContaining({ method: "HEAD" }),
+    );
+    expect(cancel).toHaveBeenCalled();
+  });
+
+  it("uses remote content-type to classify extensionless HTTP images", async () => {
+    const cancel = vi.fn();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: {
+        get: (name: string) => (name.toLowerCase() === "content-type" ? "image/png" : null),
+      },
+      body: { cancel },
+    } as unknown as Response);
+
+    const result = await loadVkOutboundMedia({
+      mediaUrl: "https://example.com/render/42",
+    });
+
+    expect(result.kind).toBe("image");
+    expect(result.title).toBe("42.png");
+    expect(result.mimeType).toBe("image/png");
+  });
+
   it("resolves HTTP audio URL as audio_message", async () => {
     const result = await loadVkOutboundMedia({
       mediaUrl: "https://example.com/voice.mp3",
@@ -541,7 +606,15 @@ describe("loadVkOutboundMedia", () => {
     const result = await loadVkOutboundMedia({ mediaUrl: textData });
     expect(result.kind).toBe("document");
     expect(result.source).toBeInstanceOf(Buffer);
+    expect(result.title).toBe("attachment.txt");
     expect((result.source as Buffer).toString()).toBe("hello world");
+  });
+
+  it("decodes PDF data URL with document extension", async () => {
+    const result = await loadVkOutboundMedia({ mediaUrl: "data:application/pdf;base64,JVBERi0x" });
+    expect(result.kind).toBe("document");
+    expect(result.title).toBe("attachment.pdf");
+    expect(result.mimeType).toBe("application/pdf");
   });
 
   it("decodes audio data URL as audio_message", async () => {
@@ -549,6 +622,16 @@ describe("loadVkOutboundMedia", () => {
     expect(result.kind).toBe("audio_message");
     expect(result.title).toBe("attachment.mp3");
     expect(result.source).toBeInstanceOf(Buffer);
+  });
+
+  it("decodes AAC/FLAC/MP4 audio data URLs with stable file extensions", async () => {
+    const aac = await loadVkOutboundMedia({ mediaUrl: "data:audio/aac;base64,SGVsbG8=" });
+    const flac = await loadVkOutboundMedia({ mediaUrl: "data:audio/flac;base64,SGVsbG8=" });
+    const m4a = await loadVkOutboundMedia({ mediaUrl: "data:audio/mp4;base64,SGVsbG8=" });
+
+    expect(aac.title).toBe("attachment.aac");
+    expect(flac.title).toBe("attachment.flac");
+    expect(m4a.title).toBe("attachment.m4a");
   });
 
   it("classifies GIF as document, not image", async () => {
@@ -592,6 +675,7 @@ describe("loadVkOutboundMedia", () => {
       await writeFile(join(tempDir, "test.png"), Buffer.from("fake-png"));
       await writeFile(join(tempDir, "doc.pdf"), Buffer.from("fake-pdf"));
       await writeFile(join(tempDir, "voice.mp3"), Buffer.from("fake-mp3"));
+      await writeFile(join(tempDir, "artifact"), Buffer.from("fake-text"));
     });
 
     afterAll(async () => {
@@ -615,6 +699,15 @@ describe("loadVkOutboundMedia", () => {
       expect(result.title).toBe("doc.pdf");
     });
 
+    it("uses preferred file name to classify and title extensionless local files", async () => {
+      const result = await loadVkOutboundMedia({
+        mediaUrl: join(tempDir, "artifact"),
+        preferredName: "test-small.txt",
+      });
+      expect(result.kind).toBe("document");
+      expect(result.title).toBe("test-small.txt");
+    });
+
     it("reads local audio file as audio_message", async () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "voice.mp3"),
@@ -636,6 +729,43 @@ describe("loadVkOutboundMedia", () => {
       const result = await loadVkOutboundMedia({
         mediaUrl: join(tempDir, "test.png"),
         mediaLocalRoots: [tempDir],
+      });
+      expect(result.kind).toBe("image");
+    });
+
+    it("resolves relative local paths against allowed roots before cwd", async () => {
+      const cwd = process.cwd();
+      const otherDir = await mkdtemp(join(tmpdir(), "vk-media-cwd-"));
+      try {
+        process.chdir(otherDir);
+        const result = await loadVkOutboundMedia({
+          mediaUrl: "./test.png",
+          mediaLocalRoots: [tempDir],
+        });
+        expect(result.kind).toBe("image");
+        expect(result.title).toBe("test.png");
+      } finally {
+        process.chdir(cwd);
+        await rm(otherDir, { recursive: true, force: true });
+      }
+    });
+
+    it("resolves relative local paths against cwd when roots are omitted", async () => {
+      const cwd = process.cwd();
+      try {
+        process.chdir(tempDir);
+        const result = await loadVkOutboundMedia({ mediaUrl: "test.png" });
+        expect(result.kind).toBe("image");
+        expect(result.title).toBe("test.png");
+      } finally {
+        process.chdir(cwd);
+      }
+    });
+
+    it("ignores blank and non-resolvable roots when an allowed root exists", async () => {
+      const result = await loadVkOutboundMedia({
+        mediaUrl: join(tempDir, "test.png"),
+        mediaLocalRoots: ["", "/definitely/missing/root", tempDir],
       });
       expect(result.kind).toBe("image");
     });

@@ -1,10 +1,8 @@
-import {
-  collapseBlankLinesBeforeVkCodeFences,
-  createVkMarkdownPipeline,
-  markdownToVk,
-  trimVkFormattedMessage,
+import { createMarkdownToVkPipeline } from "markdown-to-vk";
+import type {
+  VkMarkdownChunk,
+  VkMarkdownPipelineOptions,
 } from "markdown-to-vk";
-import type { VkFormattedMessage } from "markdown-to-vk";
 
 export type {
   VkFormatData,
@@ -13,22 +11,19 @@ export type {
   VkFormatType,
 } from "markdown-to-vk";
 
-export {
-  collapseBlankLinesBeforeVkCodeFences,
-  createVkMarkdownPipeline,
-  markdownToVk,
-  trimVkFormattedMessage,
+export type VkPreparedFormattedMessage = {
+  text: string;
+  formatData?: { version: 1; items: VkMarkdownChunk[number]["items"] };
 };
 
-export function renderVkMarkdown(markdown: string): VkFormattedMessage {
-  const rendered = markdownToVk(markdown ?? "");
-  return rendered.items.length === 0
-    ? { text: rendered.text }
-    : {
-        text: rendered.text,
-        formatData: {
-          version: 1,
-          items: rendered.items,
-        },
-      };
+export function renderVkMarkdownChunks(markdown: string, options: VkMarkdownPipelineOptions = {}): VkPreparedFormattedMessage[] {
+  const pipeline = createMarkdownToVkPipeline(options);
+  return pipeline.render(markdown ?? "").map((chunk) =>
+    chunk.items.length > 0
+      ? {
+          text: chunk.text,
+          formatData: { version: 1, items: chunk.items },
+        }
+      : { text: chunk.text },
+  );
 }

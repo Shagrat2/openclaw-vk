@@ -19,10 +19,13 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 - `src/setup-core.ts`: setup-side core operations (probe, account persistence)
 - `src/setup-surface.ts`: setup UI/runtime bridge used by setup entry
 - `src/accounts.ts`: account resolution and normalization helpers
+- `src/format.ts`: outbound Markdown-to-VK adapter; prepares `{ text, formatData }` chunks via `markdown-to-vk`
+- `src/sanitize.ts`: plain-text cleanup for VK outbound text before markdown-aware rendering
+- `src/send-support.ts`: target normalization, allowlist edits, and directory helpers shared by VK send surfaces
 - `src/runtime.ts`: runtime singleton access (`getVkRuntime` / `setVkRuntime`)
 - `src/monitor.ts`: VK updates polling and inbound event bridge
 - `src/inbound.ts`: inbound normalization, policy checks, dispatch to OpenClaw runtime
-- `src/send.ts`: outbound messaging via VK API
+- `src/send.ts`: outbound messaging via VK API and VK-specific delivery flow
 - `src/probe.ts`: token/bot probe via `groups.getById`
 - `src/media.ts`: inbound attachment extraction, outbound media loading (HTTP, data URL, local files)
 - `src/keyboard.ts`: VK keyboard/button building, text menu auto-parsing
@@ -239,6 +242,9 @@ Error: Cannot find module 'zod'
 - Keep VK plugin behavior aligned with OpenClaw channel policy patterns (pairing, allowlists, group policy).
 - Keep manifest/schema valid and minimal; never remove `configSchema` from `openclaw.plugin.json`.
 - Prefer Telegram extension behavior as the compatibility reference when implementing channel lifecycle changes.
+- Outbound VK text chunking/formatting is owned by `markdown-to-vk` via `src/format.ts`; do not reintroduce OpenClaw generic text chunker fallbacks or single-message trimming helpers.
+- For OpenClaw-facing outbound delivery, prefer the formatted seams (`sendFormattedText` / `sendFormattedMedia`) plus `textChunkLimit` metadata over generic string chunkers, because VK delivery needs both text chunks and `format_data`.
+- Do not mark VK as `markdownCapable` in OpenClaw metadata: VK supports converted rich text, but OpenClaw uses `markdownCapable` as a broader signal for markdown-native channel behavior.
 - Keep private rollout details in `AGENTS.local.md`, not here.
 - When adding new features, write tests that verify **behavior**, not just wiring. Run `npm run test:coverage` to check for uncovered branches.
 - After writing tests, audit them: would each test fail if the feature it covers was broken? If not, rewrite or remove the test.

@@ -20,12 +20,15 @@ import { VkConfigSchema } from "./config-schema.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
 import { getVkRuntime } from "./runtime.js";
+import { sanitizeVkPlainText } from "./sanitize.js";
 import {
   applyVkAllowlistConfigEdit,
   isVkGroupPeerId,
   readVkAllowlistConfig,
   resolveVkDirectoryGroups,
   resolveVkDirectoryPeers,
+  sendFormattedMediaVk,
+  sendFormattedTextVk,
   sendMessageVk,
   sendPayloadVk,
 } from "./send.js";
@@ -216,12 +219,9 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   },
   outbound: {
     deliveryMode: "direct",
-    chunker: (text, limit) => getVkRuntime().channel.text.chunkMarkdownText(text, limit),
-    chunkerMode: "markdown",
     textChunkLimit: 4096,
+    sanitizeText: ({ text }) => sanitizeVkPlainText(text),
     shouldSkipPlainTextSanitization: ({ payload }) => Boolean(payload.channelData),
-    resolveEffectiveTextChunkLimit: ({ fallbackLimit }) =>
-      typeof fallbackLimit === "number" ? Math.min(fallbackLimit, 4096) : 4096,
     sendPayload: async ({ to, payload, accountId, cfg, mediaLocalRoots, replyToId, forceDocument }) => {
       const result = await sendPayloadVk(to, payload, {
         cfg,
@@ -234,47 +234,40 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         ? { channel: "vk", ...result }
         : { channel: "vk", messageId: "", chatId: to };
     },
+    sendFormattedText: async ({ cfg, to, text, accountId, replyToId }) => {
+      const results = await sendFormattedTextVk(to, text, {
+        cfg,
+        accountId: accountId ?? undefined,
+        replyTo: replyToId ?? undefined,
+      });
+      return results.map((result) => ({ channel: "vk" as const, ...result }));
+    },
+    sendFormattedMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, replyToId, forceDocument }) => {
+      const result = await sendFormattedMediaVk(to, text, mediaUrl, {
+        cfg,
+        accountId: accountId ?? undefined,
+        mediaLocalRoots,
+        replyTo: replyToId ?? undefined,
+        forceDocument: forceDocument ?? undefined,
+      });
+      return { channel: "vk", ...result };
+    },
     sendText: async ({ cfg, to, text, accountId, replyToId }) => {
-      const result =
-        (await sendPayloadVk(
-          to,
-          {
-            text,
-            replyToId: replyToId ?? undefined,
-          },
-          {
-            cfg,
-            accountId: accountId ?? undefined,
-          },
-        )) ??
-        (await sendMessageVk(to, text, {
-          cfg,
-          accountId: accountId ?? undefined,
-          replyTo: replyToId ?? undefined,
-        }));
+      const result = await sendMessageVk(to, text, {
+        cfg,
+        accountId: accountId ?? undefined,
+        replyTo: replyToId ?? undefined,
+      });
       return { channel: "vk", ...result };
     },
     sendMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, replyToId, forceDocument }) => {
-      const result =
-        (await sendPayloadVk(
-          to,
-          {
-            text,
-            mediaUrl,
-            replyToId: replyToId ?? undefined,
-          },
-          {
-            cfg,
-            accountId: accountId ?? undefined,
-            mediaLocalRoots,
-            forceDocument: forceDocument ?? undefined,
-          },
-        )) ??
-        (await sendMessageVk(to, text, {
-          cfg,
-          accountId: accountId ?? undefined,
-          replyTo: replyToId ?? undefined,
-        }));
+      const result = await sendFormattedMediaVk(to, text, mediaUrl, {
+        cfg,
+        accountId: accountId ?? undefined,
+        mediaLocalRoots,
+        replyTo: replyToId ?? undefined,
+        forceDocument: forceDocument ?? undefined,
+      });
       return { channel: "vk", ...result };
     },
   },

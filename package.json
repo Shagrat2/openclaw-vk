@@ -1,6 +1,6 @@
 {
   "name": "@openclaw-vk/vk",
-  "version": "2026.4.2",
+  "version": "2026.4.4",
   "description": "OpenClaw VK (VKontakte) channel plugin",
   "author": {
     "name": "Pavel Frankov",
@@ -44,6 +44,8 @@
     "src/monitor.ts",
     "src/probe.ts",
     "src/runtime.ts",
+    "src/sanitize.ts",
+    "src/send-support.ts",
     "src/send.ts",
     "src/setup-core.ts",
     "src/setup-surface.ts",
@@ -56,8 +58,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "markdown-to-vk": "file:../markdown-to-vk",
-    "markdown-it": "^14.1.1",
+    "markdown-to-vk": "^0.3.0",
     "vk-io": "^4.10.1",
     "zod": "^3.25.76"
   },
