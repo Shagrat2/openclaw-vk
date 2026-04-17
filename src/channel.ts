@@ -2,7 +2,6 @@ import {
   adaptScopedAccountAccessor,
   createScopedChannelConfigAdapter,
 } from "openclaw/plugin-sdk/channel-config-helpers";
-import { createRestrictSendersChannelSecurity } from "openclaw/plugin-sdk/channel-policy";
 import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 import {
   buildComputedAccountStatusSnapshot,
@@ -60,21 +59,97 @@ const vkConfigAdapter = createScopedChannelConfigAdapter<ResolvedVkAccount, Reso
   resolveDefaultTo: (account: ResolvedVkAccount) => account.config.defaultTo,
 });
 
-const vkSecurityAdapter = createRestrictSendersChannelSecurity<ResolvedVkAccount>({
-  channelKey: "vk",
-  resolveDmPolicy: (account) => account.config.dmPolicy,
-  resolveDmAllowFrom: (account) => account.config.allowFrom,
-  resolveGroupPolicy: (account) => account.config.groupPolicy,
-  surface: "VK group chats",
-  openScope: "any member in group chats",
-  groupPolicyPath: "channels.vk.groupPolicy",
-  groupAllowFromPath: "channels.vk.groupAllowFrom",
-  mentionGated: false,
-  providerConfigPresent: (cfg) =>
-    (cfg.channels as Record<string, unknown> | undefined)?.vk !== undefined,
-  approveHint: "openclaw pairing approve vk <code>",
-  normalizeDmEntry: (raw) => raw.replace(/^vk:(?:user:)?/i, ""),
-});
+type VkGroupPolicy = "open" | "allowlist" | "disabled";
+
+const VK_CHANNEL_KEY = "vk";
+const VK_DM_APPROVE_HINT = "openclaw pairing approve vk <code>";
+const VK_OPEN_GROUP_WARNING =
+  '- VK group chats: groupPolicy="open" allows any member in group chats to trigger. ' +
+  'Set channels.vk.groupPolicy="allowlist" + channels.vk.groupAllowFrom to restrict senders.';
+
+function normalizeVkDmAllowEntry(raw: string): string {
+  return raw.replace(/^vk:(?:user:)?/i, "");
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function readVkConfiguredGroupPolicy(account: ResolvedVkAccount): VkGroupPolicy | undefined {
+  const groupPolicy = account.config.groupPolicy;
+  return groupPolicy === "open" || groupPolicy === "allowlist" || groupPolicy === "disabled"
+    ? groupPolicy
+    : undefined;
+}
+
+function readVkDefaultGroupPolicy(cfg: OpenClawConfig): VkGroupPolicy | undefined {
+  const channels = isObjectRecord(cfg.channels) ? cfg.channels : undefined;
+  const defaults = isObjectRecord(channels?.defaults) ? channels.defaults : undefined;
+  const groupPolicy = defaults?.groupPolicy;
+  return groupPolicy === "open" || groupPolicy === "allowlist" || groupPolicy === "disabled"
+    ? groupPolicy
+    : undefined;
+}
+
+function hasVkProviderConfig(cfg: OpenClawConfig): boolean {
+  const channels = isObjectRecord(cfg.channels) ? cfg.channels : undefined;
+  return channels?.[VK_CHANNEL_KEY] !== undefined;
+}
+
+function resolveVkSecurityAccountBasePath(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  account: ResolvedVkAccount;
+}): string {
+  const channels = isObjectRecord(params.cfg.channels) ? params.cfg.channels : undefined;
+  const channelConfig = isObjectRecord(channels?.[VK_CHANNEL_KEY]) ? channels[VK_CHANNEL_KEY] : undefined;
+  const accounts = isObjectRecord(channelConfig?.accounts) ? channelConfig.accounts : undefined;
+  const resolvedAccountId =
+    params.accountId?.trim() || params.account.accountId?.trim() || DEFAULT_ACCOUNT_ID;
+
+  return accounts?.[resolvedAccountId] !== undefined
+    ? `channels.${VK_CHANNEL_KEY}.accounts.${resolvedAccountId}.`
+    : `channels.${VK_CHANNEL_KEY}.`;
+}
+
+function resolveVkRuntimeGroupPolicy(params: {
+  cfg: OpenClawConfig;
+  account: ResolvedVkAccount;
+}): VkGroupPolicy {
+  const configuredGroupPolicy = readVkConfiguredGroupPolicy(params.account);
+  if (configuredGroupPolicy) {
+    return configuredGroupPolicy;
+  }
+  if (!hasVkProviderConfig(params.cfg)) {
+    return "allowlist";
+  }
+  return readVkDefaultGroupPolicy(params.cfg) ?? "allowlist";
+}
+
+const vkSecurityAdapter = {
+  resolveDmPolicy: ({
+    cfg,
+    accountId,
+    account,
+  }: {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+    account: ResolvedVkAccount;
+  }) => ({
+    policy: account.config.dmPolicy ?? "pairing",
+    allowFrom: account.config.allowFrom ?? [],
+    allowFromPath: resolveVkSecurityAccountBasePath({ cfg, accountId, account }),
+    approveHint: VK_DM_APPROVE_HINT,
+    normalizeEntry: normalizeVkDmAllowEntry,
+  }),
+  collectWarnings: ({
+    cfg,
+    account,
+  }: {
+    cfg: OpenClawConfig;
+    account: ResolvedVkAccount;
+  }) => (resolveVkRuntimeGroupPolicy({ cfg, account }) === "open" ? [VK_OPEN_GROUP_WARNING] : []),
+};
 
 export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   id: "vk",

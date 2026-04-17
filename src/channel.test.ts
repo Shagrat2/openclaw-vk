@@ -2,13 +2,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (must be before channel.ts import) ─────────────────────────────
 
-const mockCreateRestrictSendersChannelSecurity = vi.hoisted(() =>
-  vi.fn().mockImplementation(() => ({
-    resolveDmPolicy: vi.fn(),
-    collectWarnings: vi.fn().mockReturnValue([]),
-  })),
-);
-
 vi.mock("openclaw/plugin-sdk/channel-config-helpers", () => ({
   adaptScopedAccountAccessor:
     (accessor: (params: Record<string, unknown>) => unknown) =>
@@ -28,11 +21,7 @@ vi.mock("openclaw/plugin-sdk/channel-config-helpers", () => ({
     resolveAllowFrom,
     formatAllowFrom,
     resolveDefaultTo,
-  }),
-}));
-
-vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
-  createRestrictSendersChannelSecurity: mockCreateRestrictSendersChannelSecurity,
+    }),
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-config-schema", () => ({
@@ -234,12 +223,24 @@ describe("plugin metadata", () => {
   });
 
   it("marks provider config as present only when channels.vk exists", () => {
-    const params = mockCreateRestrictSendersChannelSecurity.mock.calls[0]?.[0] as
-      | { providerConfigPresent?: (cfg: unknown) => boolean }
-      | undefined;
-
-    expect(params?.providerConfigPresent?.({ channels: { vk: {} } })).toBe(true);
-    expect(params?.providerConfigPresent?.({ channels: { telegram: {} } })).toBe(false);
+    expect(
+      vkPlugin.security!.collectWarnings!({
+        account: {
+          config: { groupPolicy: "open" },
+        },
+        cfg: { channels: { vk: {} } },
+      } as never),
+    ).toEqual([
+      expect.stringContaining('channels.vk.groupPolicy="allowlist"'),
+    ]);
+    expect(
+      vkPlugin.security!.collectWarnings!({
+        account: {
+          config: {},
+        },
+        cfg: { channels: { telegram: {} } },
+      } as never),
+    ).toEqual([]);
   });
 });
 
@@ -432,27 +433,60 @@ describe("security", () => {
     expect(vkPlugin.security?.collectWarnings).toBeTypeOf("function");
   });
 
-  it("wires VK-specific settings into the shared security helper", () => {
-    const params = mockCreateRestrictSendersChannelSecurity.mock.calls[0]?.[0] as
-      | Record<string, unknown>
-      | undefined;
-    expect(params).toEqual(
-      expect.objectContaining({
-        channelKey: "vk",
-        surface: "VK group chats",
-        groupPolicyPath: "channels.vk.groupPolicy",
-        groupAllowFromPath: "channels.vk.groupAllowFrom",
-        mentionGated: false,
-        approveHint: "openclaw pairing approve vk <code>",
-      }),
-    );
+  it("returns DM security policy for root-scoped config", () => {
+    const policy = vkPlugin.security!.resolveDmPolicy!({
+      cfg: { channels: { vk: {} } },
+      accountId: "default",
+      account: {
+        accountId: "default",
+        config: {
+          dmPolicy: "pairing",
+          allowFrom: ["vk:user:12345"],
+        },
+      },
+    } as never);
 
-    const normalizeDmEntry = params?.normalizeDmEntry;
-    expect(normalizeDmEntry).toBeTypeOf("function");
-    expect((normalizeDmEntry as (raw: string) => string)("vk:user:12345")).toBe("12345");
+    expect(policy).toEqual({
+      policy: "pairing",
+      allowFrom: ["vk:user:12345"],
+      allowFromPath: "channels.vk.",
+      approveHint: "openclaw pairing approve vk <code>",
+      normalizeEntry: expect.any(Function),
+    });
+    expect(policy?.normalizeEntry?.("vk:user:12345")).toBe("12345");
   });
 
-  it("uses the helper-provided security adapter methods", () => {
+  it("returns DM security policy for explicit account config", () => {
+    const policy = vkPlugin.security!.resolveDmPolicy!({
+      cfg: {
+        channels: {
+          vk: {
+            accounts: {
+              sales: {},
+            },
+          },
+        },
+      },
+      accountId: "sales",
+      account: {
+        accountId: "sales",
+        config: {
+          dmPolicy: "allowlist",
+          allowFrom: ["111"],
+        },
+      },
+    } as never);
+
+    expect(policy).toEqual({
+      policy: "allowlist",
+      allowFrom: ["111"],
+      allowFromPath: "channels.vk.accounts.sales.",
+      approveHint: "openclaw pairing approve vk <code>",
+      normalizeEntry: expect.any(Function),
+    });
+  });
+
+  it("warns when VK group chats are open", () => {
     const warnings = vkPlugin.security!.collectWarnings!({
       account: {
         config: { groupPolicy: "allowlist" },
@@ -461,6 +495,47 @@ describe("security", () => {
     } as never);
 
     expect(warnings).toEqual([]);
+    expect(
+      vkPlugin.security!.collectWarnings!({
+        account: {
+          config: { groupPolicy: "open" },
+        },
+        cfg: { channels: { vk: {} } },
+      } as never),
+    ).toEqual([
+      '- VK group chats: groupPolicy="open" allows any member in group chats to trigger. Set channels.vk.groupPolicy="allowlist" + channels.vk.groupAllowFrom to restrict senders.',
+    ]);
+  });
+
+  it("uses the global default groupPolicy only when VK config exists", () => {
+    expect(
+      vkPlugin.security!.collectWarnings!({
+        account: {
+          config: {},
+        },
+        cfg: {
+          channels: {
+            vk: {},
+            defaults: { groupPolicy: "open" },
+          },
+        },
+      } as never),
+    ).toEqual([
+      expect.stringContaining('groupPolicy="open"'),
+    ]);
+
+    expect(
+      vkPlugin.security!.collectWarnings!({
+        account: {
+          config: {},
+        },
+        cfg: {
+          channels: {
+            defaults: { groupPolicy: "open" },
+          },
+        },
+      } as never),
+    ).toEqual([]);
   });
 });
 
