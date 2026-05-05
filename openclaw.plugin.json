@@ -5,5 +5,16 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {}
+  },
+  "channelConfigs": {
+    "vk": {
+      "label": "VK",
+      "description": "VK (VKontakte) community bot via Long Poll API.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {}
+      }
+    }
   }
 }

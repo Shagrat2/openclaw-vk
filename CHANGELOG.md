@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## v2026.5.5
+
+### Исправлено
+- Установка `@openclaw-vk/vk` через `openclaw plugins install` в свежих версиях OpenClaw больше не падает из-за отсутствующего compiled runtime output: опубликованный пакет теперь содержит собранные runtime entrypoints для канала VK и setup-мастера.
+- При установке OpenClaw больше не предупреждает, что у VK-плагина нет статических metadata для конфигурации канала: пакет теперь объявляет базовый `channelConfigs.vk` в манифесте.
+
+Кому важно:
+- Пользователям, которые ставят VK-плагин как npm-пакет на OpenClaw 2026.5.x и видели ошибку про `expected ./dist/index.js` при установке.
+
+Что проверить после обновления:
+1. Установите новую версию пакета: `openclaw plugins install @openclaw-vk/vk@2026.5.5`.
+2. Выполните `openclaw plugins info vk --json` и убедитесь, что плагин установлен и entrypoint указывает на `dist/index.js`.
+3. Перезапустите gateway: `openclaw gateway restart`.
+4. Отправьте тестовое сообщение в VK и проверьте, что канал отвечает без ошибок в логах gateway.
+
 ## v2026.4.17
 
 ### Исправлено
