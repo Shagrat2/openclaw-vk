@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## v2026.5.11
+
+### Исправлено
+- VK-канал снова запускается на OpenClaw 2026.5.7: после установки плагина и перезапуска gateway больше не падает с `TypeError: Cannot convert undefined or null to object` при загрузке runtime. Пакет теперь привозит совместимую копию VK SDK и его сетевых зависимостей, поэтому на работу канала не влияет служебная подмена `node-domexception` в OpenClaw.
+
+Кому важно:
+- Пользователям, которые обновили OpenClaw до 2026.5.7 и видели падение gateway сразу после установки или включения VK-плагина.
+
+Что проверить после обновления:
+1. Обновите плагин: `openclaw plugins install @openclaw-vk/vk@2026.5.11 --force --pin`.
+2. Перезапустите gateway: `openclaw gateway restart`.
+3. Выполните `openclaw plugins info vk --json` и убедитесь, что плагин загружается без `TypeError`.
+4. Выполните `openclaw channels status --probe` и отправьте тестовое сообщение в VK.
+
 ## v2026.5.5
 
 ### Исправлено
