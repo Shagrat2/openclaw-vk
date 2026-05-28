@@ -203,8 +203,8 @@ describe("plugin metadata", () => {
     expect(vkPlugin.capabilities.media).toBe(true);
   });
 
-  it("does not support reactions or threads", () => {
-    expect(vkPlugin.capabilities.reactions).toBe(false);
+  it("supports reactions but not threads", () => {
+    expect(vkPlugin.capabilities.reactions).toBe(true);
     expect(vkPlugin.capabilities.threads).toBe(false);
   });
 

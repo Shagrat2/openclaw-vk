@@ -184,7 +184,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   },
   capabilities: {
     chatTypes: ["direct", "group"],
-    reactions: false,
+    reactions: true,
     threads: false,
     media: true,
     nativeCommands: false,

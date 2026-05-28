@@ -732,6 +732,83 @@ export async function markMessageReadVk(
   });
 }
 
+// VK reaction id catalog as returned by messages.getReactionsAssets (16 items):
+//   1=❤️ 2=🔥 3=😂 4=👍 5=💩 6=⁉️ 7=😭 8=😡
+//   9=👎 10=👌 11=😄 12=🤔 13=🙏 14=😘 15=😍 16=🎉
+const VK_REACTION_ID_DEFAULT = 4; // 👍
+
+const VK_REACTION_ID_BY_EMOJI: Readonly<Record<string, number>> = {
+  "❤️": 1,
+  "❤": 1,
+  "🔥": 2,
+  "😂": 3,
+  "🤣": 3,
+  "👍": 4,
+  "💩": 5,
+  "⁉️": 6,
+  "⁉": 6,
+  "😭": 7,
+  "😡": 8,
+  "👎": 9,
+  "👌": 10,
+  "😄": 11,
+  "🤔": 12,
+  "🙏": 13,
+  "😘": 14,
+  "😍": 15,
+  "🎉": 16,
+};
+
+export function mapEmojiToVkReactionId(emoji: string): number {
+  return VK_REACTION_ID_BY_EMOJI[emoji] ?? VK_REACTION_ID_DEFAULT;
+}
+
+export async function sendReactionVk(
+  to: string,
+  cmid: number,
+  emoji: string,
+  account: ResolvedVkAccount,
+): Promise<boolean> {
+  if (!account.token) {
+    return false;
+  }
+  const peerId = Number(normalizeVkTargetId(to));
+  if (Number.isNaN(peerId) || !Number.isFinite(cmid)) {
+    return false;
+  }
+  const reactionId = mapEmojiToVkReactionId(emoji);
+  const vk = getOrCreateVk(account.token);
+  await withVkRetry(async () => {
+    await vk.api.messages.sendReaction({
+      peer_id: peerId,
+      cmid,
+      reaction_id: reactionId,
+    });
+  });
+  return true;
+}
+
+export async function deleteReactionVk(
+  to: string,
+  cmid: number,
+  account: ResolvedVkAccount,
+): Promise<void> {
+  if (!account.token) {
+    return;
+  }
+  const peerId = Number(normalizeVkTargetId(to));
+  if (Number.isNaN(peerId) || !Number.isFinite(cmid)) {
+    return;
+  }
+  const vk = getOrCreateVk(account.token);
+  await withVkRetry(async () => {
+    await vk.api.messages.deleteReaction({
+      peer_id: peerId,
+      cmid,
+    });
+  });
+}
+
 async function sendMessageChunksVk(params: {
   to: string;
   chunks: VkPreparedFormattedMessage[];

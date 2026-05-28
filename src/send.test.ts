@@ -8,6 +8,7 @@ import {
   applyVkAllowlistConfigEdit,
   clearVkInstances,
   isVkGroupPeerId,
+  mapEmojiToVkReactionId,
   markMessageReadVk,
   normalizeVkDirectoryEntries,
   normalizeVkSenderAllowEntry,
@@ -23,6 +24,8 @@ import {
   sendMessageVk,
   sendPayloadVk,
   sendPhotoVk,
+  sendReactionVk,
+  deleteReactionVk,
   sendTypingVk,
 } from "./send.js";
 import { makeAccount } from "./test-helpers.js";
@@ -55,6 +58,8 @@ vi.mock("./runtime.js", () => ({
 const mockMessagesSend = vi.hoisted(() => vi.fn());
 const mockMessagesMarkAsRead = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSetActivity = vi.hoisted(() => vi.fn().mockResolvedValue(1));
+const mockSendReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
+const mockDeleteReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockUploadPhoto = vi.hoisted(() => vi.fn().mockResolvedValue("photo123_456"));
 const mockUploadDocument = vi.hoisted(() => vi.fn().mockResolvedValue("doc123_789"));
 const mockUploadAudioMessage = vi.hoisted(() => vi.fn().mockResolvedValue("audio_message123_789"));
@@ -76,6 +81,8 @@ vi.mock("vk-io", () => ({
           send: mockMessagesSend,
           markAsRead: mockMessagesMarkAsRead,
           setActivity: mockSetActivity,
+          sendReaction: mockSendReaction,
+          deleteReaction: mockDeleteReaction,
         },
       },
       upload: {
@@ -129,6 +136,8 @@ beforeEach(() => {
   mockMessagesSend.mockReset();
   mockMessagesMarkAsRead.mockReset().mockResolvedValue(1);
   mockSetActivity.mockReset().mockResolvedValue(1);
+  mockSendReaction.mockReset().mockResolvedValue(1);
+  mockDeleteReaction.mockReset().mockResolvedValue(1);
   mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
   mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
   mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
@@ -676,6 +685,85 @@ describe("markMessageReadVk", () => {
       peer_id: 123,
       start_message_id: 77,
       mark_conversation_as_read: true,
+    });
+  });
+});
+
+describe("mapEmojiToVkReactionId", () => {
+  it("maps known emojis to their VK reaction ids", () => {
+    expect(mapEmojiToVkReactionId("❤️")).toBe(1);
+    expect(mapEmojiToVkReactionId("🔥")).toBe(2);
+    expect(mapEmojiToVkReactionId("😂")).toBe(3);
+    expect(mapEmojiToVkReactionId("👍")).toBe(4);
+    expect(mapEmojiToVkReactionId("💩")).toBe(5);
+    expect(mapEmojiToVkReactionId("😡")).toBe(8);
+    expect(mapEmojiToVkReactionId("🤔")).toBe(12);
+    expect(mapEmojiToVkReactionId("🎉")).toBe(16);
+  });
+
+  it("falls back to thumbs up for unsupported emoji", () => {
+    expect(mapEmojiToVkReactionId("👀")).toBe(4);
+    expect(mapEmojiToVkReactionId("🧠")).toBe(4);
+    expect(mapEmojiToVkReactionId("not-an-emoji")).toBe(4);
+  });
+});
+
+describe("sendReactionVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockSendReaction.mockReset().mockResolvedValue(1);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("posts the mapped reaction id to VK", async () => {
+    const ok = await sendReactionVk("123", 42, "👍", makeAccount());
+
+    expect(ok).toBe(true);
+    expect(mockSendReaction).toHaveBeenCalledWith({
+      peer_id: 123,
+      cmid: 42,
+      reaction_id: 4,
+    });
+  });
+
+  it("normalizes vk-prefixed peer IDs", async () => {
+    await sendReactionVk("vk:chat:9", 7, "❤️", makeAccount());
+
+    expect(mockSendReaction).toHaveBeenCalledWith({
+      peer_id: 9,
+      cmid: 7,
+      reaction_id: 1,
+    });
+  });
+
+  it("silently returns false when token is empty", async () => {
+    const ok = await sendReactionVk("123", 42, "👍", makeAccount({ token: "" }));
+
+    expect(ok).toBe(false);
+    expect(mockSendReaction).not.toHaveBeenCalled();
+  });
+
+  it("silently returns false when peer or cmid is invalid", async () => {
+    await sendReactionVk("abc", 42, "👍", makeAccount());
+    await sendReactionVk("123", Number.NaN, "👍", makeAccount());
+
+    expect(mockSendReaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("deleteReactionVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockDeleteReaction.mockReset().mockResolvedValue(1);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("posts deleteReaction with peer_id and cmid", async () => {
+    await deleteReactionVk("123", 42, makeAccount());
+
+    expect(mockDeleteReaction).toHaveBeenCalledWith({
+      peer_id: 123,
+      cmid: 42,
     });
   });
 });

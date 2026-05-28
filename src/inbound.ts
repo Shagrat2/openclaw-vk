@@ -29,7 +29,7 @@ import {
   resolveVkInboundMediaUrls,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
-import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
+import { markMessageReadVk, sendPayloadVk, sendReactionVk, sendTypingVk } from "./send.js";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -396,6 +396,42 @@ export async function handleVkInbound(params: {
     runtime.log?.(
       `vk: mark read failed for peerId=${message.peerId} messageId=${message.messageId}: ${String(err)}`,
     );
+  }
+
+  const ackReactionEmoji = "👍";
+  const ackReactionScope =
+    ((config as Record<string, Record<string, unknown>>).messages?.ackReactionScope as
+      | "all"
+      | "direct"
+      | "group-all"
+      | "group-mentions"
+      | "off"
+      | "none"
+      | undefined) ?? undefined;
+  const shouldAck =
+    typeof message.conversationMessageId === "number" &&
+    core.channel.reactions.shouldAckReaction({
+      scope: ackReactionScope,
+      isDirect: !isGroup,
+      isGroup,
+      isMentionableGroup: isGroup,
+      requireMention: Boolean(requireMention),
+      canDetectMention: true,
+      effectiveWasMentioned: isGroup ? wasMentioned : false,
+    });
+  if (shouldAck && typeof message.conversationMessageId === "number") {
+    try {
+      await sendReactionVk(
+        String(message.peerId),
+        message.conversationMessageId,
+        ackReactionEmoji,
+        account,
+      );
+    } catch (err) {
+      runtime.log?.(
+        `vk: ack reaction failed for peerId=${message.peerId} cmid=${message.conversationMessageId}: ${String(err)}`,
+      );
+    }
   }
 
   await startTypingOnce();
