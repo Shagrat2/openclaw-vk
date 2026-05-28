@@ -60,6 +60,42 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   logInboundDrop: vi.fn(),
 }));
 
+vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
+  DEFAULT_EMOJIS: {
+    queued: "👀",
+    thinking: "🧠",
+    tool: "🛠️",
+    coding: "🛠️",
+    web: "🛠️",
+    deploy: "🛠️",
+    build: "🛠️",
+    concierge: "🛠️",
+    done: "✅",
+    error: "❌",
+    stallSoft: "⏳",
+    stallHard: "⏱️",
+    compacting: "🗜️",
+  },
+  DEFAULT_TIMING: {
+    debounceMs: 250,
+    stallSoftMs: 10000,
+    stallHardMs: 30000,
+    doneHoldMs: 1500,
+    errorHoldMs: 2500,
+  },
+  createStatusReactionController: vi.fn(() => ({
+    setQueued: vi.fn(),
+    setThinking: vi.fn(),
+    setTool: vi.fn(),
+    setCompacting: vi.fn(),
+    setDone: vi.fn().mockResolvedValue(undefined),
+    setError: vi.fn().mockResolvedValue(undefined),
+    cancelPending: vi.fn(),
+    clear: vi.fn().mockResolvedValue(undefined),
+    restoreInitial: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+
 vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   readStoreAllowFromForDmPolicy: async ({ readStore }: Record<string, any>) =>
     readStore ? await readStore() : [],
