@@ -3,6 +3,11 @@ import {
   tryReadSecretFileSync,
 } from "openclaw/plugin-sdk/core";
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
+import {
+  hasConfiguredSecretInput,
+  isSecretRef,
+  normalizeSecretInputString,
+} from "openclaw/plugin-sdk/secret-input";
 import type { ResolvedVkAccount, VkAccountConfig, VkConfig, CoreConfig } from "./types.js";
 export type { ResolvedVkAccount } from "./types.js";
 
@@ -34,9 +39,23 @@ function mergeVkAccountConfig(cfg: CoreConfig, accountId: string): VkAccountConf
   return base;
 }
 
+function logSecretRefNotice(path: string): void {
+  if (process.env.OPENCLAW_VK_SECRETREF_WARNED === "1") {
+    return;
+  }
+  process.env.OPENCLAW_VK_SECRETREF_WARNED = "1";
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[vk] ${path} is a SecretRef object — runtime SecretRef resolution is not yet ` +
+      "implemented for the VK channel. Falling back to no-token (channel will be skipped). " +
+      "Use a plain-string token, VK_TOKEN env, or tokenFile until SecretRef support lands.",
+  );
+}
+
 function resolveVkToken(
   accountId: string,
   config: VkAccountConfig,
+  configPath: string,
 ): { token: string; source: "env" | "tokenFile" | "config" | "none" } {
   // 1. Environment variable
   if (accountId === DEFAULT_ACCOUNT_ID) {
@@ -54,9 +73,17 @@ function resolveVkToken(
     }
   }
 
-  // 3. Config value
-  if (config.token?.trim()) {
-    return { token: config.token.trim(), source: "config" };
+  // 3. Config value — plain string OR SecretRef
+  const tokenValue = config.token;
+  const plainToken = normalizeSecretInputString(tokenValue);
+  if (plainToken) {
+    return { token: plainToken, source: "config" };
+  }
+  if (isSecretRef(tokenValue)) {
+    // SecretRef objects need async resolution via secrets.providers; not wired in
+    // the synchronous account-resolution path yet. Warn once per process and fall
+    // through so the channel reports as "no token" instead of throwing on .trim().
+    logSecretRefNotice(configPath);
   }
 
   return { token: "", source: "none" };
@@ -68,7 +95,11 @@ export function resolveVkAccount(params: {
 }): ResolvedVkAccount {
   const accountId = normalizeAccountId(params.accountId ?? undefined);
   const config = mergeVkAccountConfig(params.cfg, accountId);
-  const { token, source } = resolveVkToken(accountId, config);
+  const configPath =
+    accountId === DEFAULT_ACCOUNT_ID
+      ? "channels.vk.token"
+      : `channels.vk.accounts.${accountId}.token`;
+  const { token, source } = resolveVkToken(accountId, config, configPath);
 
   return {
     accountId,
@@ -80,6 +111,13 @@ export function resolveVkAccount(params: {
   };
 }
 
+function hasVkTokenInput(value: unknown): boolean {
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  return hasConfiguredSecretInput(value);
+}
+
 export function listVkAccountIds(cfg: CoreConfig): string[] {
   const vkConfig = cfg.channels?.vk as VkConfig | undefined;
   if (!vkConfig) {
@@ -88,7 +126,11 @@ export function listVkAccountIds(cfg: CoreConfig): string[] {
 
   const ids: string[] = [];
   // Include default account if top-level token/tokenFile is present
-  if (vkConfig.token?.trim() || vkConfig.tokenFile?.trim() || process.env.VK_TOKEN?.trim()) {
+  if (
+    hasVkTokenInput(vkConfig.token) ||
+    vkConfig.tokenFile?.trim() ||
+    process.env.VK_TOKEN?.trim()
+  ) {
     ids.push(DEFAULT_ACCOUNT_ID);
   }
 

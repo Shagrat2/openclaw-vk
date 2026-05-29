@@ -11,6 +11,19 @@ vi.mock("openclaw/plugin-sdk/account-id", () => ({
   normalizeAccountId: (id?: string) => id?.trim() || "default",
 }));
 
+vi.mock("openclaw/plugin-sdk/secret-input", () => ({
+  hasConfiguredSecretInput: (v: unknown) =>
+    typeof v === "object" && v !== null && "source" in (v as Record<string, unknown>),
+  isSecretRef: (v: unknown) =>
+    typeof v === "object" &&
+    v !== null &&
+    "source" in (v as Record<string, unknown>) &&
+    "provider" in (v as Record<string, unknown>) &&
+    "id" in (v as Record<string, unknown>),
+  normalizeSecretInputString: (v: unknown) =>
+    typeof v === "string" ? v.trim() || undefined : undefined,
+}));
+
 vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
   createPluginRuntimeStore: (errorMsg: string) => {
     let runtime: unknown;

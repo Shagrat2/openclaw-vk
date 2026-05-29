@@ -1,4 +1,5 @@
 import { DmPolicySchema, GroupPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
+import { buildOptionalSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
 import { z } from "zod";
 
 function requireOpenAllowFrom(params: {
@@ -44,7 +45,7 @@ const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
     enabled: z.boolean().optional(),
-    token: z.string().optional(),
+    token: buildOptionalSecretInputSchema(),
     tokenFile: z.string().optional(),
     dmPolicy: DmPolicySchema.optional(),
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),

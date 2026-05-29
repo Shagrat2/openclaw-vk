@@ -14,6 +14,19 @@ vi.mock("openclaw/plugin-sdk/account-id", () => ({
   normalizeAccountId: (id?: string) => id?.trim() || "default",
 }));
 
+vi.mock("openclaw/plugin-sdk/secret-input", () => ({
+  hasConfiguredSecretInput: (v: unknown) =>
+    typeof v === "object" && v !== null && "source" in (v as Record<string, unknown>),
+  isSecretRef: (v: unknown) =>
+    typeof v === "object" &&
+    v !== null &&
+    "source" in (v as Record<string, unknown>) &&
+    "provider" in (v as Record<string, unknown>) &&
+    "id" in (v as Record<string, unknown>),
+  normalizeSecretInputString: (v: unknown) =>
+    typeof v === "string" ? v.trim() || undefined : undefined,
+}));
+
 import {
   listEnabledVkAccounts,
   listVkAccountIds,
@@ -101,6 +114,23 @@ describe("resolveVkAccount", () => {
     const result = resolveVkAccount({ cfg: cfg({}) });
     expect(result.token).toBe("");
     expect(result.tokenSource).toBe("none");
+  });
+
+  it("accepts a SecretRef object without throwing (graceful Stage 3)", () => {
+    delete process.env.OPENCLAW_VK_SECRETREF_WARNED;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const secretRef = { source: "exec", provider: "openclaw-keychain", id: "vk-group-token" };
+    const result = resolveVkAccount({
+      cfg: cfg({ token: secretRef as unknown as string }),
+    });
+    // Until async SecretRef resolution lands in resolveVkToken, the channel
+    // degrades to "no token" instead of crashing on .trim() — but the warning
+    // explains why.
+    expect(result.token).toBe("");
+    expect(result.tokenSource).toBe("none");
+    expect(warnSpy).toHaveBeenCalledOnce();
+    expect(warnSpy.mock.calls[0][0]).toMatch(/SecretRef/);
+    warnSpy.mockRestore();
   });
 
   it("defaults enabled to true", () => {
@@ -224,6 +254,13 @@ describe("listVkAccountIds", () => {
 
   it("returns default when tokenFile present", () => {
     expect(listVkAccountIds(cfg({ tokenFile: "/path" }))).toContain("default");
+  });
+
+  it("returns default when token is a SecretRef object", () => {
+    const secretRef = { source: "exec", provider: "openclaw-keychain", id: "vk-group-token" };
+    expect(
+      listVkAccountIds(cfg({ token: secretRef as unknown as string })),
+    ).toContain("default");
   });
 
   it("includes named accounts from accounts section", () => {

@@ -11,6 +11,19 @@ vi.mock("openclaw/plugin-sdk/channel-config-schema", async () => {
   };
 });
 
+vi.mock("openclaw/plugin-sdk/secret-input", async () => {
+  const { z } = await import("zod");
+  const secretRefSchema = z.object({
+    source: z.enum(["env", "file", "exec"]),
+    provider: z.string(),
+    id: z.string(),
+  });
+  return {
+    buildOptionalSecretInputSchema: () =>
+      z.union([z.string(), secretRefSchema]).optional(),
+  };
+});
+
 import { VkAccountSchema, VkConfigSchema } from "./config-schema.js";
 
 // ── VkAccountSchema ──────────────────────────────────────────────────────────
@@ -19,6 +32,24 @@ describe("VkAccountSchema", () => {
   it("accepts minimal valid config", () => {
     const result = VkAccountSchema.safeParse({});
     expect(result.success).toBe(true);
+  });
+
+  it("accepts SecretRef object for token", () => {
+    const result = VkAccountSchema.safeParse({
+      token: {
+        source: "exec",
+        provider: "openclaw-keychain",
+        id: "vk-group-token",
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects SecretRef-shaped token with unknown source", () => {
+    const result = VkAccountSchema.safeParse({
+      token: { source: "vault", provider: "x", id: "y" },
+    });
+    expect(result.success).toBe(false);
   });
 
   it("accepts full valid config", () => {

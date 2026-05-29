@@ -1,10 +1,17 @@
+import type { SecretInput } from "openclaw/plugin-sdk/secret-input";
+
 export type DmPolicy = "pairing" | "allowlist" | "open" | "disabled";
 type GroupPolicy = "open" | "disabled" | "allowlist";
 
 export type VkAccountConfig = {
   name?: string;
   enabled?: boolean;
-  token?: string;
+  /**
+   * Either a plain string token or a SecretRef pointing into
+   * a `secrets.providers.*` entry. SecretRef values are resolved
+   * by core during config-load before the channel sees the value.
+   */
+  token?: SecretInput;
   tokenFile?: string;
   dmPolicy?: DmPolicy;
   allowFrom?: Array<string | number>;
