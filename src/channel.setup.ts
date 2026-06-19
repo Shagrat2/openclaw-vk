@@ -31,7 +31,7 @@ export const vkSetupPlugin: ChannelPlugin<ResolvedVkAccount> = {
   },
   capabilities: {
     chatTypes: ["direct", "group"],
-    reactions: false,
+    reactions: true,
     threads: false,
     media: true,
     nativeCommands: false,

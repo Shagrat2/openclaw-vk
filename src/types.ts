@@ -42,6 +42,7 @@ export type ResolvedVkAccount = {
 
 export type VkInboundMessage = {
   messageId: string;
+  conversationMessageId?: number;
   peerId: number;
   senderId: number;
   text: string;

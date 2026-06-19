@@ -111,6 +111,10 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
     const message: VkInboundMessage = {
       messageId: String(context.id),
+      conversationMessageId:
+        typeof context.conversationMessageId === "number" && Number.isFinite(context.conversationMessageId)
+          ? context.conversationMessageId
+          : undefined,
       peerId,
       senderId,
       text,

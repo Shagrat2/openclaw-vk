@@ -30,6 +30,9 @@ import {
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
 import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
+import { createVkStatusReactionController } from "./reactions-controller.js";
+import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
+import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -398,34 +401,155 @@ export async function handleVkInbound(params: {
     );
   }
 
+  const cfgRecord = config as Record<string, Record<string, unknown>>;
+  const ackReactionScope =
+    (cfgRecord.messages?.ackReactionScope as
+      | "all"
+      | "direct"
+      | "group-all"
+      | "group-mentions"
+      | "off"
+      | "none"
+      | undefined) ?? undefined;
+  const statusReactionsCfg = cfgRecord.messages?.statusReactions as
+    | { enabled?: boolean; emojis?: Record<string, string>; timing?: Record<string, number> }
+    | undefined;
+  const statusReactionsEnabled =
+    statusReactionsCfg?.enabled === true &&
+    typeof message.conversationMessageId === "number" &&
+    core.channel.reactions.shouldAckReaction({
+      scope: ackReactionScope,
+      isDirect: !isGroup,
+      isGroup,
+      isMentionableGroup: isGroup,
+      requireMention: Boolean(requireMention),
+      canDetectMention: true,
+      effectiveWasMentioned: isGroup ? wasMentioned : false,
+    });
+  const removeAckAfterReply =
+    (cfgRecord.messages?.removeAckAfterReply as boolean | undefined) ?? false;
+  let statusReactions: StatusReactionController | null = null;
+  if (statusReactionsEnabled && typeof message.conversationMessageId === "number") {
+    statusReactions = createVkStatusReactionController({
+      peerId: message.peerId,
+      cmid: message.conversationMessageId,
+      account,
+      emojiOverrides: statusReactionsCfg?.emojis,
+      timing: statusReactionsCfg?.timing,
+      onError: (err) => {
+        runtime.log?.(`vk: status-reaction error for cmid=${message.conversationMessageId}: ${String(err)}`);
+      },
+    });
+    void statusReactions.setQueued();
+  }
+
   await startTypingOnce();
 
-  await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg: config as OpenClawConfig,
-    dispatcherOptions: {
-      ...prefixOptions,
-      onReplyStart: startTypingOnce,
-      typingCallbacks,
-      deliver: async (payload: unknown, info?: { kind?: string }) => {
-        const normalized =
-          payload && typeof payload === "object" && !Array.isArray(payload)
-            ? (payload as VkDispatchPayload)
-            : {};
-        const resolvedButtons = resolveVkButtonsFromPayload(normalized);
-        await deliverVkReply({
-          payload: normalized,
-          peerId: message.peerId,
-          accountId: account.accountId,
-          statusSink,
-          clearKeyboard:
-            payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
-        });
+  let dispatchError = false;
+  // Defensive guard mirroring the bundled channels' isProcessAborted() check
+  // (see core message-handler.process / telegram bot). VK has no abortSignal in
+  // this scope, so we use a local "settled" flag: once the turn finalizes
+  // (setDone/setError in finally), late-arriving progress callbacks become
+  // no-ops. The SDK controller already guards on `finished`, so this is
+  // belt-and-suspenders — but it keeps intent explicit and avoids redundant
+  // setReaction churn after the turn is done.
+  let turnSettled = false;
+  try {
+    await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: config as OpenClawConfig,
+      dispatcherOptions: {
+        ...prefixOptions,
+        onReplyStart: async () => {
+          await startTypingOnce();
+          if (statusReactions) await statusReactions.setThinking();
+        },
+        typingCallbacks,
+        deliver: async (payload: unknown, info?: { kind?: string }) => {
+          const normalized =
+            payload && typeof payload === "object" && !Array.isArray(payload)
+              ? (payload as VkDispatchPayload)
+              : {};
+          const resolvedButtons = resolveVkButtonsFromPayload(normalized);
+          await deliverVkReply({
+            payload: normalized,
+            peerId: message.peerId,
+            accountId: account.accountId,
+            statusSink,
+            clearKeyboard:
+              payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
+          });
+        },
+        onError: onDispatchError,
       },
-      onError: onDispatchError,
-    },
-    replyOptions: {
-      onModelSelected,
-    },
-  });
+      replyOptions: {
+        onModelSelected,
+        ...(statusReactions
+          ? {
+              // Without these, the core gates onToolStart/onCompactionStart
+              // behind tool-summary visibility (requiresToolSummaryVisibility),
+              // so the 👌/🙏 reactions never fire in DMs even though
+              // onReasoningStream (🤔) does. These flags enable the "quiet
+              // direct native progress" path: reaction callbacks run without
+              // emitting default tool-progress text messages.
+              suppressDefaultToolProgressMessages: true,
+              allowProgressCallbacksWhenSourceDeliverySuppressed: true,
+              onReasoningStream: async () => {
+                if (turnSettled) return;
+                await statusReactions!.setThinking();
+              },
+              onToolStart: async (payload: { name?: string }) => {
+                if (turnSettled) return;
+                await statusReactions!.setTool(payload?.name);
+              },
+              onCompactionStart: async () => {
+                if (turnSettled) return;
+                await statusReactions!.setCompacting();
+              },
+              onCompactionEnd: async () => {
+                if (turnSettled) return;
+                statusReactions!.cancelPending();
+                await statusReactions!.setThinking();
+              },
+            }
+          : {}),
+      },
+    });
+  } catch (err) {
+    dispatchError = true;
+    throw err;
+  } finally {
+    turnSettled = true;
+    if (statusReactions) {
+      try {
+        if (dispatchError) {
+          await statusReactions.setError();
+        } else {
+          await statusReactions.setDone();
+        }
+      } catch (err) {
+        runtime.log?.(`vk: status-reaction finalize failed: ${String(err)}`);
+      }
+      if (removeAckAfterReply) {
+        const holdMs = dispatchError
+          ? DEFAULT_TIMING.errorHoldMs
+          : DEFAULT_TIMING.doneHoldMs;
+        void (async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, holdMs));
+          try {
+            await statusReactions!.clear();
+          } catch (err) {
+            runtime.log?.(`vk: status-reaction clear failed: ${String(err)}`);
+          }
+        })();
+      }
+      // NB: we intentionally do NOT call statusReactions.restoreInitial()
+      // here. The Discord/bundled flow uses restoreInitial after setDone
+      // to peel away intermediate reactions on platforms that support a
+      // stack of reactions. VK lets the bot keep at most one reaction
+      // per message, so setDone/setError already *replaced* the previous
+      // emoji — calling restoreInitial would just overwrite the final
+      // state with the initial "queued" emoji again (👍 instead of 🎉).
+    }
+  }
 }

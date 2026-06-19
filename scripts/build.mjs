@@ -15,6 +15,7 @@ const entryPoints = [
   "src/media.ts",
   "src/monitor.ts",
   "src/probe.ts",
+  "src/reactions-controller.ts",
   "src/runtime.ts",
   "src/sanitize.ts",
   "src/send-support.ts",
