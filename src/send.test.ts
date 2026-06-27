@@ -1333,7 +1333,7 @@ describe("sendPayloadVk", () => {
     const fallbackCall = getSendCall(mockMessagesSend.mock.calls.length - 1);
     expect(fallbackCall.message).toContain("caption");
     expect(fallbackCall.message).toContain(
-      "Attachment generated, but VK token lacks media upload scopes (photos/docs).",
+      "Attachment could not be delivered; sent as text instead.",
     );
     expect(fallbackCall).not.toHaveProperty("attachment");
   });
@@ -1372,7 +1372,9 @@ describe("sendPayloadVk", () => {
       new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
       { code: 15 },
     );
-    mockUploadAudioMessage.mockRejectedValueOnce(scopeError);
+    // Error 15 is retried (transient under batching); reject every attempt so
+    // the retries are exhausted and the URL-text fallback is exercised.
+    mockUploadAudioMessage.mockRejectedValue(scopeError);
     mockMessagesSend.mockResolvedValueOnce(37);
 
     const result = await sendPayloadVk(
@@ -1392,20 +1394,26 @@ describe("sendPayloadVk", () => {
     );
   });
 
-  it("rethrows non-scope audio_message upload errors", async () => {
+  it("falls back to text when audio_message upload fails (voice is best-effort)", async () => {
     const audioError = new Error("audio upload exploded");
-    mockUploadAudioMessage.mockRejectedValueOnce(audioError);
+    mockUploadAudioMessage.mockRejectedValue(audioError);
+    mockMessagesSend.mockResolvedValueOnce(41);
 
-    await expect(
-      sendPayloadVk(
-        "123",
-        {
-          text: "voice caption",
-          mediaUrl: "https://example.com/voice.mp3",
-        },
-        { cfg },
-      ),
-    ).rejects.toThrow("audio upload exploded");
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "voice caption",
+        mediaUrl: "https://example.com/voice.mp3",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "41", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "voice caption\nhttps://example.com/voice.mp3",
+      }),
+    );
   });
 
   it("sends remaining text chunks after media as plain messages", async () => {

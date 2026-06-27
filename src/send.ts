@@ -34,7 +34,24 @@ const VK_TRANSIENT_RETRY_ATTEMPTS = 3;
 const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
-  "Attachment generated, but VK token lacks media upload scopes (photos/docs).";
+  "Attachment could not be delivered; sent as text instead.";
+
+// Opt-in diagnostics: when VK_VOICE_DEBUG_LOG points at a writable file path,
+// append voice/media send breadcrumbs there. No-op otherwise. Used to capture
+// the real cause of intermittent audio_message upload failures (e.g. a missing
+// peer_id surfaces from VK as a misleading "access denied / scopes" error 15).
+async function logVkVoiceDebug(line: string): Promise<void> {
+  const target = process.env.VK_VOICE_DEBUG_LOG;
+  if (!target) {
+    return;
+  }
+  try {
+    const { appendFileSync } = await import("node:fs");
+    appendFileSync(target, `[${new Date().toISOString()}] ${line}\n`);
+  } catch {
+    /* diagnostics only — never break a send */
+  }
+}
 const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
 export type SendVkOptions = {
@@ -183,14 +200,22 @@ function isRetryableVkError(error: unknown): boolean {
   );
 }
 
-async function withVkRetry<T>(operation: () => Promise<T>): Promise<T> {
+async function withVkRetry<T>(
+  operation: () => Promise<T>,
+  opts?: { extraRetryableCodes?: readonly number[]; maxAttempts?: number },
+): Promise<T> {
+  const maxAttempts = opts?.maxAttempts ?? VK_TRANSIENT_RETRY_ATTEMPTS;
   let attempt = 0;
   while (true) {
     try {
       return await operation();
     } catch (error) {
       attempt += 1;
-      if (attempt >= VK_TRANSIENT_RETRY_ATTEMPTS || !isRetryableVkError(error)) {
+      const code = readVkErrorCode(error);
+      const retryable =
+        isRetryableVkError(error) ||
+        (code !== undefined && (opts?.extraRetryableCodes?.includes(code) ?? false));
+      if (attempt >= maxAttempts || !retryable) {
         throw error;
       }
       await sleep(250 * attempt);
@@ -649,17 +674,39 @@ async function uploadVkAudioMessage(params: {
   filename: string;
   contentType?: string;
 }): Promise<string> {
-  const attachment = await withVkRetry(async () => {
-    return await params.vk.upload.audioMessage({
-      peer_id: params.peerId,
-      source: buildVkUploadSource({
-        source: params.source,
-        filename: params.filename,
-        contentType: params.contentType,
-      }),
-      title: params.filename,
-    });
-  });
+  // Guard against an invalid peer_id (would surface from VK as a misleading
+  // error 15 "access denied … with current scopes", even though the token's
+  // scopes are fine). Fail loud and accurate instead.
+  if (!Number.isFinite(params.peerId) || params.peerId <= 0) {
+    await logVkVoiceDebug(
+      `uploadVkAudioMessage ABORT invalid peerId=${JSON.stringify(params.peerId)} filename=${params.filename}`,
+    );
+    throw new Error(
+      `VK audio upload aborted: invalid peer_id (${JSON.stringify(params.peerId)}); peer_id is required for audio_message uploads`,
+    );
+  }
+  await logVkVoiceDebug(
+    `uploadVkAudioMessage peerId=${params.peerId} filename=${params.filename}`,
+  );
+  // Even with a valid peer_id, docs.getMessagesUploadServer(type=audio_message)
+  // intermittently returns error 15 when the call gets batched with concurrent
+  // requests on the shared (apiLimit) VK client. Verified ~20% failure under
+  // concurrency vs 0% sequentially. The call is otherwise idempotent, so treat
+  // 15 as transient here and retry — a re-issued (unbatched) call succeeds.
+  const attachment = await withVkRetry(
+    async () => {
+      return await params.vk.upload.audioMessage({
+        peer_id: params.peerId,
+        source: buildVkUploadSource({
+          source: params.source,
+          filename: params.filename,
+          contentType: params.contentType,
+        }),
+        title: params.filename,
+      });
+    },
+    { extraRetryableCodes: [15], maxAttempts: 5 },
+  );
   return String(attachment);
 }
 
@@ -1087,9 +1134,16 @@ async function sendResolvedMediaVk(params: {
         contentType: media.mimeType,
       });
     } catch (audioError) {
-      if (!isVkScopeDeniedError(audioError)) {
-        throw audioError;
-      }
+      // Voice is best-effort: log the *real* VK error (code/message) for
+      // diagnosis, then fall back to text rather than dropping the reply or
+      // mislabelling it as a scopes problem.
+      await logVkVoiceDebug(
+        `audio send FAILED to=${JSON.stringify(params.to)} code=${
+          (audioError as { code?: unknown })?.code
+        } scopeDenied=${isVkScopeDeniedError(audioError)} msg=${String(
+          (audioError as { message?: unknown })?.message ?? "",
+        ).slice(0, 200)}`,
+      );
       return await sendSourceUrlFallback();
     }
   }
