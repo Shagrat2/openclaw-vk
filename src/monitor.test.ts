@@ -24,10 +24,11 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
   },
 }));
 
-import { monitorVkProvider } from "./monitor.js";
+import { combineVkInboundMessages, monitorVkProvider } from "./monitor.js";
 import { setVkRuntime } from "./runtime.js";
 import {
   createVkRuntimeEnv,
+  makeMessage,
   makeVkRuntime,
 } from "./test-helpers.js";
 import type { CoreConfig } from "./types.js";
@@ -413,6 +414,17 @@ describe("message_new handler", () => {
     );
   });
 
+  it("routes each message through the inbound debouncer", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(makeCtx({ peerId: 777, text: "hi" }));
+
+    // The immediate-flush stub calls onFlush([msg]) → handleVkInbound once.
+    expect(mockHandleVkInbound).toHaveBeenCalledTimes(1);
+    expect(mockHandleVkInbound.mock.calls[0][0].message.text).toBe("hi");
+  });
+
   it("falls back to Date.now() when createdAt is missing", async () => {
     activeMonitor = startMonitor();
     await flush();
@@ -462,5 +474,37 @@ describe("message_new handler", () => {
     expect(message.attachments).toEqual([]);
     expect(message.replyToMessageId).toBeUndefined();
     expect(message.replyToText).toBeUndefined();
+  });
+});
+
+describe("combineVkInboundMessages", () => {
+  it("returns null for an empty batch", () => {
+    expect(combineVkInboundMessages([])).toBeNull();
+  });
+
+  it("returns the single message unchanged", () => {
+    const msg = makeMessage({ messageId: "m1", text: "solo" });
+    expect(combineVkInboundMessages([msg])).toBe(msg);
+  });
+
+  it("merges texts and keeps the last message's identity", () => {
+    const combined = combineVkInboundMessages([
+      makeMessage({ messageId: "m1", text: "first", timestamp: 1000 }),
+      makeMessage({ messageId: "m2", text: "second", timestamp: 2000 }),
+      makeMessage({ messageId: "m3", text: "third", timestamp: 3000 }),
+    ]);
+    expect(combined?.text).toBe("first\nsecond\nthird");
+    // Reply/react target = latest message.
+    expect(combined?.messageId).toBe("m3");
+    expect(combined?.timestamp).toBe(3000);
+  });
+
+  it("skips empty texts when merging", () => {
+    const combined = combineVkInboundMessages([
+      makeMessage({ messageId: "m1", text: "a" }),
+      makeMessage({ messageId: "m2", text: "" }),
+      makeMessage({ messageId: "m3", text: "b" }),
+    ]);
+    expect(combined?.text).toBe("a\nb");
   });
 });

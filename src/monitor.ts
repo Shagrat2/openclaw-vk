@@ -10,6 +10,42 @@ import { getVkRuntime } from "./runtime.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
+// ── Inbound coalescing (debounce) ────────────────────────────────────────────
+// Rapid same-conversation messages are buffered and flushed as ONE combined
+// inbound, the way every other channel (whatsapp/telegram/feishu/msteams/…) uses
+// the core inbound debouncer. VK was the odd one out that dispatched each message
+// immediately. Two wins:
+//   1. A burst of quick messages becomes a single coherent reply instead of N.
+//   2. The debouncer's per-key serialization means core never dispatches two
+//      replies for the same conversation concurrently — which is exactly the
+//      trigger for the core reply-dispatch concurrency bugs (deadlock / #98562
+//      "reply session initialization conflicted"). So this both improves UX and
+//      sidesteps those core bugs, without a strict per-peer promise chain.
+// Coalescing is opt-in: VK_INBOUND_DEBOUNCE_MS defaults to 0, which disables
+// batching but keeps per-peer serialization (via serializeImmediate) — the safe
+// sequential behavior with no added latency. Set it > 0 to enable coalescing.
+
+/**
+ * Merge a buffered burst of text messages into one inbound. Keeps the last
+ * message's ids/timestamp so replies/reactions target the latest message.
+ */
+export function combineVkInboundMessages(
+  items: VkInboundMessage[],
+): VkInboundMessage | null {
+  if (items.length === 0) {
+    return null;
+  }
+  const last = items[items.length - 1];
+  if (items.length === 1) {
+    return last;
+  }
+  const combinedText = items
+    .map((m) => m.text)
+    .filter((t) => t.length > 0)
+    .join("\n");
+  return { ...last, text: combinedText };
+}
+
 export type VkMonitorOptions = {
   token: string;
   accountId: string;
@@ -43,6 +79,14 @@ const TS_STALE_MS = envInt("VK_LP_TS_STALE_MS", 80_000);
 // much idle, and restart after this many consecutive probe failures.
 const IDLE_BEFORE_PROBE_MS = envInt("VK_LP_IDLE_PROBE_MS", 90_000);
 const PROBE_FAIL_LIMIT = envInt("VK_LP_PROBE_FAIL_LIMIT", 3);
+// Inbound debounce window (opt-in, default OFF). When > 0, same-conversation
+// messages arriving within this window are buffered and flushed as one combined
+// inbound (coalesced reply). 0 = no batching, just per-peer serialization — the
+// safe default: avoids the concurrent-dispatch deadlock without adding latency.
+// Set VK_INBOUND_DEBOUNCE_MS>0 to enable coalescing (best paired with a core that
+// has the reply-session reentrancy fix, so the flush after a turn can't hit
+// #98562). ~1000-2000ms is a reasonable window for catching a quick follow-up.
+const INBOUND_DEBOUNCE_MS = envInt("VK_INBOUND_DEBOUNCE_MS", 0);
 const RESTART_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
 /**
@@ -140,6 +184,54 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
   let restartAttempt = 0;
 
+  // One debouncer per monitor — buffers survive vk-io restarts (the `vk` client
+  // is recreated inside the loop; the debouncer is not). Its per-key
+  // serialization is what keeps core from dispatching two same-conversation
+  // replies concurrently.
+  const inboundDebouncer =
+    core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
+      debounceMs: INBOUND_DEBOUNCE_MS,
+      serializeImmediate: true,
+      buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
+      // Only merge plain-text messages; ones carrying attachments or a payload
+      // flush on their own (immediately) but are still serialized per peer.
+      shouldDebounce: (msg) =>
+        msg.text.length > 0 &&
+        (msg.attachments?.length ?? 0) === 0 &&
+        msg.messagePayload === undefined,
+      onFlush: async (items) => {
+        if (stopped) {
+          return;
+        }
+        const message = combineVkInboundMessages(items);
+        if (!message) {
+          return;
+        }
+        try {
+          const currentCfg = core.config.loadConfig() as CoreConfig;
+          const currentAccount = resolveVkAccount({
+            cfg: currentCfg,
+            accountId: account.accountId,
+          });
+          await handleVkInbound({
+            message,
+            account: currentAccount,
+            config: currentCfg,
+            runtime: opts.runtime,
+          });
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          opts.runtime.error?.(
+            `vk: message handler error for peerId=${message.peerId}: ${errorMessage}`,
+          );
+        }
+      },
+      onError: (err) => {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        opts.runtime.error?.(`vk: inbound debouncer error: ${errorMessage}`);
+      },
+    });
+
   try {
     while (!stopped) {
       const vk = new VK({ token: opts.token, apiLimit: 20 });
@@ -196,22 +288,16 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           at: message.timestamp,
         });
 
+        // Hand off to the debouncer: it buffers/merges a burst and serializes
+        // per peer, then calls handleVkInbound once via onFlush. onFlush owns
+        // error handling, so a bad turn never breaks ingestion.
         try {
-          const currentCfg = core.config.loadConfig() as CoreConfig;
-          const currentAccount = resolveVkAccount({
-            cfg: currentCfg,
-            accountId: account.accountId,
-          });
-
-          await handleVkInbound({
-            message,
-            account: currentAccount,
-            config: currentCfg,
-            runtime: opts.runtime,
-          });
+          await inboundDebouncer.enqueue(message);
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);
-          opts.runtime.error?.(`vk: message handler error for peerId=${peerId}: ${errorMessage}`);
+          opts.runtime.error?.(
+            `vk: inbound enqueue error for peerId=${peerId}: ${errorMessage}`,
+          );
         }
       });
 

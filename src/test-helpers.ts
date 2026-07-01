@@ -112,7 +112,19 @@ export function makeVkRuntime(opts: {
         removeAckReactionAfterReply: vi.fn(),
       },
       debounce: {
-        createInboundDebouncer: vi.fn(),
+        // Immediate-flush stub: each enqueued item flushes on its own via
+        // onFlush([item]). Enough to exercise the plugin's wiring
+        // (enqueue → onFlush → handleVkInbound) without timers. The real
+        // debouncer's batching/serialization is covered by core's own tests.
+        createInboundDebouncer: vi.fn(
+          (params: { onFlush: (items: unknown[]) => Promise<void> }) => ({
+            enqueue: vi.fn(async (item: unknown) => {
+              await params.onFlush([item]);
+            }),
+            flushKey: vi.fn(),
+            cancelKey: vi.fn(),
+          }),
+        ),
         resolveInboundDebounceMs: vi.fn(),
       },
       discord: {} as never,
