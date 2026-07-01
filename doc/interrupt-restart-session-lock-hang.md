@@ -88,14 +88,46 @@ restart-abort** on the claude-cli live backend.
   and the failure mode is a held session lock / `queued_behind_active_work`, not
   `reply session initialization conflicted`.
 
+## Instrumented findings (added after live diagnostics)
+
+We rebuilt core with targeted `console`/`log.warn` probes on the abort/lock-release
+path and reproduced the hang live. Result:
+
+- **The abort path is never invoked on restart.** `abortActiveRunExternally`,
+  `abortRun`, and `releaseEmbeddedAttemptSessionLockForAbort` /
+  `releaseHeldLockForAbort` (attempt.ts ~3400/3728/3426, attempt-abort.ts) all
+  logged **zero** hits. So the interrupted run is *not* being aborted — it runs
+  to the point of producing `cli_live:result`, then the run **completes-but-hangs
+  before the normal lock-release path** (attempt.ts ~4920 `waitForSessionEvents`
+  / `releaseForPrompt` → `attempt.session-lock.ts:releaseHeldLockWithFence`),
+  which also logged zero hits. The hang is in the narrow post-turn region between
+  the prompt resolving and `releaseForPrompt`, on the claude-cli live backend,
+  while a follow-up is queued (`queueDepth=2`).
+- The `reason=restart` live-session close is the run-end cleanup
+  (`cleanupCliLiveSessionOnRunEnd` → `closeClaudeLiveSessionForContext`,
+  cli-runner.ts:481) — **not** a reply-op abort. So "restart" here is a close
+  reason, not evidence the run was aborted.
+
+Net: the run holds the session write-lock, finishes its turn, and stalls before
+releasing it when a follow-up is queued — without ever entering the abort path.
+
 ## Note for whoever writes a regression test
 
 The existing embedded-runner test harnesses (`run.overflow-compaction.harness.ts`)
-`vi.doMock("./run/attempt.js")` and stub `runAttempt`, so the real
-`attempt.session-lock` / claude-live turn machinery — where this bug lives — is
-not exercised. A faithful repro needs a higher-fidelity integration harness that
-runs the real `attempt.js` with only the LLM mocked, plus deterministic control
-to fire the restart-abort exactly in the post-turn-resolve window.
+`vi.doMock("./run/attempt.js")` and stub `runAttempt`, **plus ~25 other
+`vi.doMock`s** (model runtime, `cli-backends`, `workspace-run`, context-engine,
+MCP, auth, usage, …). So the real `attempt.session-lock` / claude-live turn
+machinery — where this bug lives — is not exercised by any existing harness.
+
+A faithful repro therefore needs a new higher-fidelity integration harness that
+runs the **real** `attempt.js` + session lock with only the CLI backend mocked at
+the supervisor seam (`cli-runner.test-support.ts` `supervisorSpawnMock` /
+`createManagedRun` gives the streaming-JSONL pattern), a real temp session
+file/workspace, `runEmbeddedAgent` driven with a second message queued via
+`queueEmbeddedAgentMessageWithOutcome` mid-turn, and deterministic control of when
+the mocked turn resolves relative to the queued follow-up. That is substantial
+new test infrastructure for a subsystem currently covered only via high-level
+mocks — best built by maintainers who own it.
 
 ## Impact
 
