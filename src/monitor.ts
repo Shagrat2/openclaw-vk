@@ -10,6 +10,36 @@ import { getVkRuntime } from "./runtime.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
+// ⚠️ TEMPORARY WORKAROUND for openclaw core bugs — remove once fixed upstream.
+// ── Per-peer inbound serialization ──────────────────────────────────────────
+// The VK Long Poll keeps fetching updates while a message handler runs, so a 2nd
+// message for the same conversation reaches core mid-reply. Core then queues it
+// (queueDepth>=2), which trips a core reply-dispatch deadlock: the in-flight
+// reply's `waitForReplyDispatcherIdle` never resolves while a message is queued,
+// so the reply hangs and the session lane stays stuck until the 15-min
+// stuck-session abort fires. We can't fix the core dispatcher from a plugin, so
+// we sidestep the trigger: chain handlers per peer so core only ever sees one
+// inbound at a time per conversation. Messages are still processed in order,
+// just not concurrently. Set VK_SERIALIZE_INBOUND=0 to opt out.
+//
+// TEMPORARY / upstream tracking: this sidesteps the core reply-dispatch DEADLOCK
+// (a queued 2nd message makes the in-flight reply hang for 15 min). Once that is
+// fixed in openclaw core, delete this whole block and revert to a plain
+// `await handleVkInbound(...)` in the message_new handler.
+//
+// NOTE: serialization does NOT fix core bug #98562 ("reply session
+// initialization conflicted") — after a message completes, the same session
+// stays poisoned for several seconds, so a rapid 2nd message still fails fast
+// (verified: neither a settle delay nor handler retries recover it — it must be
+// fixed in core). Serialization is still a clear win: without it BOTH messages
+// break (msg1 hangs 15 min, whole lane frozen); with it msg1 always completes
+// and only the rapid 2nd message fails, fast and recoverably.
+const inboundChainByPeer = new Map<string, Promise<unknown>>();
+
+function serializeInboundEnabled(): boolean {
+  return process.env.VK_SERIALIZE_INBOUND !== "0";
+}
+
 export type VkMonitorOptions = {
   token: string;
   accountId: string;
@@ -196,23 +226,51 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           at: message.timestamp,
         });
 
-        try {
-          const currentCfg = core.config.loadConfig() as CoreConfig;
-          const currentAccount = resolveVkAccount({
-            cfg: currentCfg,
-            accountId: account.accountId,
-          });
+        const runOne = async () => {
+          if (stopped || needRestart) {
+            return;
+          }
+          try {
+            const currentCfg = core.config.loadConfig() as CoreConfig;
+            const currentAccount = resolveVkAccount({
+              cfg: currentCfg,
+              accountId: account.accountId,
+            });
 
-          await handleVkInbound({
-            message,
-            account: currentAccount,
-            config: currentCfg,
-            runtime: opts.runtime,
-          });
-        } catch (err) {
-          const errorMessage = err instanceof Error ? err.message : String(err);
-          opts.runtime.error?.(`vk: message handler error for peerId=${peerId}: ${errorMessage}`);
+            await handleVkInbound({
+              message,
+              account: currentAccount,
+              config: currentCfg,
+              runtime: opts.runtime,
+            });
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            opts.runtime.error?.(`vk: message handler error for peerId=${peerId}: ${errorMessage}`);
+          }
+        };
+
+        if (!serializeInboundEnabled()) {
+          await runOne();
+          return;
         }
+
+        // Chain this message behind any in-flight/queued handler for the same
+        // peer so core never sees a 2nd inbound while the 1st reply dispatches.
+        // runOne swallows its own errors, so the chain never rejects/breaks.
+        const chainKey = `${account.accountId}:${peerId}`;
+        const previous = inboundChainByPeer.get(chainKey) ?? Promise.resolve();
+        const task = previous.then(runOne, runOne);
+        inboundChainByPeer.set(chainKey, task);
+        void task.finally(() => {
+          if (inboundChainByPeer.get(chainKey) === task) {
+            inboundChainByPeer.delete(chainKey);
+          }
+        });
+        // Await so this handler's promise reflects completion. vk-io keeps
+        // polling during the await (it does not serialize handlers at the
+        // transport level — that's exactly why the per-peer chain is needed),
+        // so awaiting here does not stall the poller.
+        await task;
       });
 
       let groupId: number | undefined;

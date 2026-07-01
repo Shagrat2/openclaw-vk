@@ -413,6 +413,62 @@ describe("message_new handler", () => {
     );
   });
 
+  it("serializes concurrent inbound for the same peer (2nd waits for 1st)", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+    const handler = getMessageHandler();
+
+    let release1!: () => void;
+    const gate1 = new Promise<void>((resolve) => {
+      release1 = resolve;
+    });
+    mockHandleVkInbound
+      .mockImplementationOnce(async () => {
+        await gate1;
+      })
+      .mockResolvedValueOnce(undefined);
+
+    // Two messages for the same peer arrive while the 1st is still processing.
+    const p1 = handler(makeCtx({ id: 1, peerId: 777 }));
+    const p2 = handler(makeCtx({ id: 2, peerId: 777 }));
+    await flush();
+
+    // The 2nd must NOT start until the 1st finishes, so core never sees a queued
+    // 2nd inbound mid-reply (the deadlock trigger).
+    expect(mockHandleVkInbound).toHaveBeenCalledTimes(1);
+
+    release1();
+    await Promise.all([p1, p2]);
+    expect(mockHandleVkInbound).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not serialize across different peers", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+    const handler = getMessageHandler();
+
+    let release1!: () => void;
+    const gate1 = new Promise<void>((resolve) => {
+      release1 = resolve;
+    });
+    mockHandleVkInbound
+      .mockImplementationOnce(async () => {
+        await gate1;
+      })
+      .mockResolvedValueOnce(undefined);
+
+    const p1 = handler(makeCtx({ id: 1, peerId: 111 }));
+    const p2 = handler(makeCtx({ id: 2, peerId: 222 }));
+    await flush();
+
+    // Independent conversations run concurrently — a slow peer must not block
+    // a different peer.
+    expect(mockHandleVkInbound).toHaveBeenCalledTimes(2);
+
+    release1();
+    await Promise.all([p1, p2]);
+  });
+
   it("falls back to Date.now() when createdAt is missing", async () => {
     activeMonitor = startMonitor();
     await flush();
