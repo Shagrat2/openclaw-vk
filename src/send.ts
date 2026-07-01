@@ -511,6 +511,7 @@ export async function sendMessageVk(
   text: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
+  await logVkVoiceDebug(`ENTRY sendMessageVk to=${JSON.stringify(to)} textLen=${(text ?? "").length}`);
   const parsed = resolveVkMarkdownAttachmentPayload(text);
   const results = await sendPayloadResultsVk({
     to,
@@ -883,6 +884,7 @@ export async function sendFormattedMediaVk(
   mediaUrl: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
+  await logVkVoiceDebug(`ENTRY sendFormattedMediaVk to=${JSON.stringify(to)} mediaUrl=${JSON.stringify(mediaUrl)} textLen=${(text ?? "").length}`);
   const result = await sendPayloadVk(
     to,
     {
@@ -1230,6 +1232,9 @@ export async function sendPayloadVk(
   opts: SendVkOptions = {},
 ): Promise<SendVkResult | null> {
   const { text, mediaRefs, buttons, replyTo, clearKeyboard } = resolveVkPayloadParts(payload, opts);
+  await logVkVoiceDebug(
+    `ENTRY sendPayloadVk to=${JSON.stringify(to)} mediaRefs=${JSON.stringify((mediaRefs ?? []).map((r) => r?.url))} textLen=${(text ?? "").length}`,
+  );
 
   return getLastSendResult(
     await sendPayloadResultsVk({
