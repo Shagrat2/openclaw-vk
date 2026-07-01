@@ -30,7 +30,11 @@ VK-канала, но сбой — в **reply-dispatch / инициализац�
 ## Окружение
 
 - openclaw **2026.6.11** (установка через pnpm), локальный gateway-демон (macOS).
-- Канал: VK (`deliveryMode: "direct"` — тот же путь, что у discord/slack/matrix).
+- Канал: VK, `deliveryMode: "direct"` (тот же путь, что у discord/slack/matrix).
+  Плагин: [pfrankov/openclaw-vk](https://github.com/pfrankov/openclaw-vk)
+  (upstream). Repro и обход — в нашем форке
+  [Shagrat2/openclaw-vk](https://github.com/Shagrat2/openclaw-vk), ветка
+  `temp/vk-concurrency-workarounds`.
 - Бэкенд: `claude-cli` (локально), один агент `main`, ключ сессии
   `agent:main:vk:direct:<peer>`.
 - Воспроизводится на обычных текстовых сообщениях; media/TTS не нужны.
@@ -138,4 +142,5 @@ if (!committed.ok) {
 
 Мы сериализуем inbound по peer в VK-плагине (чинит случай 1). Мы намеренно **не**
 пытаемся замазать случай 2 — ему нужен фикс в ядре. См. `src/monitor.ts`
-(`inboundChainByPeer`, `VK_SERIALIZE_INBOUND`).
+(`inboundChainByPeer`, `VK_SERIALIZE_INBOUND`) в нашем форке:
+[Shagrat2/openclaw-vk @ `temp/vk-concurrency-workarounds`](https://github.com/Shagrat2/openclaw-vk/tree/temp/vk-concurrency-workarounds).

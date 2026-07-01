@@ -27,7 +27,11 @@ first reply and the entire lane.
 ## Environment
 
 - openclaw **2026.6.11** (pnpm install), local gateway daemon (macOS).
-- Channel: VK (`deliveryMode: "direct"` — same path as discord/slack/matrix).
+- Channel: VK, `deliveryMode: "direct"` (same path as discord/slack/matrix).
+  Plugin: [pfrankov/openclaw-vk](https://github.com/pfrankov/openclaw-vk)
+  (upstream). Repro + workaround live in our fork
+  [Shagrat2/openclaw-vk](https://github.com/Shagrat2/openclaw-vk), branch
+  `temp/vk-concurrency-workarounds`.
 - Backend: `claude-cli` (local), single agent `main`, session key
   `agent:main:vk:direct:<peer>`.
 - Reproduces with plain text messages; media/TTS not required.
@@ -133,5 +137,6 @@ previous message completed.
 ## Our mitigation (channel-side, temporary)
 
 We serialize inbound per peer in the VK plugin (fixes case 1). We deliberately do
-**not** try to paper over case 2 — it needs a core fix. See
-`src/monitor.ts` (`inboundChainByPeer`, `VK_SERIALIZE_INBOUND`).
+**not** try to paper over case 2 — it needs a core fix. See `src/monitor.ts`
+(`inboundChainByPeer`, `VK_SERIALIZE_INBOUND`) in our fork:
+[Shagrat2/openclaw-vk @ `temp/vk-concurrency-workarounds`](https://github.com/Shagrat2/openclaw-vk/tree/temp/vk-concurrency-workarounds).
