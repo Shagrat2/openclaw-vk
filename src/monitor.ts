@@ -191,7 +191,15 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   const inboundDebouncer =
     core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
       debounceMs: INBOUND_DEBOUNCE_MS,
-      serializeImmediate: true,
+      // Per-peer inbound serialization — the workaround for the core
+      // transcript-mirror completion deadlock (the queueDepth>=2 session-lock
+      // hang: stalled_agent_run, phase=running, recovery=none). Not admitting a
+      // second message until the prior reply operation completes keeps core out
+      // of the queueDepth>=2 window where the deadlock lives. Default on (safe on
+      // any core build); set VK_SERIALIZE_INBOUND=false to allow true concurrency
+      // once running a core build with the fire-and-forget mirror fix.
+      // See doc/interrupt-restart-session-lock-hang.md.
+      serializeImmediate: process.env.VK_SERIALIZE_INBOUND !== "false",
       buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
       // Only merge plain-text messages; ones carrying attachments or a payload
       // flush on their own (immediately) but are still serialized per peer.
