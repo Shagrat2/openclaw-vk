@@ -29,7 +29,7 @@ import {
   resolveVkInboundMediaUrls,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
-import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
+import { clearVkInstances, markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
 import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
@@ -81,12 +81,22 @@ async function deliverVkReply(params: {
   accountId: string;
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
   clearKeyboard?: boolean;
+  log?: (msg: string) => void;
 }) {
   const result = await sendPayloadVk(String(params.peerId), params.payload, {
     accountId: params.accountId,
     clearKeyboard: params.clearKeyboard,
   });
   if (!result) {
+    // Silent send failure: sendPayloadVk produced no result for a reply we meant
+    // to deliver. The cached VK client for this account can wedge (a stale/broken
+    // long-poll connection) and then EVERY send drops silently until the gateway
+    // is restarted by hand. Clear the client cache so the next send recreates a
+    // fresh client — auto-recovery instead of a manual restart.
+    params.log?.(
+      `vk: reply delivery produced no result for peer=${params.peerId}; clearing VK client cache to recover`,
+    );
+    clearVkInstances();
     return;
   }
   params.statusSink?.({ lastOutboundAt: Date.now() });
@@ -212,6 +222,7 @@ export async function handleVkInbound(params: {
                 peerId: message.senderId,
                 accountId: account.accountId,
                 statusSink,
+                log: runtime.log,
               });
             },
             onReplyError: (err) => {
@@ -476,6 +487,7 @@ export async function handleVkInbound(params: {
             peerId: message.peerId,
             accountId: account.accountId,
             statusSink,
+            log: runtime.log,
             clearKeyboard:
               payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
           });
