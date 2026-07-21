@@ -51,7 +51,7 @@
 - ❓ **Точный import-путь SDK streaming-схемы** (`openclaw/plugin-sdk/channel-config-schema`
   vs `.../bundled-channel-config-schema`) и форма (`StreamingConfigSchema`).
 
-### Ш1 · VK-примитив edit/delete в `src/send.ts` ⬜
+### Ш1 · VK-примитив edit/delete в `src/send.ts` ✅ (send.test 133/133)
 - Добавить `editMessageVk(peerId, conversationMessageId, text, account, opts?)` над
   `vk.api.messages.edit({ peer_id, conversation_message_id, message, keep_forward_messages:1 })`.
 - Добавить `deleteMessageVk` (или reuse) для `deleteCurrent`.
@@ -59,7 +59,7 @@
 - Учесть лимиты VK: окно редактирования (сообщение свежее), нельзя чужие, правила вложений.
 - Тест в `src/send.test.ts`.
 
-### Ш2 · `src/progress-draft.ts` — адаптер над core-компоновщиком ⬜
+### Ш2 · `src/progress-draft.ts` — адаптер над core-компоновщиком ✅ (progress-draft.test 6/6)
 - Скопировать структуру `reactions-controller.ts` (тонкая фабрика).
 - `import { createChannelProgressDraftCompositor } from "openclaw/plugin-sdk/channel-message"`.
 - adapter: `update(text)` → `editMessageVk` (ленивое создание черновика первым `sendMessageVk`,
@@ -69,7 +69,11 @@
 - Экспорт `createVkProgressDraftCompositor(params)`.
 - Тест `src/progress-draft.test.ts` (гейт задержки, троттл/дедуп, формат, finalize replace/keep).
 
-### Ш3 · Конфиг-схема streaming в `src/config-schema.ts` ⬜
+### Ш3 · Конфиг-схема streaming в `src/config-schema.ts` ✅ (config-schema.test 28/28)
+
+> SDK не экспортит полную `StreamingConfigSchema` (только `StreamingCoalesceSchema`),
+> `buildChannelConfigSchema` streaming не инжектит → добавлена локальная минимальная
+> `VkStreamingSchema` (`mode` + `preview.toolProgress`, `.passthrough()` для forward-compat).
 - Импортировать готовую `StreamingConfigSchema` из SDK (см. Ш0 ❓), добавить
   `streaming: StreamingConfigSchema.optional()` в `VkAccountSchemaBase` (стр.43-56).
 - Дефолт — текущее поведение (нет `streaming` ⇒ реакции/off). Ничего не ломается.
@@ -91,15 +95,20 @@
   `"replace"` → `editMessageVk` черновика в финальный текст; `"keep"` → оставить ленту
   (edit в progress-summary), финал — новым `sendMessageVk`.
 
-### Ш6 · Capabilities в `src/channel.ts` + `src/channel.setup.ts` ⬜
-- Добавить `edit: true`. Разрулить `blockStreaming` по итогу Ш0 ❓.
-- Тест `src/channel.test.ts` (уже проверяет capabilities — дополнить).
+### Ш6 · Capabilities в `src/channel.ts` + `src/channel.setup.ts` ❓ ОТЛОЖЕНО
+- Разведка показала: `capabilities.edit` **используется в ядре ~23 раза** (влияет на
+  роутинг доставки, не только статус). А наш progress-draft **драйвится вручную**
+  (прямые `messages.edit`), capability-флаг в нашем пути НЕ участвует — ядро само draft
+  для legacy-dispatch не создаёт. Значит `edit:true` **для фичи не требуется**, а объявить
+  вслепую = риск переключить обычную доставку на edit-путь (VK-send его не поддерживает).
+- **Решение:** не объявлять сейчас. Если позже захотим точного advertising — сперва
+  проследить все 23 usage и убедиться в безопасности (или мигрировать на message-adapter).
+- `blockStreaming:true` оставлен — мы задаём `mode:"progress"` вручную, он не форсит block.
 
-### Ш7 · Сборка и манифест (грабли — было 2 раза) ⬜
-- `package.json` → `files[]`: добавить `"src/progress-draft.ts"`.
-- `scripts/build.mjs` → `entryPoints[]`: добавить `"src/progress-draft.ts"`.
-- `npm run build` → убедиться, что `dist/progress-draft.js` появился (иначе рантайм
-  упадёт `Cannot find module`).
+### Ш7 · Сборка и манифест (грабли — было 2 раза) ✅
+- `package.json` → `files[]`: добавлен `"src/progress-draft.ts"`.
+- `scripts/build.mjs` → `entryPoints[]`: добавлен `"src/progress-draft.ts"`.
+- `npm run build` → `dist/src/progress-draft.js` собран (SDK externalized). ✓
 
 ### Ш8 · Тесты ⬜
 - `npm test` (vitest) зелёный; покрыть бизнес-правила новых модулей.

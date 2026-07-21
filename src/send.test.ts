@@ -26,6 +26,8 @@ import {
   sendPhotoVk,
   sendReactionVk,
   deleteReactionVk,
+  editMessageVk,
+  deleteMessageVk,
   sendTypingVk,
 } from "./send.js";
 import { makeAccount } from "./test-helpers.js";
@@ -60,6 +62,8 @@ const mockMessagesMarkAsRead = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSetActivity = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSendReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockDeleteReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
+const mockMessagesEdit = vi.hoisted(() => vi.fn().mockResolvedValue(1));
+const mockMessagesDelete = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockUploadPhoto = vi.hoisted(() => vi.fn().mockResolvedValue("photo123_456"));
 const mockUploadDocument = vi.hoisted(() => vi.fn().mockResolvedValue("doc123_789"));
 const mockUploadAudioMessage = vi.hoisted(() => vi.fn().mockResolvedValue("audio_message123_789"));
@@ -83,6 +87,8 @@ vi.mock("vk-io", () => ({
           setActivity: mockSetActivity,
           sendReaction: mockSendReaction,
           deleteReaction: mockDeleteReaction,
+          edit: mockMessagesEdit,
+          delete: mockMessagesDelete,
         },
       },
       upload: {
@@ -150,6 +156,8 @@ beforeEach(() => {
   mockSetActivity.mockReset().mockResolvedValue(1);
   mockSendReaction.mockReset().mockResolvedValue(1);
   mockDeleteReaction.mockReset().mockResolvedValue(1);
+  mockMessagesEdit.mockReset().mockResolvedValue(1);
+  mockMessagesDelete.mockReset().mockResolvedValue(1);
   mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
   mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
   mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
@@ -885,6 +893,74 @@ describe("deleteReactionVk", () => {
       peer_id: 123,
       cmid: 42,
     });
+  });
+});
+
+describe("editMessageVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesEdit.mockReset().mockResolvedValue(1);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("edits the message in place by message_id", async () => {
+    const ok = await editMessageVk("123", 42, "🛠️ Bash", makeAccount());
+
+    expect(ok).toBe(true);
+    expect(mockMessagesEdit).toHaveBeenCalledWith({
+      peer_id: 123,
+      message_id: 42,
+      message: "🛠️ Bash",
+      keep_forward_messages: 1,
+      keep_snippets: 1,
+    });
+  });
+
+  it("normalizes vk-prefixed peer IDs", async () => {
+    await editMessageVk("vk:chat:9", 7, "🔎 Web Search", makeAccount());
+
+    expect(mockMessagesEdit).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 9, message_id: 7 }),
+    );
+  });
+
+  it("returns false without calling VK when token is empty", async () => {
+    const ok = await editMessageVk("123", 42, "x", makeAccount({ token: "" }));
+
+    expect(ok).toBe(false);
+    expect(mockMessagesEdit).not.toHaveBeenCalled();
+  });
+
+  it("returns false when peer or message_id is invalid", async () => {
+    expect(await editMessageVk("abc", 42, "x", makeAccount())).toBe(false);
+    expect(await editMessageVk("123", 0, "x", makeAccount())).toBe(false);
+    expect(await editMessageVk("123", Number.NaN, "x", makeAccount())).toBe(false);
+    expect(mockMessagesEdit).not.toHaveBeenCalled();
+  });
+});
+
+describe("deleteMessageVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesDelete.mockReset().mockResolvedValue(1);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("deletes the message for everyone by id", async () => {
+    await deleteMessageVk("123", 42, makeAccount());
+
+    expect(mockMessagesDelete).toHaveBeenCalledWith({
+      peer_id: 123,
+      message_ids: [42],
+      delete_for_all: 1,
+    });
+  });
+
+  it("no-ops on empty token or invalid id", async () => {
+    await deleteMessageVk("123", 42, makeAccount({ token: "" }));
+    await deleteMessageVk("123", 0, makeAccount());
+
+    expect(mockMessagesDelete).not.toHaveBeenCalled();
   });
 });
 

@@ -163,6 +163,43 @@ describe("VkAccountSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  it("accepts streaming.mode=progress (step-progress opt-in)", () => {
+    const result = VkAccountSchema.safeParse({ streaming: { mode: "progress" } });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts every valid streaming mode", () => {
+    for (const mode of ["off", "partial", "block", "progress"]) {
+      expect(VkAccountSchema.safeParse({ streaming: { mode } }).success).toBe(true);
+    }
+  });
+
+  it("rejects an invalid streaming mode", () => {
+    const result = VkAccountSchema.safeParse({ streaming: { mode: "turbo" } });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts streaming.preview.toolProgress boolean", () => {
+    const result = VkAccountSchema.safeParse({
+      streaming: { mode: "progress", preview: { toolProgress: true } },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a non-boolean toolProgress", () => {
+    const result = VkAccountSchema.safeParse({
+      streaming: { preview: { toolProgress: "yes" } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("passes through unknown streaming keys so the core can validate the rest", () => {
+    const result = VkAccountSchema.safeParse({
+      streaming: { mode: "progress", block: { enabled: true }, label: "…" },
+    });
+    expect(result.success).toBe(true);
+  });
 });
 
 // ── VkConfigSchema ───────────────────────────────────────────────────────────

@@ -40,6 +40,26 @@ const VkGroupConfigSchema = z
   .strict()
   .optional();
 
+// Live progress streaming (`channels.vk.streaming`). The core owns the semantics
+// and full validation (resolveChannelPreviewStreamMode et al.); the full schema is
+// not exported from the plugin SDK, so we declare only the fields VK's step-progress
+// feature documents and `.passthrough()` the rest so additional core streaming keys
+// (block/chunk/coalesce/label/…) are accepted rather than rejected by `.strict()`.
+const VkStreamingSchema = z
+  .object({
+    // "progress" enables the edit-in-place step draft; others match core modes.
+    mode: z.enum(["off", "partial", "block", "progress"]).optional(),
+    preview: z
+      .object({
+        // true = keep one message and rewrite it; false = post steps as history.
+        toolProgress: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+  .optional();
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
@@ -52,6 +72,7 @@ const VkAccountSchemaBase = z
     groupPolicy: GroupPolicySchema.optional(),
     groupAllowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     groups: z.record(z.string(), VkGroupConfigSchema).optional(),
+    streaming: VkStreamingSchema,
   })
   .strict();
 
