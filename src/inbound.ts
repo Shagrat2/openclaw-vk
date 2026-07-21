@@ -31,8 +31,14 @@ import {
 import { getVkRuntime } from "./runtime.js";
 import { clearVkInstances, markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
+import { createVkProgressDraftCompositor } from "./progress-draft.js";
+import type { VkProgressDraftHandle } from "./progress-draft.js";
 import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
 import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
+import {
+  resolveChannelPreviewStreamMode,
+  type StreamingCompatEntry,
+} from "openclaw/plugin-sdk/channel-message";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -439,8 +445,24 @@ export async function handleVkInbound(params: {
     });
   const removeAckAfterReply =
     (cfgRecord.messages?.removeAckAfterReply as boolean | undefined) ?? false;
+
+  // ── Step-progress draft (opt-in via channels.vk.streaming.mode:"progress") ──
+  // Alternative to status reactions: show the live list of execution steps
+  // (🛠️ tool calls, 🔎 web search …) in ONE message edited in place, mirroring
+  // Telegram's "progress" stream. Reactions and the draft are mutually exclusive
+  // progress channels — the draft wins when both are configured.
+  const vkStreamingEntry = cfgRecord.channels?.vk as StreamingCompatEntry | undefined;
+  const progressStreamMode = resolveChannelPreviewStreamMode(vkStreamingEntry, "off");
+  const progressDraftEnabled =
+    progressStreamMode === "progress" &&
+    typeof message.conversationMessageId === "number";
+
   let statusReactions: StatusReactionController | null = null;
-  if (statusReactionsEnabled && typeof message.conversationMessageId === "number") {
+  if (
+    statusReactionsEnabled &&
+    !progressDraftEnabled &&
+    typeof message.conversationMessageId === "number"
+  ) {
     statusReactions = createVkStatusReactionController({
       peerId: message.peerId,
       cmid: message.conversationMessageId,
@@ -452,6 +474,24 @@ export async function handleVkInbound(params: {
       },
     });
     void statusReactions.setQueued();
+  }
+
+  let progressDraft: VkProgressDraftHandle | null = null;
+  if (progressDraftEnabled) {
+    progressDraft = createVkProgressDraftCompositor({
+      to: String(message.peerId),
+      account,
+      accountId: account.accountId,
+      cfg: config as CoreConfig,
+      entry: vkStreamingEntry,
+      mode: progressStreamMode,
+      seed: String(message.conversationMessageId),
+      onError: (err) => {
+        runtime.log?.(
+          `vk: progress-draft error for cmid=${message.conversationMessageId}: ${String(err)}`,
+        );
+      },
+    });
   }
 
   await startTypingOnce();
@@ -474,6 +514,7 @@ export async function handleVkInbound(params: {
         onReplyStart: async () => {
           await startTypingOnce();
           if (statusReactions) await statusReactions.setThinking();
+          if (progressDraft) await progressDraft.compositor.noteActivity();
         },
         typingCallbacks,
         deliver: async (payload: unknown, info?: { kind?: string }) => {
@@ -482,6 +523,13 @@ export async function handleVkInbound(params: {
               ? (payload as VkDispatchPayload)
               : {};
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
+          const isFinal = info?.kind === "final";
+          // Stop the step draft before the final answer lands so it can't race
+          // the answer message. The answer is delivered on its own (preserving
+          // full markdown/media/buttons); we then drop the transient step list.
+          if (progressDraft && isFinal) {
+            progressDraft.compositor.markFinalReplyStarted();
+          }
           await deliverVkReply({
             payload: normalized,
             peerId: message.peerId,
@@ -491,40 +539,67 @@ export async function handleVkInbound(params: {
             clearKeyboard:
               payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
           });
+          if (progressDraft && isFinal) {
+            progressDraft.compositor.markFinalReplyDelivered();
+            progressDraft.close();
+            await progressDraft.remove();
+          }
         },
         onError: onDispatchError,
       },
       replyOptions: {
         onModelSelected,
-        ...(statusReactions
+        ...(progressDraft
           ? {
-              // Without these, the core gates onToolStart/onCompactionStart
-              // behind tool-summary visibility (requiresToolSummaryVisibility),
-              // so the 👌/🙏 reactions never fire in DMs even though
-              // onReasoningStream (🤔) does. These flags enable the "quiet
-              // direct native progress" path: reaction callbacks run without
-              // emitting default tool-progress text messages.
+              // Same "quiet direct native progress" flags the reactions path uses
+              // (see below): without them the core gates onToolStart behind
+              // tool-summary visibility, so no steps would fire in DMs.
               suppressDefaultToolProgressMessages: true,
               allowProgressCallbacksWhenSourceDeliverySuppressed: true,
               onReasoningStream: async () => {
                 if (turnSettled) return;
-                await statusReactions!.setThinking();
+                await progressDraft!.compositor.pushReasoningProgress();
               },
               onToolStart: async (payload: { name?: string }) => {
                 if (turnSettled) return;
-                await statusReactions!.setTool(payload?.name);
+                await progressDraft!.compositor.pushToolProgress(undefined, {
+                  toolName: payload?.name,
+                });
               },
               onCompactionStart: async () => {
                 if (turnSettled) return;
-                await statusReactions!.setCompacting();
-              },
-              onCompactionEnd: async () => {
-                if (turnSettled) return;
-                statusReactions!.cancelPending();
-                await statusReactions!.setThinking();
+                await progressDraft!.compositor.noteActivity();
               },
             }
-          : {}),
+          : statusReactions
+            ? {
+                // Without these, the core gates onToolStart/onCompactionStart
+                // behind tool-summary visibility (requiresToolSummaryVisibility),
+                // so the 👌/🙏 reactions never fire in DMs even though
+                // onReasoningStream (🤔) does. These flags enable the "quiet
+                // direct native progress" path: reaction callbacks run without
+                // emitting default tool-progress text messages.
+                suppressDefaultToolProgressMessages: true,
+                allowProgressCallbacksWhenSourceDeliverySuppressed: true,
+                onReasoningStream: async () => {
+                  if (turnSettled) return;
+                  await statusReactions!.setThinking();
+                },
+                onToolStart: async (payload: { name?: string }) => {
+                  if (turnSettled) return;
+                  await statusReactions!.setTool(payload?.name);
+                },
+                onCompactionStart: async () => {
+                  if (turnSettled) return;
+                  await statusReactions!.setCompacting();
+                },
+                onCompactionEnd: async () => {
+                  if (turnSettled) return;
+                  statusReactions!.cancelPending();
+                  await statusReactions!.setThinking();
+                },
+              }
+            : {}),
       },
     });
   } catch (err) {
@@ -532,6 +607,18 @@ export async function handleVkInbound(params: {
     throw err;
   } finally {
     turnSettled = true;
+    if (progressDraft) {
+      try {
+        progressDraft.compositor.cancel();
+        progressDraft.close();
+        // On a failed turn no final deliver ran, so drop the dangling step draft.
+        if (dispatchError) {
+          await progressDraft.remove();
+        }
+      } catch (err) {
+        runtime.log?.(`vk: progress-draft finalize failed: ${String(err)}`);
+      }
+    }
     if (statusReactions) {
       try {
         if (dispatchError) {

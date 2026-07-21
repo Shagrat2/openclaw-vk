@@ -51,6 +51,11 @@ export type VkProgressDraftHandle = {
   overwrite(text: string): Promise<void>;
   /** Remove the draft message entirely (best-effort). */
   remove(): Promise<void>;
+  /**
+   * Seal the draft: after this, `overwrite` is a no-op so a late compositor
+   * render can never spawn a fresh message once the turn has finalized.
+   */
+  close(): void;
 };
 
 export function createVkProgressDraftCompositor(
@@ -58,8 +63,14 @@ export function createVkProgressDraftCompositor(
 ): VkProgressDraftHandle {
   // The single "live" message we keep editing. Lazily created on first update.
   let messageId: number | undefined;
+  // Once the turn has finalized we stop touching VK, so a straggler compositor
+  // render can't create a brand-new message after the answer is delivered.
+  let closed = false;
 
   const overwrite = async (text: string): Promise<void> => {
+    if (closed) {
+      return;
+    }
     try {
       if (messageId === undefined) {
         const result = await sendMessageVk(params.to, text, {
@@ -108,5 +119,8 @@ export function createVkProgressDraftCompositor(
     currentMessageId: () => messageId,
     overwrite,
     remove,
+    close: () => {
+      closed = true;
+    },
   };
 }

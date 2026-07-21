@@ -121,4 +121,13 @@ describe("createVkProgressDraftCompositor", () => {
     expect(onError).toHaveBeenCalledTimes(1);
     expect(handle.currentMessageId()).toBeUndefined();
   });
+
+  it("overwrite becomes a no-op after close() so no stray message is sent", async () => {
+    const handle = make();
+    await handle.overwrite("a"); // sends → id 55
+    handle.close();
+    await handle.overwrite("b"); // sealed: neither edit nor send
+    expect(mockEditMessage).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+  });
 });

@@ -79,7 +79,7 @@
 - Дефолт — текущее поведение (нет `streaming` ⇒ реакции/off). Ничего не ломается.
 - Тест `src/config-schema.test.ts`.
 
-### Ш4 · Развилка в `src/inbound.ts` (replyOptions) ⬜
+### Ш4 · Развилка в `src/inbound.ts` (replyOptions) ✅ (inbound.test 47/47, +2 progress)
 - Резолв режима: `resolveChannelPreviewStreamMode(vkCfg)`.
 - `"progress"` → создать компоновщик (Ш2), завести колбэки на него вместо реакций:
   `onReplyStart → noteActivity`, `onToolStart → pushToolProgress`,
@@ -89,11 +89,14 @@
 - `"reactions"`/дефолт → как сейчас (`statusReactions`, `createVkStatusReactionController`).
 - Взаимоисключающе: либо реакции, либо draft (один прогресс-канал за раз).
 
-### Ш5 · Finalize в deliver-пути ⬜
-- В `deliverVkReply` / `onDispatch` (`inbound.ts:469-529`): на финальном payload вызвать
-  `markFinalReplyStarted()` / `markFinalReplyDelivered()` и по `streaming.finalize`:
-  `"replace"` → `editMessageVk` черновика в финальный текст; `"keep"` → оставить ленту
-  (edit в progress-summary), финал — новым `sendMessageVk`.
+### Ш5 · Finalize в deliver-пути ✅
+- В `deliver` (`inbound.ts`): на финальном блоке (`info.kind==="final"`)
+  `markFinalReplyStarted()` → доставка ответа обычным путём (полная вёрстка/медиа/кнопки
+  сохраняются) → `markFinalReplyDelivered()` + `close()` + `remove()` (лента шагов
+  убирается, остаётся чистый ответ). На ошибке — `cancel()`+`remove()` в `finally`.
+- **v1-решение:** ответ доставляется отдельным сообщением (не edit черновика в ответ) —
+  чтобы не терять markdown/медиа/кнопки. «Edit-in-place прямо в финальный ответ» (истинно
+  одно сообщение как Telegram) = требует message-adapter путь, отдельный follow-up.
 
 ### Ш6 · Capabilities в `src/channel.ts` + `src/channel.setup.ts` ❓ ОТЛОЖЕНО
 - Разведка показала: `capabilities.edit` **используется в ядре ~23 раза** (влияет на
@@ -110,8 +113,9 @@
 - `scripts/build.mjs` → `entryPoints[]`: добавлен `"src/progress-draft.ts"`.
 - `npm run build` → `dist/src/progress-draft.js` собран (SDK externalized). ✓
 
-### Ш8 · Тесты ⬜
-- `npm test` (vitest) зелёный; покрыть бизнес-правила новых модулей.
+### Ш8 · Тесты ✅ (весь сьют 574/574, build зелёный)
+- `npm test` (vitest): 14 файлов, 574 теста. Новые: send +6, progress-draft +7,
+  config-schema +6, inbound +2. `npm run build` собирает `dist/src/progress-draft.js`.
 
 ### Ш9 · Живой прогон ⬜
 - Собрать, поставить (`plugins install … --force --pin` или симлинк dist), рестарт gateway.

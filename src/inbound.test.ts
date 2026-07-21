@@ -136,6 +136,26 @@ vi.mock("openclaw/plugin-sdk/channel-runtime", () => ({
   logTypingFailure: mockLogTypingFailure,
 }));
 
+// Step-progress: default mode "off" keeps the existing (reactions/plain) paths;
+// individual tests flip resolveChannelPreviewStreamMode to "progress".
+const mockResolveStreamMode = vi.hoisted(() => vi.fn(() => "off"));
+const mockProgressCompositor = vi.hoisted(() => ({
+  noteActivity: vi.fn().mockResolvedValue(true),
+  pushToolProgress: vi.fn().mockResolvedValue(true),
+  pushReasoningProgress: vi.fn().mockResolvedValue(true),
+  markFinalReplyStarted: vi.fn(),
+  markFinalReplyDelivered: vi.fn(),
+  cancel: vi.fn(),
+}));
+const mockCreateProgressCompositor = vi.hoisted(() =>
+  vi.fn(() => mockProgressCompositor),
+);
+
+vi.mock("openclaw/plugin-sdk/channel-message", () => ({
+  resolveChannelPreviewStreamMode: mockResolveStreamMode,
+  createChannelProgressDraftCompositor: mockCreateProgressCompositor,
+}));
+
 // ── Internal module mocks ────────────────────────────────────────────────────
 
 const mockSendPayloadVk = vi.hoisted(() =>
@@ -148,6 +168,12 @@ vi.mock("./send.js", () => ({
   markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
+  // Used transitively by progress-draft.ts; harmless no-ops here since the
+  // mocked compositor never drives update()/deleteCurrent().
+  sendMessageVk: vi.fn().mockResolvedValue({ messageId: "9", chatId: "0" }),
+  editMessageVk: vi.fn().mockResolvedValue(true),
+  deleteMessageVk: vi.fn().mockResolvedValue(undefined),
+  clearVkInstances: vi.fn(),
 }));
 
 import { handleVkInbound } from "./inbound.js";
@@ -196,6 +222,14 @@ beforeEach(() => {
   mockMarkMessageReadVk.mockReset().mockResolvedValue(undefined);
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendTypingVk.mockReset().mockResolvedValue(undefined);
+  mockResolveStreamMode.mockReset().mockReturnValue("off");
+  mockCreateProgressCompositor.mockClear();
+  mockProgressCompositor.noteActivity.mockClear();
+  mockProgressCompositor.pushToolProgress.mockClear();
+  mockProgressCompositor.pushReasoningProgress.mockClear();
+  mockProgressCompositor.markFinalReplyStarted.mockClear();
+  mockProgressCompositor.markFinalReplyDelivered.mockClear();
+  mockProgressCompositor.cancel.mockClear();
   PREFIX_OPTIONS.responsePrefixContextProvider.mockReset().mockReturnValue({});
   PREFIX_OPTIONS.onModelSelected.mockReset();
   mockCreateReplyPrefixOptions.mockReset().mockReturnValue(PREFIX_OPTIONS);
@@ -1411,5 +1445,54 @@ describe("command gating", () => {
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).toHaveBeenCalledOnce();
+  });
+});
+
+describe("step-progress (channels.vk.streaming.mode=progress)", () => {
+  it("routes execution steps to the edit-in-place draft and finalizes on the last block", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "done" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // A draft compositor was created and fed by the execution steps.
+    expect(mockCreateProgressCompositor).toHaveBeenCalledTimes(1);
+    expect(mockProgressCompositor.noteActivity).toHaveBeenCalled();
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(undefined, {
+      toolName: "Bash",
+    });
+    // The final answer still flows through the normal deliver path…
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+    // …bracketed by the compositor's finalize signals.
+    expect(mockProgressCompositor.markFinalReplyStarted).toHaveBeenCalledTimes(1);
+    expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
+  });
+
+  it("builds no draft when streaming mode is off (default reactions/plain path)", async () => {
+    mockResolveStreamMode.mockReturnValue("off");
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockCreateProgressCompositor).not.toHaveBeenCalled();
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
   });
 });
