@@ -447,10 +447,11 @@ export async function handleVkInbound(params: {
     (cfgRecord.messages?.removeAckAfterReply as boolean | undefined) ?? false;
 
   // ── Step-progress draft (opt-in via channels.vk.streaming.mode:"progress") ──
-  // Alternative to status reactions: show the live list of execution steps
-  // (🛠️ tool calls, 🔎 web search …) in ONE message edited in place, mirroring
-  // Telegram's "progress" stream. Reactions and the draft are mutually exclusive
-  // progress channels — the draft wins when both are configured.
+  // Shows the live list of execution steps (🛠️ tool calls, 🔎 web search …) in
+  // ONE message edited in place, mirroring Telegram's "progress" stream. It is
+  // INDEPENDENT of status reactions — both can run together (as Telegram does):
+  // the reaction tracks the coarse state on the user's message, the draft shows
+  // the steps. Each progress callback below fans out to whichever is enabled.
   const vkStreamingEntry = cfgRecord.channels?.vk as StreamingCompatEntry | undefined;
   const progressStreamMode = resolveChannelPreviewStreamMode(vkStreamingEntry, "off");
   const progressDraftEnabled =
@@ -458,11 +459,7 @@ export async function handleVkInbound(params: {
     typeof message.conversationMessageId === "number";
 
   let statusReactions: StatusReactionController | null = null;
-  if (
-    statusReactionsEnabled &&
-    !progressDraftEnabled &&
-    typeof message.conversationMessageId === "number"
-  ) {
+  if (statusReactionsEnabled && typeof message.conversationMessageId === "number") {
     statusReactions = createVkStatusReactionController({
       peerId: message.peerId,
       cmid: message.conversationMessageId,
@@ -549,57 +546,46 @@ export async function handleVkInbound(params: {
       },
       replyOptions: {
         onModelSelected,
-        ...(progressDraft
+        // Reactions and the step draft are independent surfaces — fan each
+        // progress event out to whichever is enabled (both, when both are on).
+        ...(progressDraft || statusReactions
           ? {
-              // Same "quiet direct native progress" flags the reactions path uses
-              // (see below): without them the core gates onToolStart behind
-              // tool-summary visibility, so no steps would fire in DMs.
+              // Without these, the core gates onToolStart/onCompactionStart
+              // behind tool-summary visibility (requiresToolSummaryVisibility),
+              // so neither the 👌/🙏 reactions nor the step draft fire in DMs
+              // even though onReasoningStream (🤔) does. These flags enable the
+              // "quiet direct native progress" path: the callbacks run without
+              // emitting default tool-progress text messages.
               suppressDefaultToolProgressMessages: true,
               allowProgressCallbacksWhenSourceDeliverySuppressed: true,
               onReasoningStream: async () => {
                 if (turnSettled) return;
-                await progressDraft!.compositor.pushReasoningProgress();
+                if (statusReactions) await statusReactions.setThinking();
+                if (progressDraft) await progressDraft.compositor.pushReasoningProgress();
               },
               onToolStart: async (payload: { name?: string }) => {
                 if (turnSettled) return;
-                await progressDraft!.compositor.pushToolProgress(undefined, {
-                  toolName: payload?.name,
-                });
+                if (statusReactions) await statusReactions.setTool(payload?.name);
+                if (progressDraft) {
+                  await progressDraft.compositor.pushToolProgress(undefined, {
+                    toolName: payload?.name,
+                  });
+                }
               },
               onCompactionStart: async () => {
                 if (turnSettled) return;
-                await progressDraft!.compositor.noteActivity();
+                if (statusReactions) await statusReactions.setCompacting();
+                if (progressDraft) await progressDraft.compositor.noteActivity();
+              },
+              onCompactionEnd: async () => {
+                if (turnSettled) return;
+                if (statusReactions) {
+                  statusReactions.cancelPending();
+                  await statusReactions.setThinking();
+                }
               },
             }
-          : statusReactions
-            ? {
-                // Without these, the core gates onToolStart/onCompactionStart
-                // behind tool-summary visibility (requiresToolSummaryVisibility),
-                // so the 👌/🙏 reactions never fire in DMs even though
-                // onReasoningStream (🤔) does. These flags enable the "quiet
-                // direct native progress" path: reaction callbacks run without
-                // emitting default tool-progress text messages.
-                suppressDefaultToolProgressMessages: true,
-                allowProgressCallbacksWhenSourceDeliverySuppressed: true,
-                onReasoningStream: async () => {
-                  if (turnSettled) return;
-                  await statusReactions!.setThinking();
-                },
-                onToolStart: async (payload: { name?: string }) => {
-                  if (turnSettled) return;
-                  await statusReactions!.setTool(payload?.name);
-                },
-                onCompactionStart: async () => {
-                  if (turnSettled) return;
-                  await statusReactions!.setCompacting();
-                },
-                onCompactionEnd: async () => {
-                  if (turnSettled) return;
-                  statusReactions!.cancelPending();
-                  await statusReactions!.setThinking();
-                },
-              }
-            : {}),
+          : {}),
       },
     });
   } catch (err) {

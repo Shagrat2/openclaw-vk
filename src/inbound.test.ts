@@ -60,6 +60,18 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   logInboundDrop: vi.fn(),
 }));
 
+const mockStatusReactionCtrl = vi.hoisted(() => ({
+  setQueued: vi.fn(),
+  setThinking: vi.fn(),
+  setTool: vi.fn(),
+  setCompacting: vi.fn(),
+  setDone: vi.fn().mockResolvedValue(undefined),
+  setError: vi.fn().mockResolvedValue(undefined),
+  cancelPending: vi.fn(),
+  clear: vi.fn().mockResolvedValue(undefined),
+  restoreInitial: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
   DEFAULT_EMOJIS: {
     queued: "👀",
@@ -83,17 +95,7 @@ vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
     doneHoldMs: 1500,
     errorHoldMs: 2500,
   },
-  createStatusReactionController: vi.fn(() => ({
-    setQueued: vi.fn(),
-    setThinking: vi.fn(),
-    setTool: vi.fn(),
-    setCompacting: vi.fn(),
-    setDone: vi.fn().mockResolvedValue(undefined),
-    setError: vi.fn().mockResolvedValue(undefined),
-    cancelPending: vi.fn(),
-    clear: vi.fn().mockResolvedValue(undefined),
-    restoreInitial: vi.fn().mockResolvedValue(undefined),
-  })),
+  createStatusReactionController: vi.fn(() => mockStatusReactionCtrl),
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
@@ -230,6 +232,7 @@ beforeEach(() => {
   mockProgressCompositor.markFinalReplyStarted.mockClear();
   mockProgressCompositor.markFinalReplyDelivered.mockClear();
   mockProgressCompositor.cancel.mockClear();
+  Object.values(mockStatusReactionCtrl).forEach((fn) => fn.mockClear());
   PREFIX_OPTIONS.responsePrefixContextProvider.mockReset().mockReturnValue({});
   PREFIX_OPTIONS.onModelSelected.mockReset();
   mockCreateReplyPrefixOptions.mockReset().mockReturnValue(PREFIX_OPTIONS);
@@ -1494,5 +1497,34 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
 
     expect(mockCreateProgressCompositor).not.toHaveBeenCalled();
     expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
+  });
+
+  it("runs reactions AND the step draft together when both are enabled (Telegram parity)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ replyOptions }: any) => {
+        await replyOptions.onToolStart?.({ name: "Bash" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: {
+        ...baseCfg({ streaming: { mode: "progress" } }),
+        messages: { statusReactions: { enabled: true }, ackReactionScope: "all" },
+      } as CoreConfig,
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // Both controllers exist and the single onToolStart fans out to each.
+    expect(mockCreateProgressCompositor).toHaveBeenCalledTimes(1);
+    expect(mockStatusReactionCtrl.setTool).toHaveBeenCalledWith("Bash");
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(undefined, {
+      toolName: "Bash",
+    });
   });
 });

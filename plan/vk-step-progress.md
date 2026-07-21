@@ -79,7 +79,7 @@
 - Дефолт — текущее поведение (нет `streaming` ⇒ реакции/off). Ничего не ломается.
 - Тест `src/config-schema.test.ts`.
 
-### Ш4 · Развилка в `src/inbound.ts` (replyOptions) ✅ (inbound.test 47/47, +2 progress)
+### Ш4 · Развилка в `src/inbound.ts` (replyOptions) ✅ (inbound.test 48/48, +3 progress)
 - Резолв режима: `resolveChannelPreviewStreamMode(vkCfg)`.
 - `"progress"` → создать компоновщик (Ш2), завести колбэки на него вместо реакций:
   `onReplyStart → noteActivity`, `onToolStart → pushToolProgress`,
@@ -87,7 +87,9 @@
   Сохранить `suppressDefaultToolProgressMessages:true` +
   `allowProgressCallbacksWhenSourceDeliverySuppressed:true` (уже стоят, `inbound.ts:507-508`).
 - `"reactions"`/дефолт → как сейчас (`statusReactions`, `createVkStatusReactionController`).
-- Взаимоисключающе: либо реакции, либо draft (один прогресс-канал за раз).
+- **Реакции и draft НЕзависимы — работают вместе (как Telegram, проверено в ядре):**
+  общие колбэки (`onToolStart` и т.д.) фанаутят в оба (`if(statusReactions)…; if(progressDraft)…`).
+  Реакция = грубое состояние на сообщении юзера, draft = конкретные шаги.
 
 ### Ш5 · Finalize в deliver-пути ✅
 - В `deliver` (`inbound.ts`): на финальном блоке (`info.kind==="final"`)
@@ -113,9 +115,9 @@
 - `scripts/build.mjs` → `entryPoints[]`: добавлен `"src/progress-draft.ts"`.
 - `npm run build` → `dist/src/progress-draft.js` собран (SDK externalized). ✓
 
-### Ш8 · Тесты ✅ (весь сьют 574/574, build зелёный)
-- `npm test` (vitest): 14 файлов, 574 теста. Новые: send +6, progress-draft +7,
-  config-schema +6, inbound +2. `npm run build` собирает `dist/src/progress-draft.js`.
+### Ш8 · Тесты ✅ (весь сьют 575/575, build зелёный)
+- `npm test` (vitest): 14 файлов, 575 тестов. Новые: send +6, progress-draft +7,
+  config-schema +6, inbound +3. `npm run build` собирает `dist/src/progress-draft.js`.
 
 ### Ш9 · Живой прогон ⬜ (за Иваном — деплой на живого бота)
 - Собрать, поставить (`plugins install … --force --pin` или симлинк dist), рестарт gateway.
