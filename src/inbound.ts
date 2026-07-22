@@ -36,6 +36,7 @@ import type { VkProgressDraftHandle } from "./progress-draft.js";
 import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
 import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
 import {
+  buildChannelProgressDraftLineForEntry,
   resolveChannelPreviewStreamMode,
   type StreamingCompatEntry,
 } from "openclaw/plugin-sdk/channel-message";
@@ -483,12 +484,16 @@ export async function handleVkInbound(params: {
       entry: vkStreamingEntry,
       mode: progressStreamMode,
       seed: String(message.conversationMessageId),
+      log: runtime.log,
       onError: (err) => {
         runtime.log?.(
           `vk: progress-draft error for cmid=${message.conversationMessageId}: ${String(err)}`,
         );
       },
     });
+    runtime.log?.(
+      `vk: step-progress draft enabled (mode=${progressStreamMode}) cmid=${message.conversationMessageId}`,
+    );
   }
 
   await startTypingOnce();
@@ -511,7 +516,10 @@ export async function handleVkInbound(params: {
         onReplyStart: async () => {
           await startTypingOnce();
           if (statusReactions) await statusReactions.setThinking();
-          if (progressDraft) await progressDraft.compositor.noteActivity();
+          // NB: the step draft is intentionally NOT seeded here. Telegram seeds
+          // its draft only from real tool/reasoning events, so a text-only turn
+          // never spawns an empty placeholder message. We do the same — the draft
+          // is created lazily on the first onToolStart below.
         },
         typingCallbacks,
         deliver: async (payload: unknown, info?: { kind?: string }) => {
@@ -560,22 +568,45 @@ export async function handleVkInbound(params: {
               allowProgressCallbacksWhenSourceDeliverySuppressed: true,
               onReasoningStream: async () => {
                 if (turnSettled) return;
+                // Reasoning drives only the reaction (🤔). The step draft shows
+                // execution steps, not reasoning (thinking is off), so it is fed
+                // exclusively from onToolStart below — mirroring Telegram, which
+                // never seeds the draft from reply-start/reasoning.
                 if (statusReactions) await statusReactions.setThinking();
-                if (progressDraft) await progressDraft.compositor.pushReasoningProgress();
               },
-              onToolStart: async (payload: { name?: string }) => {
+              onToolStart: async (payload: {
+                name?: string;
+                phase?: string;
+                args?: Record<string, unknown>;
+                itemId?: string;
+                toolCallId?: string;
+              }) => {
                 if (turnSettled) return;
-                if (statusReactions) await statusReactions.setTool(payload?.name);
+                const toolName = payload?.name?.trim();
+                if (statusReactions) await statusReactions.setTool(toolName);
                 if (progressDraft) {
-                  await progressDraft.compositor.pushToolProgress(undefined, {
-                    toolName: payload?.name,
-                  });
+                  runtime.log?.(
+                    `vk: step-progress tool name=${toolName ?? "?"} phase=${payload?.phase ?? "?"} cmid=${message.conversationMessageId}`,
+                  );
+                  // Build the full draft line (like Telegram). Passing undefined
+                  // leaves the compositor with nothing to render; startImmediately
+                  // shows the step at once instead of waiting out the start gate.
+                  await progressDraft.compositor.pushToolProgress(
+                    buildChannelProgressDraftLineForEntry(vkStreamingEntry, {
+                      event: "tool",
+                      itemId: payload?.itemId,
+                      toolCallId: payload?.toolCallId,
+                      name: toolName,
+                      phase: payload?.phase,
+                      args: payload?.args,
+                    }),
+                    { toolName, startImmediately: true },
+                  );
                 }
               },
               onCompactionStart: async () => {
                 if (turnSettled) return;
                 if (statusReactions) await statusReactions.setCompacting();
-                if (progressDraft) await progressDraft.compositor.noteActivity();
               },
               onCompactionEnd: async () => {
                 if (turnSettled) return;

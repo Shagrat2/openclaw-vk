@@ -37,6 +37,8 @@ export type VkProgressDraftParams = {
   /** Stable per-turn seed so the compositor can distinguish turns. */
   seed: string;
   onError?: (err: unknown) => void;
+  /** Optional diagnostic logger — traces draft send/edit/remove to gateway.log. */
+  log?: (msg: string) => void;
 };
 
 /**
@@ -79,9 +81,11 @@ export function createVkProgressDraftCompositor(
         });
         const id = Number(result.messageId);
         messageId = Number.isFinite(id) && id > 0 ? id : undefined;
+        params.log?.(`vk: step-progress draft sent msgId=${messageId ?? "?"} len=${text.length}`);
         return;
       }
       const ok = await editMessageVk(params.to, messageId, text, params.account);
+      params.log?.(`vk: step-progress draft edited msgId=${messageId} ok=${ok} len=${text.length}`);
       if (!ok) {
         // Edit window elapsed or message gone — forget it so the next render
         // starts a fresh draft instead of silently dropping progress.
@@ -100,6 +104,7 @@ export function createVkProgressDraftCompositor(
     messageId = undefined;
     try {
       await deleteMessageVk(params.to, id, params.account);
+      params.log?.(`vk: step-progress draft removed msgId=${id}`);
     } catch (err) {
       params.onError?.(err);
     }

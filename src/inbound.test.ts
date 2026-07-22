@@ -156,6 +156,8 @@ const mockCreateProgressCompositor = vi.hoisted(() =>
 vi.mock("openclaw/plugin-sdk/channel-message", () => ({
   resolveChannelPreviewStreamMode: mockResolveStreamMode,
   createChannelProgressDraftCompositor: mockCreateProgressCompositor,
+  // Return the raw input as the "line" so tests can assert what was built.
+  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
 }));
 
 // ── Internal module mocks ────────────────────────────────────────────────────
@@ -1473,10 +1475,11 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
 
     // A draft compositor was created and fed by the execution steps.
     expect(mockCreateProgressCompositor).toHaveBeenCalledTimes(1);
-    expect(mockProgressCompositor.noteActivity).toHaveBeenCalled();
-    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(undefined, {
-      toolName: "Bash",
-    });
+    // The step is rendered from a built line (not undefined) and shown at once.
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "tool", name: "Bash" }),
+      expect.objectContaining({ toolName: "Bash", startImmediately: true }),
+    );
     // The final answer still flows through the normal deliver path…
     expect(mockSendPayloadVk).toHaveBeenCalled();
     // …bracketed by the compositor's finalize signals.
@@ -1523,8 +1526,9 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     // Both controllers exist and the single onToolStart fans out to each.
     expect(mockCreateProgressCompositor).toHaveBeenCalledTimes(1);
     expect(mockStatusReactionCtrl.setTool).toHaveBeenCalledWith("Bash");
-    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(undefined, {
-      toolName: "Bash",
-    });
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "tool", name: "Bash" }),
+      expect.objectContaining({ toolName: "Bash", startImmediately: true }),
+    );
   });
 });
