@@ -149,15 +149,31 @@ const mockProgressCompositor = vi.hoisted(() => ({
   markFinalReplyDelivered: vi.fn(),
   cancel: vi.fn(),
 }));
-const mockCreateProgressCompositor = vi.hoisted(() =>
-  vi.fn(() => mockProgressCompositor),
+// currentMessageId defaults to undefined (no live draft); the edit-into-answer
+// test overrides it to a number to exercise the single-bubble finalize.
+const mockCurrentMessageId = vi.hoisted(() => vi.fn<[], number | undefined>(() => undefined));
+const mockDraftRemove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockDraftClose = vi.hoisted(() => vi.fn());
+const mockCreateVkProgressDraft = vi.hoisted(() =>
+  vi.fn(() => ({
+    compositor: mockProgressCompositor,
+    currentMessageId: mockCurrentMessageId,
+    overwrite: vi.fn().mockResolvedValue(undefined),
+    remove: mockDraftRemove,
+    close: mockDraftClose,
+  })),
 );
 
 vi.mock("openclaw/plugin-sdk/channel-message", () => ({
   resolveChannelPreviewStreamMode: mockResolveStreamMode,
-  createChannelProgressDraftCompositor: mockCreateProgressCompositor,
   // Return the raw input as the "line" so tests can assert what was built.
   buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
+  // Used only by progress-draft.ts (mocked below); stub keeps the shape complete.
+  createChannelProgressDraftCompositor: vi.fn(() => mockProgressCompositor),
+}));
+
+vi.mock("./progress-draft.js", () => ({
+  createVkProgressDraftCompositor: mockCreateVkProgressDraft,
 }));
 
 // ── Internal module mocks ────────────────────────────────────────────────────
@@ -167,17 +183,23 @@ const mockSendPayloadVk = vi.hoisted(() =>
 );
 const mockMarkMessageReadVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockSendTypingVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockEditMessageVk = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 
 vi.mock("./send.js", () => ({
   markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
-  // Used transitively by progress-draft.ts; harmless no-ops here since the
-  // mocked compositor never drives update()/deleteCurrent().
+  // editMessageVk backs the edit-in-place finalize; the rest are no-ops here.
+  editMessageVk: mockEditMessageVk,
   sendMessageVk: vi.fn().mockResolvedValue({ messageId: "9", chatId: "0" }),
-  editMessageVk: vi.fn().mockResolvedValue(true),
   deleteMessageVk: vi.fn().mockResolvedValue(undefined),
   clearVkInstances: vi.fn(),
+}));
+
+// inbound.ts renders the final answer with renderVkMarkdownChunks for the
+// edit-in-place finalize; stub it to a single plain chunk.
+vi.mock("./format.js", () => ({
+  renderVkMarkdownChunks: (md: string) => [{ text: md }],
 }));
 
 import { handleVkInbound } from "./inbound.js";
@@ -227,7 +249,11 @@ beforeEach(() => {
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendTypingVk.mockReset().mockResolvedValue(undefined);
   mockResolveStreamMode.mockReset().mockReturnValue("off");
-  mockCreateProgressCompositor.mockClear();
+  mockCreateVkProgressDraft.mockClear();
+  mockCurrentMessageId.mockReset().mockReturnValue(undefined);
+  mockDraftRemove.mockClear();
+  mockDraftClose.mockClear();
+  mockEditMessageVk.mockReset().mockResolvedValue(true);
   mockProgressCompositor.noteActivity.mockClear();
   mockProgressCompositor.pushToolProgress.mockClear();
   mockProgressCompositor.pushReasoningProgress.mockClear();
@@ -1474,7 +1500,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     });
 
     // A draft compositor was created and fed by the execution steps.
-    expect(mockCreateProgressCompositor).toHaveBeenCalledTimes(1);
+    expect(mockCreateVkProgressDraft).toHaveBeenCalledTimes(1);
     // The step is rendered from a built line (not undefined) and shown at once.
     expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
       expect.objectContaining({ event: "tool", name: "Bash" }),
@@ -1498,7 +1524,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       runtime: createVkRuntimeEnv(),
     });
 
-    expect(mockCreateProgressCompositor).not.toHaveBeenCalled();
+    expect(mockCreateVkProgressDraft).not.toHaveBeenCalled();
     expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
   });
 
@@ -1524,11 +1550,89 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     });
 
     // Both controllers exist and the single onToolStart fans out to each.
-    expect(mockCreateProgressCompositor).toHaveBeenCalledTimes(1);
+    expect(mockCreateVkProgressDraft).toHaveBeenCalledTimes(1);
     expect(mockStatusReactionCtrl.setTool).toHaveBeenCalledWith("Bash");
     expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
       expect.objectContaining({ event: "tool", name: "Bash" }),
       expect.objectContaining({ toolName: "Bash", startImmediately: true }),
     );
+  });
+
+  it("edits the live draft INTO the final answer (single bubble) for a plain text reply", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555); // a live draft exists
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The draft message is edited into the answer; no separate reply is sent.
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      555,
+      "The answer.",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(mockSendPayloadVk).not.toHaveBeenCalled();
+    expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a normal reply when the draft edit fails (answer never lost)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555);
+    mockEditMessageVk.mockResolvedValue(false); // edit fails
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).toHaveBeenCalled();
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+  });
+
+  it("keeps media replies as their own message (no edit-into-answer)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555);
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          { text: "See this", mediaUrl: "https://example/y.jpg" },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockEditMessageVk).not.toHaveBeenCalled();
+    expect(mockSendPayloadVk).toHaveBeenCalled();
   });
 });

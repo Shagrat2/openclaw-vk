@@ -937,6 +937,28 @@ describe("editMessageVk", () => {
     expect(await editMessageVk("123", Number.NaN, "x", makeAccount())).toBe(false);
     expect(mockMessagesEdit).not.toHaveBeenCalled();
   });
+
+  it("passes format_data (serialized) when rich-text runs are provided", async () => {
+    await editMessageVk("123", 42, "bold", makeAccount(), {
+      formatData: { version: 1, items: [{ type: "bold", offset: 0, length: 4 }] },
+    });
+    const call = mockMessagesEdit.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call.peer_id).toBe(123);
+    expect(call.message_id).toBe(42);
+    expect(typeof call.format_data).toBe("string");
+    expect(JSON.parse(call.format_data as string)).toEqual({
+      version: 1,
+      items: [{ type: "bold", offset: 0, length: 4 }],
+    });
+  });
+
+  it("omits format_data when there are no rich-text runs", async () => {
+    await editMessageVk("123", 42, "plain", makeAccount(), {
+      formatData: { version: 1, items: [] },
+    });
+    const call = mockMessagesEdit.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call.format_data).toBeUndefined();
+  });
 });
 
 describe("deleteMessageVk", () => {

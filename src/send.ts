@@ -1035,6 +1035,7 @@ export async function editMessageVk(
   messageId: number,
   text: string,
   account: ResolvedVkAccount,
+  opts: { formatData?: VkPreparedFormattedMessage["formatData"] } = {},
 ): Promise<boolean> {
   if (!account.token) {
     return false;
@@ -1044,14 +1045,22 @@ export async function editMessageVk(
     return false;
   }
   const vk = getOrCreateVk(account.token);
+  const editParams: Record<string, unknown> = {
+    peer_id: peerId,
+    message_id: messageId,
+    message: text,
+    keep_forward_messages: 1,
+    keep_snippets: 1,
+  };
+  // format_data carries VK's rich-text runs (markdown). It is a real messages.edit
+  // param but not typed by vk-io, so build the params loosely and cast on the call.
+  if (opts.formatData && opts.formatData.items.length > 0) {
+    editParams.format_data = JSON.stringify(opts.formatData);
+  }
   await withVkRetry(async () => {
-    await vk.api.messages.edit({
-      peer_id: peerId,
-      message_id: messageId,
-      message: text,
-      keep_forward_messages: 1,
-      keep_snippets: 1,
-    });
+    await vk.api.messages.edit(
+      editParams as unknown as Parameters<typeof vk.api.messages.edit>[0],
+    );
   });
   return true;
 }

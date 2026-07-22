@@ -29,7 +29,14 @@ import {
   resolveVkInboundMediaUrls,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
-import { clearVkInstances, markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
+import {
+  clearVkInstances,
+  editMessageVk,
+  markMessageReadVk,
+  sendPayloadVk,
+  sendTypingVk,
+} from "./send.js";
+import { renderVkMarkdownChunks } from "./format.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { createVkProgressDraftCompositor } from "./progress-draft.js";
 import type { VkProgressDraftHandle } from "./progress-draft.js";
@@ -529,11 +536,54 @@ export async function handleVkInbound(params: {
               : {};
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
           const isFinal = info?.kind === "final";
-          // Stop the step draft before the final answer lands so it can't race
-          // the answer message. The answer is delivered on its own (preserving
-          // full markdown/media/buttons); we then drop the transient step list.
+          let draftHandled = false;
+
+          // ── Edit-in-place finalize (Telegram-style single bubble) ──────────
+          // When a step draft is live and the final answer is a plain text reply
+          // (no media, no buttons, fits one VK message), edit the draft message
+          // INTO the answer instead of dropping it and sending a new one. Any
+          // richer answer falls through to the normal, proven delivery path so
+          // media / buttons / long multi-chunk replies keep full fidelity.
           if (progressDraft && isFinal) {
-            progressDraft.compositor.markFinalReplyStarted();
+            const draftMsgId = progressDraft.currentMessageId();
+            const hasMedia =
+              Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
+            const finalText = normalized.text?.trim();
+            if (draftMsgId !== undefined && finalText && !hasMedia && !resolvedButtons) {
+              const chunks = renderVkMarkdownChunks(normalized.text ?? "");
+              if (chunks.length === 1) {
+                progressDraft.compositor.markFinalReplyStarted();
+                let edited = false;
+                try {
+                  edited = await editMessageVk(
+                    String(message.peerId),
+                    draftMsgId,
+                    chunks[0].text,
+                    account,
+                    { formatData: chunks[0].formatData },
+                  );
+                } catch (err) {
+                  runtime.log?.(`vk: step-progress edit-into-final failed: ${String(err)}`);
+                }
+                progressDraft.compositor.markFinalReplyDelivered();
+                progressDraft.close();
+                if (edited) {
+                  runtime.log?.(
+                    `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length}`,
+                  );
+                  statusSink?.({ lastOutboundAt: Date.now() });
+                  return;
+                }
+                // Edit failed — drop the draft and deliver the answer normally so
+                // the reply is never lost.
+                await progressDraft.remove();
+                draftHandled = true;
+              }
+            }
+            if (!draftHandled) {
+              // Stop the step draft before the answer lands so it can't race it.
+              progressDraft.compositor.markFinalReplyStarted();
+            }
           }
           await deliverVkReply({
             payload: normalized,
@@ -544,7 +594,7 @@ export async function handleVkInbound(params: {
             clearKeyboard:
               payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
           });
-          if (progressDraft && isFinal) {
+          if (progressDraft && isFinal && !draftHandled) {
             progressDraft.compositor.markFinalReplyDelivered();
             progressDraft.close();
             await progressDraft.remove();
