@@ -598,6 +598,42 @@ describe("sendAudioMessageVk", () => {
     expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
   });
 
+  it("retries audio upload on transient code=100 \"file is undefined\"", async () => {
+    const fileUndefinedError = Object.assign(
+      new Error("One of the parameters specified was missing or invalid: file is undefined"),
+      { code: 100 },
+    );
+    mockUploadAudioMessage
+      .mockRejectedValueOnce(fileUndefinedError)
+      .mockResolvedValueOnce("audio_message123_789");
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", {
+      cfg,
+    });
+
+    // Two upload attempts: transient failure then success — the voice is delivered.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 456, attachment: "audio_message123_789" }),
+    );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("does not retry audio upload on a genuine (non-file) code=100", async () => {
+    const paramError = Object.assign(
+      new Error("One of the parameters specified was missing or invalid: peer_id is invalid"),
+      { code: 100 },
+    );
+    mockUploadAudioMessage.mockRejectedValue(paramError);
+
+    await expect(
+      sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+    // Only one attempt — an arbitrary code=100 must not be masked as transient.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the single-message path for a short local file", async () => {
     mockMessagesSend.mockResolvedValueOnce(88);
     mockProbeAudioDurationMs.mockResolvedValueOnce(60_000); // 1 min ≤ limit

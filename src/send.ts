@@ -160,6 +160,19 @@ function isVkImageUploadFallbackError(error: unknown): boolean {
   return isVkScopeDeniedError(error) || isVkPhotoSourceRejectedError(error);
 }
 
+// audio_message uploads intermittently fail with code=100 "file is undefined"
+// when the multipart upload to the getMessagesUploadServer endpoint is dropped
+// mid-flight (transient, same family as the error-15 batching failure). Unlike a
+// genuine invalid-parameter 100, a re-issued upload succeeds, so treat only this
+// specific message as retryable — not every code=100.
+function isVkTransientFileUndefinedError(error: unknown): boolean {
+  if (readVkErrorCode(error) !== 100) {
+    return false;
+  }
+  const message = readVkErrorMessage(error).toLowerCase();
+  return message.includes("file is undefined") || message.includes("file undefined");
+}
+
 function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
 }
@@ -202,7 +215,11 @@ function isRetryableVkError(error: unknown): boolean {
 
 async function withVkRetry<T>(
   operation: () => Promise<T>,
-  opts?: { extraRetryableCodes?: readonly number[]; maxAttempts?: number },
+  opts?: {
+    extraRetryableCodes?: readonly number[];
+    extraRetryablePredicate?: (error: unknown) => boolean;
+    maxAttempts?: number;
+  },
 ): Promise<T> {
   const maxAttempts = opts?.maxAttempts ?? VK_TRANSIENT_RETRY_ATTEMPTS;
   let attempt = 0;
@@ -214,7 +231,8 @@ async function withVkRetry<T>(
       const code = readVkErrorCode(error);
       const retryable =
         isRetryableVkError(error) ||
-        (code !== undefined && (opts?.extraRetryableCodes?.includes(code) ?? false));
+        (code !== undefined && (opts?.extraRetryableCodes?.includes(code) ?? false)) ||
+        (opts?.extraRetryablePredicate?.(error) ?? false);
       if (attempt >= maxAttempts || !retryable) {
         throw error;
       }
@@ -694,6 +712,8 @@ async function uploadVkAudioMessage(params: {
   // requests on the shared (apiLimit) VK client. Verified ~20% failure under
   // concurrency vs 0% sequentially. The call is otherwise idempotent, so treat
   // 15 as transient here and retry — a re-issued (unbatched) call succeeds.
+  // Same idempotent path also hits a transient code=100 "file is undefined" when
+  // the multipart upload is dropped mid-flight — retry that specific case too.
   const attachment = await withVkRetry(
     async () => {
       return await params.vk.upload.audioMessage({
@@ -706,7 +726,11 @@ async function uploadVkAudioMessage(params: {
         title: params.filename,
       });
     },
-    { extraRetryableCodes: [15], maxAttempts: 5 },
+    {
+      extraRetryableCodes: [15],
+      extraRetryablePredicate: isVkTransientFileUndefinedError,
+      maxAttempts: 5,
+    },
   );
   return String(attachment);
 }
