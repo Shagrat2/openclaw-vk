@@ -24,7 +24,8 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
   },
 }));
 
-import { monitorVkProvider } from "./monitor.js";
+import { monitorVkProvider, readPollingCursor } from "./monitor.js";
+import type { VK } from "vk-io";
 import { setVkRuntime } from "./runtime.js";
 import {
   createVkRuntimeEnv,
@@ -462,5 +463,32 @@ describe("message_new handler", () => {
     expect(message.attachments).toEqual([]);
     expect(message.replyToMessageId).toBeUndefined();
     expect(message.replyToText).toBeUndefined();
+  });
+});
+
+describe("readPollingCursor", () => {
+  const vkWith = (ts: unknown): VK =>
+    ({ updates: { pollingTransport: { ts } } }) as unknown as VK;
+
+  it("reads a numeric ts (User Long Poll) as a string", () => {
+    expect(readPollingCursor(vkWith(5))).toBe("5");
+  });
+
+  it("reads a string ts (Bots Long Poll) — primary liveness path engages", () => {
+    // Regression guard for finding #1: VK's groups.getLongPollServer returns
+    // `ts` as a JSON string ("9"), and vk-io stores it unchanged. The old
+    // numeric-only check dropped it, so in Bots LP mode the cursor was always
+    // unreadable and the watchdog silently degraded to the fallback probe.
+    expect(readPollingCursor(vkWith("9"))).toBe("9");
+  });
+
+  it("treats an empty string ts as unreadable", () => {
+    expect(readPollingCursor(vkWith(""))).toBeUndefined();
+  });
+
+  it("returns undefined when ts is missing or the transport is absent", () => {
+    expect(readPollingCursor(vkWith(undefined))).toBeUndefined();
+    expect(readPollingCursor({ updates: {} } as unknown as VK)).toBeUndefined();
+    expect(readPollingCursor({} as unknown as VK)).toBeUndefined();
   });
 });

@@ -273,13 +273,20 @@ export async function splitAudioAtSilence(file: string, maxMs: number): Promise<
       outputs.push(out);
     }
   } catch {
-    // Any extraction failure → clean up and bail so caller falls back.
+    // Any extraction failure → clean up and bail so caller falls back. When the
+    // first extraction fails, `outputs` is empty, so cleanupAudioSegments can't
+    // derive the temp dir — remove it explicitly so the mkdtemp dir (and any
+    // partial file) never leaks.
     await cleanupAudioSegments(outputs);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }
 
   if (outputs.length < 2) {
+    // Not enough segments to be worth splitting. Same leak guard: with zero
+    // outputs the dir must be removed explicitly.
     await cleanupAudioSegments(outputs);
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }
   return outputs;
