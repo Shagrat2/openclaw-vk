@@ -59,11 +59,12 @@ export type VkMonitorOptions = {
 // wedged so that the long-poll request stops delivering updates while the API
 // itself stays healthy — which manifests as "VK goes silent until the gateway
 // is restarted" (commonly right after a gateway restart). The watchdog below
-// supervises the poller via vk-io's internal `ts` cursor — it advances on EVERY
-// long-poll cycle (~every 25s) even when no one is messaging, so a frozen `ts`
-// is an unambiguous "poller is dead" signal that does NOT false-positive during
-// legitimate idle. When dead, the poller is recreated in-place (no gateway
-// restart), with a logged reason and backoff.
+// supervises the poller via vk-io's internal `ts` event cursor plus an active
+// token probe: a moving cursor proves liveness for free, while a static or
+// unreadable cursor triggers a probe (never an immediate restart — VK's cursor
+// does NOT advance on empty idle polls). When the token is genuinely
+// unreachable, the poller is recreated in-place (no gateway restart), with a
+// logged reason and backoff.
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -72,11 +73,10 @@ function envInt(name: string, fallback: number): number {
 }
 // How often to inspect the poller heartbeat.
 const WATCHDOG_INTERVAL_MS = envInt("VK_LP_WATCHDOG_INTERVAL_MS", 30_000);
-// Restart if the `ts` cursor has not advanced for this long (≈3× the 25s
-// long-poll wait) — that means no poll cycle has completed.
-const TS_STALE_MS = envInt("VK_LP_TS_STALE_MS", 80_000);
-// Fallback only (when the `ts` cursor can't be read): probe the API after this
-// much idle, and restart after this many consecutive probe failures.
+// When the `ts` cursor is static or unreadable, probe the API after this much
+// idle, and restart after this many consecutive probe failures. (VK_LP_TS_STALE_MS
+// is retired: VK's `ts` is an event cursor that legitimately stays static on an
+// idle channel, so cursor staleness alone must never trigger a restart.)
 const IDLE_BEFORE_PROBE_MS = envInt("VK_LP_IDLE_PROBE_MS", 90_000);
 const PROBE_FAIL_LIMIT = envInt("VK_LP_PROBE_FAIL_LIMIT", 3);
 // Inbound debounce window (opt-in, default OFF). When > 0, same-conversation
@@ -113,16 +113,21 @@ async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: numb
 }
 
 /**
- * Read vk-io's internal long-poll cursor (`ts`). It is bumped after every
- * completed long-poll request (including empty ones), so it is a reliable
- * liveness heartbeat. Returns undefined when the field is not accessible
- * (e.g. webhook mode or a vk-io version that renames it).
+ * Read vk-io's internal long-poll cursor (`ts`) as a string. VK's `ts` is an
+ * EVENT cursor, not a per-request heartbeat: it advances only when the poll
+ * delivers new events, and empty (idle) polls return the SAME value. User Long
+ * Poll exposes it as a number; Bots Long Poll (groups.getLongPollServer) returns
+ * it as a JSON string (e.g. "9") and vk-io stores it unchanged — so both types
+ * must be accepted. Returns undefined when the field is not accessible (e.g.
+ * webhook mode or a vk-io version that renames it).
  */
-function readPollingTs(vk: VK): number | undefined {
+export function readPollingCursor(vk: VK): string | undefined {
   const transport = (vk.updates as unknown as { pollingTransport?: { ts?: unknown } })
     ?.pollingTransport;
   const ts = transport?.ts;
-  return typeof ts === "number" ? ts : undefined;
+  if (typeof ts === "number") return String(ts);
+  if (typeof ts === "string" && ts.length > 0) return ts;
+  return undefined;
 }
 
 /**
@@ -339,8 +344,14 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         // Poller started successfully — reset backoff.
         restartAttempt = 0;
 
-        // ── Watchdog loop (heartbeat via vk-io `ts` cursor) ─────────────
-        let lastTs = readPollingTs(vk);
+        // ── Watchdog loop (probe-based liveness) ────────────────────────
+        // A MOVING cursor is a free liveness proof. A static cursor is
+        // ambiguous — it means EITHER a genuinely idle channel (empty polls
+        // don't advance VK's event cursor) OR a wedged poll loop — so it never
+        // restarts anything on its own. When the cursor is static or unreadable
+        // for long enough, we actively probe the token and restart only after
+        // repeated probe failures (a real outage), never on quiet alone.
+        let lastCursor = readPollingCursor(vk);
         let lastBeatAt = Date.now();
         let probeFailures = 0;
         while (!stopped && !needRestart) {
@@ -353,35 +364,30 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             break;
           }
 
-          const ts = readPollingTs(vk);
-          if (ts !== undefined) {
-            // Primary signal: the long-poll cursor must keep advancing.
-            if (ts !== lastTs) {
-              lastTs = ts;
-              lastBeatAt = Date.now();
+          const cursor = readPollingCursor(vk);
+          if (cursor !== undefined && cursor !== lastCursor) {
+            // Cursor advanced → the poll loop delivered events. Alive.
+            lastCursor = cursor;
+            lastBeatAt = Date.now();
+            probeFailures = 0;
+            continue;
+          }
+
+          // Cursor static or unreadable → probe the token after a long idle.
+          // Restart only on repeated probe failures, never on a quiet cursor.
+          if (Date.now() - lastBeatAt >= IDLE_BEFORE_PROBE_MS) {
+            const alive = await probeTokenAlive(vk);
+            lastBeatAt = Date.now();
+            if (alive) {
               probeFailures = 0;
-            } else if (Date.now() - lastBeatAt >= TS_STALE_MS) {
-              requestRestart(
-                `long-poll heartbeat frozen for ${Math.round((Date.now() - lastBeatAt) / 1000)}s (ts=${ts})`,
+            } else {
+              probeFailures += 1;
+              opts.runtime.log?.(
+                `${tag} VK token probe failed (${probeFailures}/${PROBE_FAIL_LIMIT})`,
               );
-              break;
-            }
-          } else {
-            // Fallback: ts unreadable — probe the token after a long idle.
-            if (Date.now() - lastBeatAt >= IDLE_BEFORE_PROBE_MS) {
-              const alive = await probeTokenAlive(vk);
-              lastBeatAt = Date.now();
-              if (alive) {
-                probeFailures = 0;
-              } else {
-                probeFailures += 1;
-                opts.runtime.log?.(
-                  `${tag} VK token probe failed (${probeFailures}/${PROBE_FAIL_LIMIT})`,
-                );
-                if (probeFailures >= PROBE_FAIL_LIMIT) {
-                  requestRestart("VK token unreachable");
-                  break;
-                }
+              if (probeFailures >= PROBE_FAIL_LIMIT) {
+                requestRestart("VK token unreachable");
+                break;
               }
             }
           }

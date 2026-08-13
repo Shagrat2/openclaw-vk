@@ -6,11 +6,15 @@ vi.mock("node:child_process", () => ({
   execFile: mockExecFile,
 }));
 
+import { readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+
 import {
   getVkAudioMessageMaxMs,
   parseSilenceWindows,
   probeAudioDurationMs,
   selectCutPointsMs,
+  splitAudioAtSilence,
 } from "./audio-chunk.js";
 
 /**
@@ -117,5 +121,43 @@ describe("selectCutPointsMs", () => {
   it("cuts hard at max when no silence fits in the window", () => {
     const cuts = selectCutPointsMs([], 600_000, 270_000);
     expect(cuts).toEqual([270_000, 540_000]);
+  });
+});
+
+describe("splitAudioAtSilence temp dir cleanup", () => {
+  async function vkVoiceDirs(): Promise<string[]> {
+    const entries = await readdir(tmpdir());
+    return entries.filter((e) => e.startsWith("vk-voice-")).sort();
+  }
+
+  it("removes the temp dir when the first ffmpeg extraction fails", async () => {
+    // Regression guard for finding #3: on the first-segment failure `outputs`
+    // is empty, so cleanupAudioSegments can't derive the mkdtemp dir — it must
+    // be removed explicitly or the vk-voice-* dir (and a partial file) leaks.
+    const before = await vkVoiceDirs();
+
+    mockExecFile.mockImplementation(
+      (
+        _bin: string,
+        args: string[],
+        _opts: unknown,
+        cb: (e: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const a = args.join(" ");
+        if (a.includes("format=duration")) {
+          cb(null, "100.0\n", ""); // 100s >> maxMs → will split
+        } else if (a.includes("silencedetect")) {
+          cb(null, "", ""); // no silence → even cuts by maxMs still apply
+        } else {
+          // extraction of the very first segment fails
+          const err = Object.assign(new Error("ffmpeg boom"), { stderr: "boom" });
+          cb(err, "", "boom");
+        }
+      },
+    );
+
+    const result = await splitAudioAtSilence("/tmp/in.ogg", 40_000);
+    expect(result).toEqual([]);
+    expect(await vkVoiceDirs()).toEqual(before); // no leaked vk-voice-* dir
   });
 });
