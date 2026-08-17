@@ -13,6 +13,12 @@ import {
   renderVkMarkdownChunks,
   type VkPreparedFormattedMessage,
 } from "./format.js";
+import {
+  claimTtsParts,
+  discardTtsParts,
+  readTtsPartsManifest,
+  waitForTtsPart,
+} from "./tts-parts.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
@@ -735,6 +741,102 @@ async function uploadVkAudioMessage(params: {
   return String(attachment);
 }
 
+/**
+ * Streams the continuation parts of a long spoken reply as follow-up voice
+ * messages (see `./tts-parts.ts`). Runs detached from the reply operation:
+ * parts are still being synthesized while this waits, and blocking the reply on
+ * that would stall the dispatcher.
+ */
+async function deliverTtsContinuation(params: {
+  vk: VK;
+  peerId: number;
+  to: string;
+  account: ResolvedVkAccount;
+  dir: string;
+  opts: SendVkOptions;
+}): Promise<void> {
+  const manifest = await readTtsPartsManifest(params.dir);
+  if (!manifest) {
+    return;
+  }
+  await logVkVoiceDebug(
+    `tts continuation START dir=${params.dir} parts=${manifest.parts.length} peerId=${params.peerId}`,
+  );
+  const maxMs = getVkAudioMessageMaxMs();
+
+  for (const entry of manifest.parts) {
+    const part = await waitForTtsPart(params.dir, entry.index);
+    if (!part) {
+      await logVkVoiceDebug(`tts continuation SKIP part=${entry.index} (not ready)`);
+      continue;
+    }
+    const file = join(params.dir, part.file);
+    let segments: string[] = [];
+    try {
+      if ((part.durationMs ?? 0) > maxMs) {
+        segments = await splitAudioAtSilence(file, maxMs);
+      }
+    } catch {
+      segments = [];
+    }
+    const sources = segments.length >= 2 ? segments : [file];
+    try {
+      for (let index = 0; index < sources.length; index += 1) {
+        const source = sources[index] as string;
+        const attachment = await uploadVkAudioMessage({
+          vk: params.vk,
+          peerId: params.peerId,
+          source,
+          filename: `voice-part-${String(part.index).padStart(2, "0")}-${index + 1}${
+            source.endsWith(".wav") ? ".wav" : ".ogg"
+          }`,
+        });
+        await sendVkApiMessage({
+          to: params.to,
+          peerId: params.peerId,
+          account: params.account,
+          formatted: { text: "" },
+          attachment,
+          opts: {
+            ...params.opts,
+            replyTo: undefined,
+            buttons: undefined,
+            clearKeyboard: undefined,
+          },
+        });
+      }
+      await logVkVoiceDebug(
+        `tts continuation SENT part=${part.index}/${manifest.parts.length} segments=${sources.length}`,
+      );
+    } catch (error) {
+      // One lost part must not swallow the rest of the reply.
+      await logVkVoiceDebug(
+        `tts continuation FAILED part=${part.index}: ${(error as Error).message}`,
+      );
+    } finally {
+      if (segments.length >= 2) {
+        await cleanupAudioSegments(segments);
+      }
+    }
+  }
+
+  await discardTtsParts(params.dir);
+  await logVkVoiceDebug(`tts continuation DONE dir=${params.dir}`);
+}
+
+function startTtsContinuation(params: {
+  vk: VK;
+  peerId: number;
+  to: string;
+  account: ResolvedVkAccount;
+  dir: string;
+  opts: SendVkOptions;
+}): void {
+  void deliverTtsContinuation(params).catch(async (error: unknown) => {
+    await logVkVoiceDebug(`tts continuation ERROR: ${(error as Error).message}`);
+  });
+}
+
 export async function sendAudioMessageVk(
   to: string,
   audioSource: string | Buffer,
@@ -753,12 +855,14 @@ export async function sendAudioMessageVk(
 
   // ── Attempt silence-based split for over-limit local audio ────────────────
   const local = await materializeLocalAudioFile(audioSource, title);
+  // Head duration doubles as the key that claims this reply's continuation parts.
+  let headDurationMs: number | null = null;
   if (local) {
     const maxMs = getVkAudioMessageMaxMs();
     let segments: string[] = [];
     try {
-      const durationMs = await probeAudioDurationMs(local.path);
-      if (durationMs !== null && durationMs > maxMs) {
+      headDurationMs = await probeAudioDurationMs(local.path);
+      if (headDurationMs !== null && headDurationMs > maxMs) {
         segments = await splitAudioAtSilence(local.path, maxMs);
       }
     } catch {
@@ -767,7 +871,7 @@ export async function sendAudioMessageVk(
 
     if (segments.length >= 2) {
       try {
-        return await sendVkAudioSegments({
+        const result = await sendVkAudioSegments({
           to: normalizedTo,
           peerId,
           account,
@@ -778,6 +882,11 @@ export async function sendAudioMessageVk(
           tailChunks,
           opts,
         });
+        const partsDir = await claimTtsParts(headDurationMs);
+        if (partsDir) {
+          startTtsContinuation({ vk, peerId, to: normalizedTo, account, dir: partsDir, opts });
+        }
+        return result;
       } finally {
         await cleanupAudioSegments(segments);
         await local.cleanup();
@@ -806,6 +915,11 @@ export async function sendAudioMessageVk(
       clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
     },
   });
+
+  const partsDir = await claimTtsParts(headDurationMs);
+  if (partsDir) {
+    startTtsContinuation({ vk, peerId, to: normalizedTo, account, dir: partsDir, opts });
+  }
 
   if (tailChunks.length === 0) {
     return firstResult;

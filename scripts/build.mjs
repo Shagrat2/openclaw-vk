@@ -24,6 +24,7 @@ const entryPoints = [
   "src/send.ts",
   "src/setup-core.ts",
   "src/setup-surface.ts",
+  "src/tts-parts.ts",
   "src/types.ts",
 ];
 
