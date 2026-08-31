@@ -20,6 +20,7 @@ const entryPoints = [
   "src/reactions-controller.ts",
   "src/runtime.ts",
   "src/sanitize.ts",
+  "src/sdk-compat.ts",
   "src/send-support.ts",
   "src/send.ts",
   "src/setup-core.ts",

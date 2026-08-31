@@ -1,15 +1,14 @@
-import type { StreamingCompatEntry } from "./sdk-compat.js";
+import {
+  issuePairingChallengeCompat,
+  loadChannelMessageBits,
+  type StreamingCompatEntry,
+} from "./sdk-compat.js";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
 import {
   readStoreAllowFromForDmPolicy,
   resolveEffectiveAllowFromLists,
 } from "openclaw/plugin-sdk/channel-policy";
-import {
-  createReplyPrefixOptions,
-  createTypingCallbacks,
-} from "openclaw/plugin-sdk/channel-message";
-import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
 import {
   resolveAllowlistProviderRuntimeGroupPolicy,
@@ -124,6 +123,10 @@ export async function handleVkInbound(params: {
 }): Promise<void> {
   const { message, account, config, runtime, statusSink } = params;
   const core = getVkRuntime();
+  // Значения тянем через компат-слой: ядро переносит эти символы между
+  // версиями SDK, и статический импорт молча ломает загрузку плагина целиком.
+  const { createReplyPrefixOptions, createTypingCallbacks, logTypingFailure } =
+    await loadChannelMessageBits();
   const pairing = createChannelPairingController({
     core,
     channel: CHANNEL_ID,
@@ -224,9 +227,13 @@ export async function handleVkInbound(params: {
       if (!dmAllowed.allowed) {
         if (dmPolicy === "pairing") {
           // 8.1 убрала issuePairingChallenge из публичного SDK: тот же вызов
-          // теперь делается через контроллер, который сам подставляет
-          // channel/accountId/upsertPairingRequest.
-          await pairing.issueChallenge({
+          // теперь идёт через контроллер. На старом ядре контроллер метода не
+          // имеет — компат-слой откатывается на прямой вызов.
+          await issuePairingChallengeCompat({
+            controller: pairing,
+            channel: CHANNEL_ID,
+            upsertPairingRequest: pairing.upsertPairingRequest,
+            challenge: {
             senderId: senderDisplay,
             senderIdLine: `Your VK user id: ${senderDisplay}`,
             meta: {},
@@ -241,6 +248,7 @@ export async function handleVkInbound(params: {
             },
             onReplyError: (err) => {
               runtime.error?.(`vk: pairing reply failed for ${senderDisplay}: ${String(err)}`);
+            },
             },
           });
         }

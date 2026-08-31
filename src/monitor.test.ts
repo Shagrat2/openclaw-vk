@@ -28,6 +28,7 @@ import {
   combineVkInboundMessages,
   monitorVkProvider,
   readPollingCursor,
+  resolveSerializeInbound,
 } from "./monitor.js";
 import { VK } from "vk-io";
 import { setVkRuntime } from "./runtime.js";
@@ -83,6 +84,9 @@ vi.mock("./inbound.js", () => ({ handleVkInbound: mockHandleVkInbound }));
 
 const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
 vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
+
+const mockCoreAtLeast = vi.hoisted(() => vi.fn(() => true));
+vi.mock("./sdk-compat.js", () => ({ coreAtLeast: mockCoreAtLeast }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -683,5 +687,32 @@ describe("monitorVkProvider — watchdog liveness policy", () => {
     expect(mockUpdatesStop).toHaveBeenCalled();
     controller.abort();
     await promise;
+  });
+});
+
+describe("resolveSerializeInbound", () => {
+  afterEach(() => {
+    delete process.env.VK_SERIALIZE_INBOUND;
+    mockCoreAtLeast.mockReturnValue(true);
+  });
+
+  it("на свежем ядре не сериализует: дедлок mirror-transcript исправлен нативно", () => {
+    mockCoreAtLeast.mockReturnValue(true);
+    expect(resolveSerializeInbound()).toBe(false);
+  });
+
+  it("на старом ядре включает сериализацию сама — обход там ещё нужен", () => {
+    mockCoreAtLeast.mockReturnValue(false);
+    expect(resolveSerializeInbound()).toBe(true);
+  });
+
+  it("явный флаг перебивает автоопределение в обе стороны", () => {
+    mockCoreAtLeast.mockReturnValue(true);
+    process.env.VK_SERIALIZE_INBOUND = "true";
+    expect(resolveSerializeInbound()).toBe(true);
+
+    mockCoreAtLeast.mockReturnValue(false);
+    process.env.VK_SERIALIZE_INBOUND = "false";
+    expect(resolveSerializeInbound()).toBe(false);
   });
 });

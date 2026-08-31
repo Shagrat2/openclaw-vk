@@ -7,6 +7,7 @@ import {
   resolveVkInboundReplyContext,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
+import { coreAtLeast } from "./sdk-compat.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -79,6 +80,28 @@ const WATCHDOG_INTERVAL_MS = envInt("VK_LP_WATCHDOG_INTERVAL_MS", 30_000);
 // idle channel, so cursor staleness alone must never trigger a restart.)
 const IDLE_BEFORE_PROBE_MS = envInt("VK_LP_IDLE_PROBE_MS", 90_000);
 const PROBE_FAIL_LIMIT = envInt("VK_LP_PROBE_FAIL_LIMIT", 3);
+/**
+ * Нужна ли per-peer сериализация входящих.
+ *
+ * Это был обход дедлока ядра при втором сообщении в диалоге; ядро чинит его
+ * нативно с 2026.7.1 (fire-and-forget mirror, PR #99549), поэтому на свежем
+ * ядре включать её незачем — она стоит параллелизма. На старом ядре она нужна.
+ * Явный override: VK_SERIALIZE_INBOUND=true|false.
+ */
+export function resolveSerializeInbound(): boolean {
+  const flag = process.env.VK_SERIALIZE_INBOUND;
+  if (flag === "true") {
+    return true;
+  }
+  if (flag === "false") {
+    return false;
+  }
+  return !coreAtLeast(CORE_VERSION_WITH_MIRROR_FIX);
+}
+
+/** Ядро, начиная с которого дедлок mirror-transcript исправлен нативно. */
+const CORE_VERSION_WITH_MIRROR_FIX = "2026.7.1";
+
 // Inbound debounce window (opt-in, default OFF). When > 0, same-conversation
 // messages arriving within this window are buffered and flushed as one combined
 // inbound (coalesced reply). 0 = no batching, just per-peer serialization — the
@@ -205,7 +228,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       // to force serialization back on if the separate session-init conflict
       // (#98562) resurfaces on a concurrent second message.
       // See doc/interrupt-restart-session-lock-hang.md.
-      serializeImmediate: process.env.VK_SERIALIZE_INBOUND === "true",
+      serializeImmediate: resolveSerializeInbound(),
       buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
       // Only merge plain-text messages; ones carrying attachments or a payload
       // flush on their own (immediately) but are still serialized per peer.

@@ -132,13 +132,29 @@ const mockCreateReplyPrefixOptions = vi.hoisted(() => vi.fn());
 const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
-vi.mock("openclaw/plugin-sdk/channel-message", () => ({
-  createReplyPrefixOptions: mockCreateReplyPrefixOptions,
-  createTypingCallbacks: mockCreateTypingCallbacks,
-}));
-
-vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
-  logTypingFailure: mockLogTypingFailure,
+// Мокаем компат-слой, а не конкретные пути SDK: он на то и заведён, чтобы
+// прятать переезды символов между версиями ядра, а в тестовой среде пакета
+// openclaw нет вовсе, и динамический импорт резолвиться не может.
+vi.mock("./sdk-compat.js", () => ({
+  loadChannelMessageBits: async () => ({
+    createReplyPrefixOptions: mockCreateReplyPrefixOptions,
+    createTypingCallbacks: mockCreateTypingCallbacks,
+    logTypingFailure: mockLogTypingFailure,
+  }),
+  issuePairingChallengeCompat: async ({
+    channel,
+    upsertPairingRequest,
+    challenge,
+  }: Record<string, any>) => {
+    const result = await upsertPairingRequest({ channel, id: challenge.senderId });
+    if (result.created && challenge.sendPairingReply) {
+      try {
+        await challenge.sendPairingReply("pairing-reply-text");
+      } catch (err) {
+        challenge.onReplyError?.(err);
+      }
+    }
+  },
 }));
 
 // Step-progress: default mode "off" keeps the existing (reactions/plain) paths;
