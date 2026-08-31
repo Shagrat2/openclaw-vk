@@ -1,8 +1,7 @@
+import type { ChannelProgressDraftMode, StreamingCompatEntry } from "./sdk-compat.js";
 import {
   createChannelProgressDraftCompositor,
   type ChannelProgressDraftCompositor,
-  type ChannelProgressDraftMode,
-  type StreamingCompatEntry,
 } from "openclaw/plugin-sdk/channel-message";
 import { deleteMessageVk, editMessageVk, sendMessageVk } from "./send.js";
 import type { CoreConfig, ResolvedVkAccount } from "./types.js";

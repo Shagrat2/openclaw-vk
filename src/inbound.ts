@@ -1,5 +1,5 @@
+import type { StreamingCompatEntry } from "./sdk-compat.js";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
-import { issuePairingChallenge } from "openclaw/plugin-sdk/conversation-runtime";
 import { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
 import {
   readStoreAllowFromForDmPolicy,
@@ -8,8 +8,8 @@ import {
 import {
   createReplyPrefixOptions,
   createTypingCallbacks,
-  logTypingFailure,
-} from "openclaw/plugin-sdk/channel-runtime";
+} from "openclaw/plugin-sdk/channel-message";
+import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
 import {
   resolveAllowlistProviderRuntimeGroupPolicy,
@@ -45,7 +45,6 @@ import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedb
 import {
   buildChannelProgressDraftLineForEntry,
   resolveChannelPreviewStreamMode,
-  type StreamingCompatEntry,
 } from "openclaw/plugin-sdk/channel-message";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
@@ -224,12 +223,13 @@ export async function handleVkInbound(params: {
       });
       if (!dmAllowed.allowed) {
         if (dmPolicy === "pairing") {
-          await issuePairingChallenge({
-            channel: CHANNEL_ID,
+          // 8.1 убрала issuePairingChallenge из публичного SDK: тот же вызов
+          // теперь делается через контроллер, который сам подставляет
+          // channel/accountId/upsertPairingRequest.
+          await pairing.issueChallenge({
             senderId: senderDisplay,
             senderIdLine: `Your VK user id: ${senderDisplay}`,
             meta: {},
-            upsertPairingRequest: pairing.upsertPairingRequest,
             sendPairingReply: async (text) => {
               await deliverVkReply({
                 payload: { text },

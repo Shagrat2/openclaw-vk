@@ -132,9 +132,12 @@ const mockCreateReplyPrefixOptions = vi.hoisted(() => vi.fn());
 const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
-vi.mock("openclaw/plugin-sdk/channel-runtime", () => ({
+vi.mock("openclaw/plugin-sdk/channel-message", () => ({
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
+}));
+
+vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
   logTypingFailure: mockLogTypingFailure,
 }));
 
