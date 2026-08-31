@@ -1,6 +1,7 @@
 import {
   issuePairingChallengeCompat,
   loadChannelMessageBits,
+  loadCoreBridge,
   type StreamingCompatEntry,
 } from "./sdk-compat.js";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
@@ -125,8 +126,15 @@ export async function handleVkInbound(params: {
   const core = getVkRuntime();
   // Значения тянем через компат-слой: ядро переносит эти символы между
   // версиями SDK, и статический импорт молча ломает загрузку плагина целиком.
+  if (process.env.VK_INBOUND_TRACE === "1") {
+    runtime.log?.("vk: handleVkInbound entered, loading sdk bits");
+  }
   const { createReplyPrefixOptions, createTypingCallbacks, logTypingFailure } =
     await loadChannelMessageBits();
+  const bridge = await loadCoreBridge(core);
+  if (process.env.VK_INBOUND_TRACE === "1") {
+    runtime.log?.("vk: sdk bits loaded");
+  }
   const pairing = createChannelPairingController({
     core,
     channel: CHANNEL_ID,
@@ -272,7 +280,7 @@ export async function handleVkInbound(params: {
     allowFrom: isGroup ? effectiveGroupSenderAllowFrom : effectiveAllowFrom,
     senderId: message.senderId,
   }).allowed;
-  const hasControlCommand = core.channel.text.hasControlCommand(rawBody, config as OpenClawConfig);
+  const hasControlCommand = bridge.hasControlCommand(rawBody, config as OpenClawConfig);
   const commandGate = resolveControlCommandGate({
     useAccessGroups,
     authorizers: [
@@ -305,6 +313,10 @@ export async function handleVkInbound(params: {
     return;
   }
 
+  if (process.env.VK_INBOUND_TRACE === "1") {
+    runtime.log?.(`vk: inbound passed gates, routing peer=${message.peerId}`);
+  }
+
   // Build route and dispatch
   const peerId = String(message.peerId);
   const route = core.channel.routing.resolveAgentRoute({
@@ -318,18 +330,18 @@ export async function handleVkInbound(params: {
   });
 
   const fromLabel = isGroup ? `vk:chat:${message.peerId}` : `vk:${message.senderId}`;
-  const storePath = core.channel.session.resolveStorePath(
+  const storePath = bridge.resolveStorePath(
     (config as Record<string, Record<string, unknown>>).session?.store as string | undefined,
     {
       agentId: route.agentId,
     },
   );
-  const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(config as OpenClawConfig);
-  const previousTimestamp = core.channel.session.readSessionUpdatedAt({
+  const envelopeOptions = bridge.resolveEnvelopeFormatOptions(config as OpenClawConfig);
+  const previousTimestamp = bridge.readSessionUpdatedAt({
     storePath,
     sessionKey: route.sessionKey,
   });
-  const body = core.channel.reply.formatAgentEnvelope({
+  const body = bridge.formatAgentEnvelope({
     channel: "VK",
     from: fromLabel,
     timestamp: message.timestamp,
@@ -352,7 +364,7 @@ export async function handleVkInbound(params: {
   const mediaTypes =
     mediaPaths.length > 0 ? downloadedMediaTypes : resolveVkInboundMediaTypes(message.attachments);
 
-  const ctxPayload = core.channel.reply.finalizeInboundContext({
+  const ctxPayload = bridge.finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
     RawBody: visibleBody || rawBody,
@@ -417,7 +429,7 @@ export async function handleVkInbound(params: {
     accountId: account.accountId,
   });
 
-  await core.channel.session.recordInboundSession({
+  await bridge.recordInboundSession({
     storePath,
     ctx: ctxPayload,
     sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
@@ -523,7 +535,10 @@ export async function handleVkInbound(params: {
   // setReaction churn after the turn is done.
   let turnSettled = false;
   try {
-    await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    if (process.env.VK_INBOUND_TRACE === "1") {
+      runtime.log?.(`vk: dispatching to core peer=${message.peerId}`);
+    }
+    await bridge.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config as OpenClawConfig,
       dispatcherOptions: {

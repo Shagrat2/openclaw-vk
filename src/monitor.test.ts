@@ -86,7 +86,22 @@ const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
 vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
 
 const mockCoreAtLeast = vi.hoisted(() => vi.fn(() => true));
-vi.mock("./sdk-compat.js", () => ({ coreAtLeast: mockCoreAtLeast }));
+vi.mock("./sdk-compat.js", () => ({
+  coreAtLeast: mockCoreAtLeast,
+  loadCoreBridge: async (core: any) => ({
+    loadConfig: () => core.config.loadConfig(),
+    resolveStorePath: (...a: any[]) => core.channel.session.resolveStorePath(...a),
+    readSessionUpdatedAt: (...a: any[]) => core.channel.session.readSessionUpdatedAt(...a),
+    recordInboundSession: (...a: any[]) => core.channel.session.recordInboundSession(...a),
+    dispatchReplyWithBufferedBlockDispatcher: (...a: any[]) =>
+      core.channel.reply.dispatchReplyWithBufferedBlockDispatcher(...a),
+    finalizeInboundContext: (...a: any[]) => core.channel.reply.finalizeInboundContext(...a),
+    formatAgentEnvelope: (...a: any[]) => core.channel.reply.formatAgentEnvelope(...a),
+    resolveEnvelopeFormatOptions: (...a: any[]) =>
+      core.channel.reply.resolveEnvelopeFormatOptions(...a),
+    hasControlCommand: (...a: any[]) => core.channel.text.hasControlCommand(...a),
+  }),
+}));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

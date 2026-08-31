@@ -136,6 +136,19 @@ const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 // прятать переезды символов между версиями ядра, а в тестовой среде пакета
 // openclaw нет вовсе, и динамический импорт резолвиться не может.
 vi.mock("./sdk-compat.js", () => ({
+  loadCoreBridge: async (core: any) => ({
+    loadConfig: () => core.config.loadConfig(),
+    resolveStorePath: (...a: any[]) => core.channel.session.resolveStorePath(...a),
+    readSessionUpdatedAt: (...a: any[]) => core.channel.session.readSessionUpdatedAt(...a),
+    recordInboundSession: (...a: any[]) => core.channel.session.recordInboundSession(...a),
+    dispatchReplyWithBufferedBlockDispatcher: (...a: any[]) =>
+      core.channel.reply.dispatchReplyWithBufferedBlockDispatcher(...a),
+    finalizeInboundContext: (...a: any[]) => core.channel.reply.finalizeInboundContext(...a),
+    formatAgentEnvelope: (...a: any[]) => core.channel.reply.formatAgentEnvelope(...a),
+    resolveEnvelopeFormatOptions: (...a: any[]) =>
+      core.channel.reply.resolveEnvelopeFormatOptions(...a),
+    hasControlCommand: (...a: any[]) => core.channel.text.hasControlCommand(...a),
+  }),
   loadChannelMessageBits: async () => ({
     createReplyPrefixOptions: mockCreateReplyPrefixOptions,
     createTypingCallbacks: mockCreateTypingCallbacks,

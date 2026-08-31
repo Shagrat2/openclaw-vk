@@ -7,7 +7,7 @@ import {
   resolveVkInboundReplyContext,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
-import { coreAtLeast } from "./sdk-compat.js";
+import { coreAtLeast, loadCoreBridge } from "./sdk-compat.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -236,16 +236,47 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         msg.text.length > 0 &&
         (msg.attachments?.length ?? 0) === 0 &&
         msg.messagePayload === undefined,
-      onFlush: async (items) => {
+      // ⚠️ Контракт onFlush менялся: ядро ≥2026.8.1 передаёт вторым аргументом
+      // фабрику и ждёт назад { admission, completion } — «полоса» освобождается
+      // на admission, пока completion ещё идёт. Старое ядро ждало обычный
+      // промис. Если вернуть промис новому ядру, оно падает на flush.admission,
+      // и сообщение теряется МОЛЧА: канал показывает приём, обработчик не
+      // зовётся, в логе ни строки (31.08 так «умер» VK после апдейта).
+      onFlush: ((items: VkInboundMessage[], createFlush?: unknown) => {
+        if (process.env.VK_INBOUND_TRACE === "1") {
+          opts.runtime.log?.(
+            `vk: flush called items=${items.length} createFlush=${typeof createFlush}`,
+          );
+        }
+        const dispatch = async () => {
+          try {
+            return await dispatchInner();
+          } catch (err) {
+            opts.runtime.error?.(
+              `vk: dispatch threw: ${err instanceof Error ? `${err.message} | ${err.stack?.split("\n")[1]?.trim() ?? ""}` : String(err)}`,
+            );
+            throw err;
+          }
+        };
+        const dispatchInner = async () => {
+          if (process.env.VK_INBOUND_TRACE === "1") {
+            opts.runtime.log?.(
+              `vk: dispatch start items=${items.length} stopped=${stopped}`,
+            );
+          }
         if (stopped) {
+          // Тихий выход здесь означал «сообщение исчезло без следа» — логируем.
+          opts.runtime.log?.("vk: dispatch skipped (monitor stopped)");
           return;
         }
         const message = combineVkInboundMessages(items);
         if (!message) {
+          opts.runtime.log?.("vk: dispatch skipped (no message after combine)");
           return;
         }
         try {
-          const currentCfg = core.config.loadConfig() as CoreConfig;
+          const bridge = await loadCoreBridge(core);
+          const currentCfg = bridge.loadConfig() as CoreConfig;
           const currentAccount = resolveVkAccount({
             cfg: currentCfg,
             accountId: account.accountId,
@@ -262,7 +293,15 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             `vk: message handler error for peerId=${message.peerId}: ${errorMessage}`,
           );
         }
-      },
+        };
+        // Новое ядро: отдаём ему пару admission/completion. Старое: обычный промис.
+        if (typeof createFlush === "function") {
+          return (createFlush as (p: { dispatch: () => Promise<void> }) => unknown)({
+            dispatch,
+          });
+        }
+        return dispatch();
+      }) as never,
       onError: (err) => {
         const errorMessage = err instanceof Error ? err.message : String(err);
         opts.runtime.error?.(`vk: inbound debouncer error: ${errorMessage}`);
@@ -281,7 +320,56 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         restartReason = reason;
       };
 
+      // Датчик на ВСЕ апдейты (VK_INBOUND_TRACE=1): показывает, доходят ли до
+      // плагина события вообще. Без него «канал молчит» неотличимо от «VK не
+      // присылает апдейты», а это разные поломки с разным лечением.
+      if (process.env.VK_INBOUND_TRACE === "1") {
+        vk.updates.use(async (context: { type?: string; subTypes?: string[] }, next: () => Promise<void>) => {
+          opts.runtime.log?.(
+            `vk: update type=${context?.type ?? "?"} sub=${(context?.subTypes ?? []).join(",")}`,
+          );
+          await next();
+        });
+      }
+
+      // Самопроверка цепочки (VK_SELFTEST=<peerId>): прогоняем синтетическое
+      // входящее через тот же дебаунсер, что и живые сообщения. Нужна потому,
+      // что поломку приёма нельзя воспроизвести снаружи — сообщение боту может
+      // отправить только человек, а «канал running» ничего не доказывает.
+      const selftestPeer = Number(process.env.VK_SELFTEST ?? "");
+      if (Number.isFinite(selftestPeer) && selftestPeer > 0) {
+        setTimeout(() => {
+          const probe: VkInboundMessage = {
+            // ⚠️ id должен быть валидным int32 И существовать в диалоге: VK
+            // кладёт его в reply_to. Синтетика тут только мешает — берём id из
+            // VK_SELFTEST_MSGID, а без него шлём без ответа-реплая (0).
+            messageId: process.env.VK_SELFTEST_MSGID ?? "0",
+            peerId: selftestPeer,
+            senderId: selftestPeer,
+            text: process.env.VK_SELFTEST_TEXT ?? "селф-тест канала",
+            timestamp: Date.now(),
+            isGroup: false,
+            attachments: [],
+          };
+          opts.runtime.log?.(`vk: selftest enqueue peer=${selftestPeer}`);
+          void inboundDebouncer
+            .enqueue(probe)
+            .then(() => opts.runtime.log?.("vk: selftest enqueued ok"))
+            .catch((err: unknown) =>
+              opts.runtime.error?.(`vk: selftest enqueue failed: ${String(err)}`),
+            );
+        }, 8000);
+      }
+
       vk.updates.on("message_new", async (context) => {
+        // Датчик на самом входе: без него «канал принимает, но не отвечает»
+        // неотличимо от «событие вообще не пришло» — а это разные поломки.
+        // Включается VK_INBOUND_TRACE=1.
+        if (process.env.VK_INBOUND_TRACE === "1") {
+          opts.runtime.log?.(
+            `vk: inbound event id=${context.id} peer=${context.peerId} outbox=${context.isOutbox} len=${(context.text ?? "").length}`,
+          );
+        }
         if (stopped || needRestart) {
           return;
         }

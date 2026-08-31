@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
+import { loadCoreBridge } from "./sdk-compat.js";
 import {
   cleanupAudioSegments,
   getVkAudioMessageMaxMs,
@@ -451,9 +452,11 @@ function recordOutboundActivity(accountId: string): void {
   });
 }
 
-function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: string }) {
+async function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: string }) {
   const runtime = getVkRuntime();
-  const cfg = (params.cfg ?? runtime.config.loadConfig()) as CoreConfig;
+  // 8.1 убрала runtime.config — конфиг берём через мост совместимости.
+  const cfg = (params.cfg ??
+    (await loadCoreBridge(runtime)).loadConfig()) as CoreConfig;
   const account = resolveVkAccount({ cfg, accountId: params.accountId });
   if (!account.token) {
     throw new Error("VK token not configured");
@@ -554,7 +557,7 @@ export async function sendPhotoVk(
   opts: SendVkOptions = {},
   uploadMeta?: { filename?: string; contentType?: string },
 ): Promise<SendVkResult> {
-  const { account, peerId, to: normalizedTo } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: opts.cfg,
     accountId: opts.accountId,
     to,
@@ -608,7 +611,7 @@ export async function sendDocumentVk(
   opts: SendVkOptions = {},
   uploadMeta?: { contentType?: string },
 ): Promise<SendVkResult> {
-  const { account, peerId, to: normalizedTo } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: opts.cfg,
     accountId: opts.accountId,
     to,
@@ -845,7 +848,7 @@ export async function sendAudioMessageVk(
   opts: SendVkOptions = {},
   uploadMeta?: { contentType?: string },
 ): Promise<SendVkResult> {
-  const { account, peerId, to: normalizedTo } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: opts.cfg,
     accountId: opts.accountId,
     to,
@@ -1235,7 +1238,7 @@ async function sendMessageChunksVk(params: {
   chunks: VkPreparedFormattedMessage[];
   opts: SendVkOptions;
 }): Promise<SendVkResult[]> {
-  const { account, peerId, to: normalizedTo } = resolveSendTarget({
+  const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: params.opts.cfg,
     accountId: params.opts.accountId,
     to: params.to,
