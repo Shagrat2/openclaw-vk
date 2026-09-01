@@ -554,6 +554,17 @@ export async function handleVkInbound(params: {
         },
         typingCallbacks,
         deliver: async (payload: unknown, info?: { kind?: string }) => {
+          // Отладка потока доставки (VK_DELIVER_TRACE=1): показывает, какие
+          // куски ядро отдаёт по ходу хода и что приходит финалом. Нужна,
+          // чтобы понять, можно ли показывать рассказ в черновике, а в финале
+          // оставлять только итог.
+          if (process.env.VK_DELIVER_TRACE === "1") {
+            const p = payload as { text?: string; mediaUrl?: string } | null;
+            const t = (p?.text ?? "").replace(/\s+/g, " ");
+            runtime.log?.(
+              `vk: deliver kind=${info?.kind ?? "?"} len=${t.length} media=${Boolean(p?.mediaUrl)} head=${JSON.stringify(t.slice(0, 70))}`,
+            );
+          }
           const normalized =
             payload && typeof payload === "object" && !Array.isArray(payload)
               ? (payload as VkDispatchPayload)
@@ -561,6 +572,37 @@ export async function handleVkInbound(params: {
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
           const isFinal = info?.kind === "final";
           let draftHandled = false;
+
+          // ── Промежуточный блок → в черновик, а не отдельным сообщением ────
+          // С включённым блочным стримингом ядро отдаёт рассказ о работе
+          // кусками (kind=block), а итог — отдельно (kind=final). Раньше
+          // каждый кусок уходил своим сообщением, и в чате росла простыня.
+          // Теперь кусок переписывает черновик: ход виден в одном пузыре и
+          // сменяется по мере работы, а в конце этот же пузырь становится
+          // ответом. Медиа и кнопки идут прежним путём — их в черновик не
+          // положишь.
+          if (
+            progressDraft &&
+            !isFinal &&
+            normalized.text?.trim() &&
+            !normalized.mediaUrl &&
+            !(normalized.mediaUrls?.length ?? 0) &&
+            !resolvedButtons
+          ) {
+            const chunks = renderVkMarkdownChunks(normalized.text);
+            try {
+              await progressDraft.overwrite(chunks[0]?.text ?? normalized.text);
+              if (process.env.VK_INBOUND_TRACE === "1") {
+                runtime.log?.(
+                  `vk: block → draft len=${(chunks[0]?.text ?? "").length}`,
+                );
+              }
+              return;
+            } catch (err) {
+              runtime.log?.(`vk: block → draft failed: ${String(err)}`);
+              // не смогли переписать черновик — пусть уходит обычным путём
+            }
+          }
 
           // ── Edit-in-place finalize (Telegram-style single bubble) ──────────
           // When a step draft is live and the final answer is a plain text reply
