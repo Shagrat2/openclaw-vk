@@ -42,6 +42,7 @@ jobs:
 
       - name: Run release checks
         run: |
+          npm run build
           npm run check:runtime
           git checkout -- package.json
           npm ci
