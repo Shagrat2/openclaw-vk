@@ -38,12 +38,14 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
 
       - name: Install minimum supported OpenClaw
-        run: npm install --no-save --package-lock=false openclaw@2026.8.1
+        run: npm install --save-dev --package-lock=false openclaw@2026.8.1
 
       - name: Run release checks
         run: |
-          npm run check
           npm run check:runtime
+          git checkout -- package.json
+          npm ci
+          npm run check
 
       - name: Validate package is publishable
         run: |
