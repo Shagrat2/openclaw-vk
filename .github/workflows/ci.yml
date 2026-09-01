@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,11 +20,47 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 22.22.3
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Run repository checks
+        run: npm run check
+
+  runtime-compatibility:
+    name: OpenClaw runtime (${{ matrix.openclaw }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        openclaw:
+          - "2026.8.1"
+          - latest
+          - beta
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.22.3
+          cache: npm
+
+      - name: Install plugin dependencies
+        run: npm ci
+
+      - name: Install OpenClaw host
+        run: npm install --no-save --package-lock=false "openclaw@${{ matrix.openclaw }}"
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Resolve SDK imports and load packaged runtime
+        run: npm run check:runtime
