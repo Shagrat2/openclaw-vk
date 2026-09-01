@@ -1643,7 +1643,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     expect(mockSendPayloadVk).toHaveBeenCalled();
   });
 
-  it("keeps media replies as their own message (no edit-into-answer)", async () => {
+  it("editing into the answer also works for media replies (voice follows separately)", async () => {
     mockResolveStreamMode.mockReturnValue("progress");
     mockCurrentMessageId.mockReturnValue(555);
     const runtime = installRuntime();
@@ -1664,7 +1664,15 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       runtime: createVkRuntimeEnv(),
     });
 
-    expect(mockEditMessageVk).not.toHaveBeenCalled();
+    // Черновик с ходом работы переписывается текстом ответа…
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      555,
+      expect.stringContaining("See this"),
+      expect.anything(),
+      expect.anything(),
+    );
+    // …а картинка/голосовое уходит следом отдельным сообщением.
     expect(mockSendPayloadVk).toHaveBeenCalled();
   });
 });

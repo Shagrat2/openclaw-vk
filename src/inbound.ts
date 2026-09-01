@@ -35,6 +35,7 @@ import {
   markMessageReadVk,
   sendPayloadVk,
   sendTypingVk,
+  sendMessageVk,
 } from "./send.js";
 import { renderVkMarkdownChunks } from "./format.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
@@ -572,9 +573,19 @@ export async function handleVkInbound(params: {
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
             const finalText = normalized.text?.trim();
-            if (draftMsgId !== undefined && finalText && !hasMedia && !resolvedButtons) {
+            // Медиа больше не отменяет замену: черновик с ходом работы
+            // переписываем текстом ответа, а голосовые уходят следом
+            // отдельными сообщениями. Раньше любой озвученный ответ шёл мимо
+            // замены — черновик просто удалялся, и ход работы пропадал, а
+            // ответ приходил новым сообщением.
+            if (draftMsgId !== undefined && finalText && !resolvedButtons) {
               const chunks = renderVkMarkdownChunks(normalized.text ?? "");
-              if (chunks.length === 1) {
+              // Раньше замена работала только для ответа в одно сообщение, и
+              // длинный вывод («ход мыслей» + итог) вместо замены оставлял
+              // черновик простынёй, а ответ приходил отдельно. Теперь первым
+              // куском переписываем черновик, остальные дописываем следом —
+              // пузырь один и тот же, хвост идёт продолжением.
+              if (chunks.length >= 1) {
                 progressDraft.compositor.markFinalReplyStarted();
                 let edited = false;
                 try {
@@ -592,8 +603,43 @@ export async function handleVkInbound(params: {
                 progressDraft.close();
                 if (edited) {
                   runtime.log?.(
-                    `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length}`,
+                    `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
+                  // Хвост длинного ответа досылаем обычными сообщениями: VK не
+                  // умеет держать больше ~4096 символов в одном пузыре.
+                  for (const chunk of chunks.slice(1)) {
+                    try {
+                      await sendMessageVk(String(message.peerId), chunk.text, {
+                        accountId: account.accountId,
+                      });
+                    } catch (err) {
+                      runtime.error?.(
+                        `vk: step-progress tail chunk failed: ${String(err)}`,
+                      );
+                    }
+                  }
+                  // Голосовые — последними и без текста: текст уже в
+                  // заменённом черновике, дублировать его подписью незачем.
+                  if (hasMedia) {
+                    const mediaList = normalized.mediaUrls?.length
+                      ? normalized.mediaUrls
+                      : normalized.mediaUrl
+                        ? [normalized.mediaUrl]
+                        : [];
+                    for (const media of mediaList) {
+                      try {
+                        await deliverVkReply({
+                          payload: { ...normalized, text: "", mediaUrl: media, mediaUrls: undefined },
+                          peerId: message.peerId,
+                          accountId: account.accountId,
+                          statusSink,
+                          log: runtime.log,
+                        });
+                      } catch (err) {
+                        runtime.error?.(`vk: step-progress voice tail failed: ${String(err)}`);
+                      }
+                    }
+                  }
                   statusSink?.({ lastOutboundAt: Date.now() });
                   return;
                 }
