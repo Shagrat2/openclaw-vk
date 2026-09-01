@@ -68,10 +68,26 @@ export function createVkProgressDraftCompositor(
   // render can't create a brand-new message after the answer is delivered.
   let closed = false;
 
-  const overwrite = async (text: string): Promise<void> => {
+  // Метка живого черновика (`streaming.progress.label`). Ядро её не
+  // подставляет ни на одном из путей — проверено по трейсу: длина черновика на
+  // шагах инструментов не менялась при заданной метке. Ставим сами и здесь, в
+  // единственной точке записи, чтобы покрыть и шаги, и текстовые куски.
+  // Проверка startsWith защищает от дубля, если метка уже добавлена выше.
+  const resolveProgressLabel = (): string | undefined => {
+    const cfg = params.cfg as
+      | { channels?: { vk?: { streaming?: { progress?: { label?: unknown } } } } }
+      | undefined;
+    const label = cfg?.channels?.vk?.streaming?.progress?.label;
+    return typeof label === "string" && label.trim() ? label.trim() : undefined;
+  };
+
+  const overwrite = async (rawText: string): Promise<void> => {
     if (closed) {
       return;
     }
+    const label = resolveProgressLabel();
+    const text =
+      label && !rawText.startsWith(label) ? `${label}\n\n${rawText}` : rawText;
     try {
       if (messageId === undefined) {
         const result = await sendMessageVk(params.to, text, {
