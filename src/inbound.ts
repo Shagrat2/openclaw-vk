@@ -590,11 +590,29 @@ export async function handleVkInbound(params: {
             !resolvedButtons
           ) {
             const chunks = renderVkMarkdownChunks(normalized.text);
+            // Метку черновика (streaming.progress.label) ставит композитор
+            // ядра — но только на своём пути, для шагов инструментов. Текстовый
+            // блок мы кладём в черновик сами, и метка теряется: в чате кусок
+            // рассказа выглядел как готовый ответ. Добавляем её здесь, если
+            // текст ещё не начинается с неё (тогда дубля не будет, даже если
+            // ядро однажды начнёт подставлять метку и на этом пути).
+            const progressLabel = (() => {
+              const raw = (config as Record<string, unknown> | undefined) as
+                | { channels?: { vk?: { streaming?: { progress?: { label?: unknown } } } } }
+                | undefined;
+              const label = raw?.channels?.vk?.streaming?.progress?.label;
+              return typeof label === "string" && label.trim() ? label.trim() : undefined;
+            })();
+            const draftBody = chunks[0]?.text ?? normalized.text;
+            const draftText =
+              progressLabel && !draftBody.startsWith(progressLabel)
+                ? `${progressLabel}\n\n${draftBody}`
+                : draftBody;
             try {
-              await progressDraft.overwrite(chunks[0]?.text ?? normalized.text);
+              await progressDraft.overwrite(draftText);
               if (process.env.VK_INBOUND_TRACE === "1") {
                 runtime.log?.(
-                  `vk: block → draft len=${(chunks[0]?.text ?? "").length}`,
+                  `vk: block → draft len=${draftText.length} label=${Boolean(progressLabel)}`,
                 );
               }
               return;
