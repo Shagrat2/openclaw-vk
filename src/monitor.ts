@@ -1,6 +1,7 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk";
 import { VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
+import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
 import { handleVkInbound } from "./inbound.js";
 import {
   extractVkInboundAttachments,
@@ -243,11 +244,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       // и сообщение теряется МОЛЧА: канал показывает приём, обработчик не
       // зовётся, в логе ни строки (31.08 так «умер» VK после апдейта).
       onFlush: ((items: VkInboundMessage[], createFlush?: unknown) => {
-        if (process.env.VK_INBOUND_TRACE === "1") {
-          opts.runtime.log?.(
-            `vk: flush called items=${items.length} createFlush=${typeof createFlush}`,
-          );
-        }
+        vkDiag("inbound flush", { items: items.length, createFlush: typeof createFlush });
         const dispatch = async () => {
           try {
             return await dispatchInner();
@@ -259,11 +256,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           }
         };
         const dispatchInner = async () => {
-          if (process.env.VK_INBOUND_TRACE === "1") {
-            opts.runtime.log?.(
-              `vk: dispatch start items=${items.length} stopped=${stopped}`,
-            );
-          }
+          vkDiag("inbound dispatch start", { items: items.length, stopped });
         if (stopped) {
           // Тихий выход здесь означал «сообщение исчезло без следа» — логируем.
           opts.runtime.log?.("vk: dispatch skipped (monitor stopped)");
@@ -290,7 +283,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);
           opts.runtime.error?.(
-            `vk: message handler error for peerId=${message.peerId}: ${errorMessage}`,
+            `vk: message handler error for peerId=${redactVkId(message.peerId)}: ${errorMessage}`,
           );
         }
         };
@@ -320,14 +313,16 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         restartReason = reason;
       };
 
-      // Датчик на ВСЕ апдейты (VK_INBOUND_TRACE=1): показывает, доходят ли до
-      // плагина события вообще. Без него «канал молчит» неотличимо от «VK не
-      // присылает апдейты», а это разные поломки с разным лечением.
-      if (process.env.VK_INBOUND_TRACE === "1") {
+      // Датчик на ВСЕ апдейты: показывает, доходят ли до плагина события
+      // вообще. Без него «канал молчит» неотличимо от «VK не присылает
+      // апдейты», а это разные поломки с разным лечением. Промежуточный слой
+      // ставим только когда диагностика включена — на `off` он не нужен.
+      if (resolveVkDiagLevel() !== "off") {
         vk.updates.use(async (context: { type?: string; subTypes?: string[] }, next: () => Promise<void>) => {
-          opts.runtime.log?.(
-            `vk: update type=${context?.type ?? "?"} sub=${(context?.subTypes ?? []).join(",")}`,
-          );
+          vkDiag("update", {
+            type: context?.type ?? "?",
+            sub: (context?.subTypes ?? []).join(","),
+          });
           await next();
         });
       }
@@ -351,7 +346,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             isGroup: false,
             attachments: [],
           };
-          opts.runtime.log?.(`vk: selftest enqueue peer=${selftestPeer}`);
+          opts.runtime.log?.(`vk: selftest enqueue peer=${redactVkId(selftestPeer)}`);
           void inboundDebouncer
             .enqueue(probe)
             .then(() => opts.runtime.log?.("vk: selftest enqueued ok"))
@@ -364,12 +359,12 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       vk.updates.on("message_new", async (context) => {
         // Датчик на самом входе: без него «канал принимает, но не отвечает»
         // неотличимо от «событие вообще не пришло» — а это разные поломки.
-        // Включается VK_INBOUND_TRACE=1.
-        if (process.env.VK_INBOUND_TRACE === "1") {
-          opts.runtime.log?.(
-            `vk: inbound event id=${context.id} peer=${context.peerId} outbox=${context.isOutbox} len=${(context.text ?? "").length}`,
-          );
-        }
+        vkDiag("inbound event", {
+          id: context.id,
+          peerId: context.peerId,
+          outbox: context.isOutbox,
+          len: (context.text ?? "").length,
+        });
         if (stopped || needRestart) {
           return;
         }
@@ -421,7 +416,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);
           opts.runtime.error?.(
-            `vk: inbound enqueue error for peerId=${peerId}: ${errorMessage}`,
+            `vk: inbound enqueue error for peerId=${redactVkId(peerId)}: ${errorMessage}`,
           );
         }
       });

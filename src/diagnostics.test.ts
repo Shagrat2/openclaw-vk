@@ -27,9 +27,8 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactSensitiveText: (text: string) => text.replace(/vk1\.a\.\S+/g, "[REDACTED]"),
 }));
 
-const { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } = await import(
-  "./diagnostics.js"
-);
+const { describeVkSourceKind, redactVkId, resolveVkDiagLevel, vkDiag, vkDiagFailure } =
+  await import("./diagnostics.js");
 
 function lastFields(spy: typeof mockLogger.info): Record<string, unknown> {
   const [, fields] = spy.mock.calls.at(-1) ?? [];
@@ -140,6 +139,16 @@ describe("VK diagnostics levels", () => {
     process.env.VK_DIAG_LEVEL = "full";
     expect(() => vkDiag("send media", { textLen: 1 })).not.toThrow();
     expect(() => vkDiagFailure("vk upload failed", new Error("boom"))).not.toThrow();
+  });
+
+  it("hides identifiers in plain operational log lines too", () => {
+    // Не всё в плагине идёт через vkDiag: «сообщение отброшено политикой» —
+    // рабочее предупреждение, оно видно всегда, но peer id в нём печатать нельзя.
+    process.env.VK_DIAG_LEVEL = "redacted";
+    expect(redactVkId(12324712)).not.toContain("12324712");
+    expect(redactVkId(undefined)).toBe("-");
+    process.env.VK_DIAG_LEVEL = "full";
+    expect(redactVkId(12324712)).toBe("12324712");
   });
 
   it("names the kind of source without naming the source", () => {

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
-import { vkDiag, vkDiagFailure } from "./diagnostics.js";
+import { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } from "./diagnostics.js";
 import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
 import { loadCoreBridge } from "./sdk-compat.js";
 import {
@@ -268,7 +268,35 @@ function retryDelayMs(attempt: number): number {
  * Загрузка вложения: очередь на время передачи, ретрай на транзиентных отказах
  * и единая диагностика. Вызывающему коду остаётся сказать, что он грузит.
  */
-function runMediaUpload<T>(params: {
+/**
+ * Размер локального файла для лога. Ревьюер числит число байт среди безопасных
+ * полей, но у нас он считался только для буферов — у файла на диске в логе была
+ * дыра ровно там, где по нему отличают «пустой рендер» от «целого».
+ *
+ * Дисковый вызов делаем только при включённой диагностике и один раз на
+ * загрузку, а не на попытку: на выключенной путь отправки не должен платить
+ * ничего.
+ */
+async function localSourceSize(source: string | Buffer): Promise<number | undefined> {
+  if (Buffer.isBuffer(source)) {
+    return source.byteLength;
+  }
+  if (resolveVkDiagLevel() === "off" || describeVkSourceKind(source) !== "local") {
+    return undefined;
+  }
+  try {
+    const [{ stat }, { fileURLToPath }] = await Promise.all([
+      import("node:fs/promises"),
+      import("node:url"),
+    ]);
+    const path = source.startsWith("file://") ? fileURLToPath(source) : source;
+    return (await stat(path)).size;
+  } catch {
+    return undefined;
+  }
+}
+
+async function runMediaUpload<T>(params: {
   kind: MediaUploadKind;
   source: string | Buffer;
   mime?: string;
@@ -281,9 +309,9 @@ function runMediaUpload<T>(params: {
     maxAttempts?: number;
   };
 }): Promise<T> {
-  const bytes = Buffer.isBuffer(params.source) ? params.source.byteLength : undefined;
+  const bytes = await localSourceSize(params.source);
   let attempt = 0;
-  return withVkRetry(
+  return await withVkRetry(
     async () => {
       attempt += 1;
       try {

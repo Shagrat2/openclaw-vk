@@ -18,6 +18,7 @@ import {
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/config-runtime";
 import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
+import { redactVkId, vkDiag } from "./diagnostics.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
   resolveVkInboundBodyText,
@@ -110,7 +111,7 @@ async function deliverVkReply(params: {
     // is restarted by hand. Clear the client cache so the next send recreates a
     // fresh client — auto-recovery instead of a manual restart.
     params.log?.(
-      `vk: reply delivery produced no result for peer=${params.peerId}; clearing VK client cache to recover`,
+      `vk: reply delivery produced no result for peer=${redactVkId(params.peerId)}; clearing VK client cache to recover`,
     );
     clearVkInstances();
     return;
@@ -129,15 +130,11 @@ export async function handleVkInbound(params: {
   const core = getVkRuntime();
   // Значения тянем через компат-слой: ядро переносит эти символы между
   // версиями SDK, и статический импорт молча ломает загрузку плагина целиком.
-  if (process.env.VK_INBOUND_TRACE === "1") {
-    runtime.log?.("vk: handleVkInbound entered, loading sdk bits");
-  }
+  vkDiag("inbound entered");
   const { createReplyPrefixOptions, createTypingCallbacks, logTypingFailure } =
     await loadChannelMessageBits();
   const bridge = await loadCoreBridge(core);
-  if (process.env.VK_INBOUND_TRACE === "1") {
-    runtime.log?.("vk: sdk bits loaded");
-  }
+  vkDiag("inbound sdk bits loaded");
   const pairing = createChannelPairingController({
     core,
     channel: CHANNEL_ID,
@@ -204,11 +201,11 @@ export async function handleVkInbound(params: {
   // Group access check
   if (isGroup) {
     if (groupConfig?.enabled === false) {
-      runtime.log?.(`vk: drop group peerId=${message.peerId} (group disabled by config)`);
+      runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (group disabled by config)`);
       return;
     }
     if (groupPolicy === "disabled") {
-      runtime.log?.(`vk: drop group peerId=${message.peerId} (groupPolicy=${groupPolicy})`);
+      runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (groupPolicy=${groupPolicy})`);
       return;
     }
   }
@@ -312,13 +309,11 @@ export async function handleVkInbound(params: {
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
   if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
-    runtime.log?.(`vk: drop group peerId=${message.peerId} (mention required)`);
+    runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (mention required)`);
     return;
   }
 
-  if (process.env.VK_INBOUND_TRACE === "1") {
-    runtime.log?.(`vk: inbound passed gates, routing peer=${message.peerId}`);
-  }
+  vkDiag("inbound passed gates", { peerId: message.peerId });
 
   // Build route and dispatch
   const peerId = String(message.peerId);
@@ -445,7 +440,7 @@ export async function handleVkInbound(params: {
     await markMessageReadVk(String(message.peerId), message.messageId, account);
   } catch (err) {
     runtime.log?.(
-      `vk: mark read failed for peerId=${message.peerId} messageId=${message.messageId}: ${String(err)}`,
+      `vk: mark read failed for peerId=${redactVkId(message.peerId)} messageId=${redactVkId(message.messageId)}: ${String(err)}`,
     );
   }
 
@@ -498,7 +493,9 @@ export async function handleVkInbound(params: {
       emojiOverrides: statusReactionsCfg?.emojis,
       timing: statusReactionsCfg?.timing,
       onError: (err) => {
-        runtime.log?.(`vk: status-reaction error for cmid=${message.conversationMessageId}: ${String(err)}`);
+        runtime.log?.(
+          `vk: status-reaction error for cmid=${redactVkId(message.conversationMessageId)}: ${String(err)}`,
+        );
       },
     });
     void statusReactions.setQueued();
@@ -538,9 +535,7 @@ export async function handleVkInbound(params: {
   // setReaction churn after the turn is done.
   let turnSettled = false;
   try {
-    if (process.env.VK_INBOUND_TRACE === "1") {
-      runtime.log?.(`vk: dispatching to core peer=${message.peerId}`);
-    }
+    vkDiag("inbound dispatching to core", { peerId: message.peerId });
     await bridge.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config as OpenClawConfig,
@@ -556,16 +551,20 @@ export async function handleVkInbound(params: {
         },
         typingCallbacks,
         deliver: async (payload: unknown, info?: { kind?: string }) => {
-          // Отладка потока доставки (VK_DELIVER_TRACE=1): показывает, какие
-          // куски ядро отдаёт по ходу хода и что приходит финалом. Нужна,
-          // чтобы понять, можно ли показывать рассказ в черновике, а в финале
-          // оставлять только итог.
-          if (process.env.VK_DELIVER_TRACE === "1") {
+          {
+            // Показывает, какие куски ядро отдаёт по ходу, а что приходит
+            // финалом: без этого не понять, можно ли держать рассказ в
+            // черновике, оставляя в финале только итог.
+            //
+            // Раньше сюда писалась «голова» текста (первые 70 символов) — то
+            // есть содержимое переписки. Для этого вопроса достаточно длины и
+            // наличия медиа; содержимое не печатаем ни на одном уровне.
             const p = payload as { text?: string; mediaUrl?: string } | null;
-            const t = (p?.text ?? "").replace(/\s+/g, " ");
-            runtime.log?.(
-              `vk: deliver kind=${info?.kind ?? "?"} len=${t.length} media=${Boolean(p?.mediaUrl)} head=${JSON.stringify(t.slice(0, 70))}`,
-            );
+            vkDiag("deliver", {
+              kind: info?.kind ?? "?",
+              len: (p?.text ?? "").replace(/\s+/g, " ").length,
+              media: Boolean(p?.mediaUrl),
+            });
           }
           const normalized =
             payload && typeof payload === "object" && !Array.isArray(payload)
@@ -596,11 +595,7 @@ export async function handleVkInbound(params: {
             const draftText = chunks[0]?.text ?? normalized.text;
             try {
               await progressDraft.overwrite(draftText);
-              if (process.env.VK_INBOUND_TRACE === "1") {
-                runtime.log?.(
-                  `vk: block → draft len=${draftText.length}`,
-                );
-              }
+              vkDiag("block into draft", { len: draftText.length });
               return;
             } catch (err) {
               runtime.log?.(`vk: block → draft failed: ${String(err)}`);

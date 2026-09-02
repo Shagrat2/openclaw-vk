@@ -201,6 +201,23 @@ function emit(event: string, fields: Record<string, unknown>, failure: boolean):
   appendVkDiagFile(event, fields);
 }
 
+/**
+ * Идентификатор для строки штатного лога.
+ *
+ * Не всё в плагине проходит через `vkDiag`: часть сообщений — не диагностика,
+ * а рабочие предупреждения («сообщение отброшено политикой», «не удалось
+ * пометить прочитанным»), и они должны быть видны всегда. Печатать в них peer id
+ * сырым нельзя, а выбрасывать — значит потерять возможность связать строки
+ * между собой. Хэшируем так же, как поля диагностики; на `full` оставляем как
+ * есть.
+ */
+export function redactVkId(value: string | number | undefined | null): string {
+  if (value === undefined || value === null || value === "") {
+    return "-";
+  }
+  return resolveVkDiagLevel() === "full" ? String(value) : redactIdentifier(String(value));
+}
+
 /** Ход дела. Молчит на `off`; поля обезличиваются по уровню. */
 export function vkDiag(event: string, fields: Record<string, unknown> = {}): void {
   const level = resolveVkDiagLevel();
