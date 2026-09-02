@@ -35,6 +35,12 @@ vi.mock("openclaw/plugin-sdk/channel-status", () => ({
   buildTokenChannelStatusSummary: vi.fn().mockReturnValue({}),
 }));
 
+vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  createAccountStatusSink:
+    ({ accountId, setStatus }: { accountId: string; setStatus: (next: unknown) => void }) =>
+    (patch: Record<string, unknown>) => setStatus({ accountId, ...patch }),
+}));
+
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   DEFAULT_ACCOUNT_ID: "default",
 }));
@@ -130,7 +136,7 @@ vi.mock("./probe.js", () => ({ probeVkBot: mockProbeVkBot }));
 
 const mockGetVkRuntime = vi.hoisted(() =>
   vi.fn().mockReturnValue({
-    config: { writeConfigFile: vi.fn() },
+    config: { replaceConfigFile: vi.fn() },
     logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
     channel: {
       text: { chunkMarkdownText: vi.fn((text: string) => [text]) },
@@ -263,13 +269,22 @@ describe("pairing", () => {
     expect(vkPlugin.pairing!.normalizeAllowEntry("111")).toBe("111");
   });
 
-  it("notifyApproval sends message via sendMessageVk", async () => {
-    await vkPlugin.pairing!.notifyApproval({ cfg: {}, id: "42" });
+  it("notifyApproval preserves the approved named account for delivery", async () => {
+    const cfg = {
+      channels: {
+        vk: {
+          token: "default-token",
+          accounts: { sales: { token: "sales-token" } },
+        },
+      },
+    };
+
+    await vkPlugin.pairing!.notifyApproval({ cfg, id: "42", accountId: "sales" });
 
     expect(mockSendMessageVk).toHaveBeenCalledWith(
       "42",
-      expect.stringContaining("approved"),
-      expect.objectContaining({ cfg: {} }),
+      "OpenClaw: your access has been approved.",
+      { cfg, accountId: "sales" },
     );
   });
 
@@ -998,9 +1013,9 @@ describe("outbound", () => {
 describe("gateway", () => {
   describe("logoutAccount", () => {
     it("clears token for default account", async () => {
-      const mockWriteConfigFile = vi.fn();
+      const mockReplaceConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: mockWriteConfigFile },
+        config: { replaceConfigFile: mockReplaceConfigFile },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1016,13 +1031,17 @@ describe("gateway", () => {
       } as never);
 
       expect(result.cleared).toBe(true);
-      expect(mockWriteConfigFile).toHaveBeenCalledOnce();
+      expect(mockReplaceConfigFile).toHaveBeenCalledOnce();
+      expect(mockReplaceConfigFile).toHaveBeenCalledWith({
+        nextConfig: {},
+        afterWrite: { mode: "auto" },
+      });
     });
 
     it("removes named account from accounts section", async () => {
-      const mockWriteConfigFile = vi.fn();
+      const mockReplaceConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: mockWriteConfigFile },
+        config: { replaceConfigFile: mockReplaceConfigFile },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1048,7 +1067,14 @@ describe("gateway", () => {
       } as never);
 
       expect(result.cleared).toBe(true);
-      const writtenCfg = mockWriteConfigFile.mock.calls[0][0] as Record<string, unknown>;
+      expect(mockReplaceConfigFile).toHaveBeenCalledWith({
+        nextConfig: expect.any(Object),
+        afterWrite: { mode: "auto" },
+      });
+      const writtenCfg = mockReplaceConfigFile.mock.calls[0][0].nextConfig as Record<
+        string,
+        unknown
+      >;
       const vk = (writtenCfg.channels as Record<string, Record<string, unknown>>).vk;
       const accounts = vk.accounts as Record<string, unknown>;
       expect(accounts).toEqual({
@@ -1057,9 +1083,9 @@ describe("gateway", () => {
     });
 
     it("removes accounts section when last named account is deleted", async () => {
-      const mockWriteConfigFile = vi.fn();
+      const mockReplaceConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: mockWriteConfigFile },
+        config: { replaceConfigFile: mockReplaceConfigFile },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1081,15 +1107,22 @@ describe("gateway", () => {
         },
       } as never);
 
-      const writtenCfg = mockWriteConfigFile.mock.calls[0][0] as Record<string, unknown>;
+      expect(mockReplaceConfigFile).toHaveBeenCalledWith({
+        nextConfig: expect.any(Object),
+        afterWrite: { mode: "auto" },
+      });
+      const writtenCfg = mockReplaceConfigFile.mock.calls[0][0].nextConfig as Record<
+        string,
+        unknown
+      >;
       const vk = (writtenCfg.channels as Record<string, Record<string, unknown>>).vk;
       expect(vk.accounts).toBeUndefined();
     });
 
     it("preserves other channel sections when removing vk from channels", async () => {
-      const mockWriteConfigFile = vi.fn();
+      const mockReplaceConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: mockWriteConfigFile },
+        config: { replaceConfigFile: mockReplaceConfigFile },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1109,7 +1142,11 @@ describe("gateway", () => {
         },
       } as never);
 
-      const writtenCfg = mockWriteConfigFile.mock.calls[0]?.[0] as {
+      expect(mockReplaceConfigFile).toHaveBeenCalledWith({
+        nextConfig: expect.any(Object),
+        afterWrite: { mode: "auto" },
+      });
+      const writtenCfg = mockReplaceConfigFile.mock.calls[0]?.[0].nextConfig as {
         channels?: Record<string, unknown>;
       };
       expect(writtenCfg.channels).toEqual({
@@ -1118,9 +1155,9 @@ describe("gateway", () => {
     });
 
     it("does not write config when nothing to clear", async () => {
-      const mockWriteConfigFile = vi.fn();
+      const mockReplaceConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: mockWriteConfigFile },
+        config: { replaceConfigFile: mockReplaceConfigFile },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1136,13 +1173,13 @@ describe("gateway", () => {
       } as never);
 
       expect(result.cleared).toBe(false);
-      expect(mockWriteConfigFile).not.toHaveBeenCalled();
+      expect(mockReplaceConfigFile).not.toHaveBeenCalled();
     });
 
     it("removes channels section when VK was the only configured channel", async () => {
-      const mockWriteConfigFile = vi.fn();
+      const mockReplaceConfigFile = vi.fn();
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: mockWriteConfigFile },
+        config: { replaceConfigFile: mockReplaceConfigFile },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1157,13 +1194,20 @@ describe("gateway", () => {
         cfg: { channels: { vk: { token: "tok" } } },
       } as never);
 
-      const writtenCfg = mockWriteConfigFile.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(mockReplaceConfigFile).toHaveBeenCalledWith({
+        nextConfig: {},
+        afterWrite: { mode: "auto" },
+      });
+      const writtenCfg = mockReplaceConfigFile.mock.calls[0]?.[0].nextConfig as Record<
+        string,
+        unknown
+      >;
       expect(writtenCfg.channels).toBeUndefined();
     });
 
     it("reports loggedOut=true when tokenSource is none after clearing", async () => {
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: vi.fn() },
+        config: { replaceConfigFile: vi.fn() },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(false) },
       });
       mockResolveVkAccount.mockReturnValue({
@@ -1184,6 +1228,7 @@ describe("gateway", () => {
 
   describe("startAccount", () => {
     it("calls probeVkBot and monitorVkProvider", async () => {
+      const setStatus = vi.fn();
       const ctx = {
         account: {
           accountId: "default",
@@ -1192,6 +1237,7 @@ describe("gateway", () => {
         cfg: { channels: { vk: { token: "test-token" } } },
         runtime: {},
         abortSignal: undefined,
+        setStatus,
         log: { info: vi.fn(), debug: vi.fn() },
       };
 
@@ -1202,8 +1248,17 @@ describe("gateway", () => {
         expect.objectContaining({
           token: "test-token",
           accountId: "default",
+          setStatus: expect.any(Function),
         }),
       );
+
+      const monitorStatusSink = mockMonitorVkProvider.mock.calls[0][0].setStatus;
+      monitorStatusSink({ lifecycle: "ready", connected: true });
+      expect(setStatus).toHaveBeenCalledWith({
+        accountId: "default",
+        lifecycle: "ready",
+        connected: true,
+      });
     });
 
     it("throws when token is empty", async () => {
@@ -1237,7 +1292,7 @@ describe("gateway", () => {
     it("logs probe failure in verbose mode", async () => {
       mockProbeVkBot.mockRejectedValueOnce(new Error("timeout"));
       mockGetVkRuntime.mockReturnValue({
-        config: { writeConfigFile: vi.fn() },
+        config: { replaceConfigFile: vi.fn() },
         logging: { shouldLogVerbose: vi.fn().mockReturnValue(true) },
         channel: { text: { chunkMarkdownText: vi.fn((text: string) => [text]) } },
       });

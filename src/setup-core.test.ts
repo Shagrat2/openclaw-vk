@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
 
@@ -21,6 +21,16 @@ import {
   patchVkAccountConfig,
   vkSetupAdapter,
 } from "./setup-core.js";
+
+const initialVkToken = process.env.VK_TOKEN;
+
+afterEach(() => {
+  if (initialVkToken === undefined) {
+    delete process.env.VK_TOKEN;
+  } else {
+    process.env.VK_TOKEN = initialVkToken;
+  }
+});
 
 // ── patchVkAccountConfig ─────────────────────────────────────────────────────
 
@@ -236,6 +246,22 @@ describe("vkSetupAdapter", () => {
       expect(err).toBe("VK requires a community access token (or --use-env).");
     });
 
+    it("rejects a whitespace-only token", () => {
+      const err = vkSetupAdapter.validateInput({
+        accountId: "default",
+        input: { token: "   \t" },
+      });
+      expect(err).toBe("VK requires a community access token (or --use-env).");
+    });
+
+    it("rejects a whitespace-only tokenFile", () => {
+      const err = vkSetupAdapter.validateInput({
+        accountId: "default",
+        input: { tokenFile: "  \n " },
+      });
+      expect(err).toBe("VK requires a community access token (or --use-env).");
+    });
+
     it("accepts input with token", () => {
       const err = vkSetupAdapter.validateInput({
         accountId: "default",
@@ -252,7 +278,26 @@ describe("vkSetupAdapter", () => {
       expect(err).toBeNull();
     });
 
-    it("accepts useEnv for default account", () => {
+    it("rejects useEnv when VK_TOKEN is absent", () => {
+      delete process.env.VK_TOKEN;
+      const err = vkSetupAdapter.validateInput({
+        accountId: "default",
+        input: { useEnv: true },
+      });
+      expect(err).toBe("VK_TOKEN is not set or is empty. Set it before using --use-env.");
+    });
+
+    it("rejects useEnv when VK_TOKEN is empty or whitespace", () => {
+      process.env.VK_TOKEN = "   \t";
+      const err = vkSetupAdapter.validateInput({
+        accountId: "default",
+        input: { useEnv: true },
+      });
+      expect(err).toBe("VK_TOKEN is not set or is empty. Set it before using --use-env.");
+    });
+
+    it("accepts useEnv for default account when VK_TOKEN is non-empty", () => {
+      process.env.VK_TOKEN = "env-token";
       const err = vkSetupAdapter.validateInput({
         accountId: "default",
         input: { useEnv: true },

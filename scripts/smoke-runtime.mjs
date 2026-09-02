@@ -6,6 +6,18 @@ const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const sourceRoots = ["api.ts", "index.ts", "setup-entry.ts", "src"];
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
 
+try {
+  import.meta.resolve("openclaw");
+} catch {
+  console.error(
+    "OpenClaw host is not installed. check:runtime needs the optional peer dependency and built output.",
+  );
+  console.error(
+    'Run: npm install --no-save --package-lock=false "openclaw@<version>" && npm run build && npm run check:runtime',
+  );
+  process.exit(1);
+}
+
 async function* walk(path, extensions) {
   const entries = await readdir(path, { withFileTypes: true });
   for (const entry of entries) {

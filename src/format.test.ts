@@ -54,6 +54,69 @@ describe("renderVkMarkdownChunks", () => {
     ]);
   });
 
+  it("keeps complete rendered blocks together when they fit the VK chunk budget", () => {
+    const markdown = "**Alpha bold**\n\nSecond paragraph stays whole.\n\nTail";
+    const chunks = renderVkMarkdownChunks(markdown, { chunkSize: 32 });
+
+    expect(chunks.map((chunk) => chunk.text)).toEqual([
+      "Alpha bold\n\n",
+      "Second paragraph stays whole.\n\n",
+      "Tail",
+    ]);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(
+      "Alpha bold\n\nSecond paragraph stays whole.\n\nTail",
+    );
+    expect(chunks[0]?.formatData?.items).toEqual([
+      { type: "bold", offset: 0, length: "Alpha bold".length },
+    ]);
+    expect(chunks.slice(1).every((chunk) => chunk.formatData === undefined)).toBe(true);
+  });
+
+  it("splits an oversized formatted paragraph at word boundaries and preserves local format offsets", () => {
+    const renderedText = "one two three four five six seven";
+    const chunks = renderVkMarkdownChunks(`**${renderedText}**`, { chunkSize: 12 });
+
+    expect(chunks.map((chunk) => chunk.text)).toEqual([
+      "one two ",
+      "three four ",
+      "five six ",
+      "seven",
+    ]);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(renderedText);
+    for (const chunk of chunks) {
+      expect(chunk.formatData?.items).toEqual([
+        { type: "bold", offset: 0, length: chunk.text.length },
+      ]);
+    }
+  });
+
+  it("counts @ as two VK limit units while retaining text and format ranges", () => {
+    const chunks = renderVkMarkdownChunks("**aaaa@bbbb**", { chunkSize: 9 });
+    const measureVkLength = (text: string): number =>
+      [...text].reduce((total, character) => total + (character === "@" ? 2 : 1), 0);
+
+    expect(chunks.map((chunk) => chunk.text)).toEqual(["aaaa@bbb", "b"]);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe("aaaa@bbbb");
+    expect(chunks.every((chunk) => measureVkLength(chunk.text) <= 9)).toBe(true);
+    expect(chunks.map((chunk) => chunk.formatData?.items)).toEqual([
+      [{ type: "bold", offset: 0, length: 8 }],
+      [{ type: "bold", offset: 0, length: 1 }],
+    ]);
+  });
+
+  it("never splits a surrogate pair at a VK chunk boundary", () => {
+    const chunks = renderVkMarkdownChunks("**1234567😀XYZ**", { chunkSize: 8 });
+
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe("1234567😀XYZ");
+    for (const chunk of chunks) {
+      expect(chunk.text).not.toMatch(/[\uD800-\uDBFF]$/u);
+      expect(chunk.text).not.toMatch(/^[\uDC00-\uDFFF]/u);
+      expect(chunk.formatData?.items).toEqual([
+        { type: "bold", offset: 0, length: chunk.text.length },
+      ]);
+    }
+  });
+
   it("keeps custom pipelines without injecting the default table transform", () => {
     const input = ["## Header", "---", "Body"].join("\n");
     const result = renderSingleVkMarkdownChunk(input, { pipeline: [transformMarkdownHeadingBlock] });

@@ -20,7 +20,11 @@ const channel = "vk" as const;
 
 const VK_SETUP_HELP_LINES = [
   "1) Go to VK community settings > API usage > Access tokens",
-  "2) Create a community access token with message permissions",
+  "2) Create a community access token with all required scopes:",
+  "   - messages: receive and send community messages",
+  "   - manage: use Bots Long Poll API",
+  "   - photos: send images",
+  "   - docs: send files, TTS audio, and voice messages",
   "3) Enable Bots Long Poll API in community settings",
   "4) Grant the bot message sending permissions in the community",
   `Docs: ${formatDocsLink("/channels/vk", "channels/vk")}`,

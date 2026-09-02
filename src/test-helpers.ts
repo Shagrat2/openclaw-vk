@@ -24,8 +24,9 @@ export function makeVkRuntime(opts: {
   return {
     version: "0.0.0",
     config: {
-      loadConfig: vi.fn().mockReturnValue({}),
-      writeConfigFile: vi.fn(),
+      current: vi.fn().mockReturnValue({}),
+      mutateConfigFile: vi.fn(),
+      replaceConfigFile: vi.fn(),
     },
     logging: {
       shouldLogVerbose: vi.fn().mockReturnValue(false),

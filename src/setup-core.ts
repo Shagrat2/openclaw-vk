@@ -93,7 +93,14 @@ export const vkSetupAdapter: ChannelSetupAdapter = {
     if (typedInput.useEnv && accountId !== DEFAULT_ACCOUNT_ID) {
       return "VK_TOKEN can only be used for the default account.";
     }
-    if (!typedInput.useEnv && !typedInput.token && !typedInput.tokenFile) {
+    if (typedInput.useEnv && !process.env.VK_TOKEN?.trim()) {
+      return "VK_TOKEN is not set or is empty. Set it before using --use-env.";
+    }
+    if (
+      !typedInput.useEnv &&
+      !typedInput.token?.trim() &&
+      !typedInput.tokenFile?.trim()
+    ) {
       return "VK requires a community access token (or --use-env).";
     }
     return null;

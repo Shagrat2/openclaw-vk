@@ -39,12 +39,28 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 
 ## Minimal Runtime Smoke Check
 Run from this repo root:
-1. `pnpm test`
-2. `pnpm run check:pack`
+1. `npm ci`
+2. `npm test`
+3. `npm run check:pack`
 
 Expected checkpoints:
 - tests stay green
 - pack output includes `src/media.ts` and all runtime entrypoints
+
+This standalone repository is npm-managed and commits `package-lock.json`. Use
+`npm`, not `pnpm`, for installs and checks here; do not create a second lockfile
+or a `pnpm-workspace.yaml` in this repository.
+
+`npm run check:runtime` is intentionally a host-compatibility check, not a
+standalone post-`npm ci` command. The `openclaw` peer dependency is optional for
+plugin consumers, so install the host version being tested without changing the
+lockfile, build, and then run the smoke check:
+
+```bash
+npm install --no-save --package-lock=false "openclaw@<version>"
+npm run build
+npm run check:runtime
+```
 
 Important:
 - inspecting a sibling OpenClaw checkout can tell you about the bundled VK extension there, not necessarily about this external plugin package. Do not treat that as proof that the package in this repo is valid.
@@ -177,12 +193,14 @@ global.fetch = vi.fn().mockImplementation((_url, opts) => new Promise((_, reject
 - Run with coverage: `npm run test:coverage`
 - Single file: `npx vitest run src/inbound.test.ts`
 - Watch mode: `npm run test:watch`
-- From monorepo root: `pnpm test -- extensions/vk`
+- In an OpenClaw monorepo checkout, follow that checkout's package-manager and
+  extension-test instructions; do not copy its lockfile workflow into this
+  standalone npm package.
 
 ## Deployment Notes
 
 ### General rollout checklist
-- Verify the plugin package locally before publishing: `pnpm test`, `pnpm run check:pack`
+- Verify the plugin package locally before publishing: `npm test`, `npm run check:pack`
 - After install on a target host, verify plugin load state with `openclaw plugins info vk --json`
 - Restart the gateway after rollout and verify the service status/logs from that host's service manager
 
@@ -249,7 +267,7 @@ Error: Cannot find module 'zod'
 - When adding new features, write tests that verify **behavior**, not just wiring. Run `npm run test:coverage` to check for uncovered branches.
 - After writing tests, audit them: would each test fail if the feature it covers was broken? If not, rewrite or remove the test.
 - Re-run these checks after edits:
-  1. `pnpm test` (all tests pass)
-  2. `pnpm run check:pack`
+  1. `npm test` (all tests pass)
+  2. `npm run check:pack`
   3. If releasing: bump `package.json`, push matching `v<version>` tag, and verify the publish workflow succeeds
   4. If deploying: install the published npm package version, verify plugin load, and restart the gateway on the target host

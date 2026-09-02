@@ -47,7 +47,7 @@ const mockGetVkRuntime = vi.hoisted(() =>
     channel: {
       activity: { record: vi.fn() },
     },
-    config: { loadConfig: vi.fn().mockReturnValue({}) },
+    config: { current: vi.fn().mockReturnValue({}) },
   }),
 );
 

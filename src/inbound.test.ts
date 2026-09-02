@@ -1474,3 +1474,232 @@ describe("command gating", () => {
     ).toHaveBeenCalledOnce();
   });
 });
+
+// ── Status reaction lifecycle ────────────────────────────────────────────────
+
+describe("status reaction lifecycle", () => {
+  async function installStatusController(overrides: Record<string, unknown> = {}) {
+    const { createStatusReactionController } = await import(
+      "openclaw/plugin-sdk/channel-feedback"
+    );
+    const controller = {
+      setQueued: vi.fn().mockResolvedValue(undefined),
+      setThinking: vi.fn().mockResolvedValue(undefined),
+      setTool: vi.fn().mockResolvedValue(undefined),
+      setCompacting: vi.fn().mockResolvedValue(undefined),
+      setDone: vi.fn().mockResolvedValue(undefined),
+      setError: vi.fn().mockResolvedValue(undefined),
+      cancelPending: vi.fn(),
+      clear: vi.fn().mockResolvedValue(undefined),
+      restoreInitial: vi.fn().mockResolvedValue(undefined),
+      ...overrides,
+    };
+    vi.mocked(createStatusReactionController).mockReturnValueOnce(controller as never);
+    return controller;
+  }
+
+  function statusReactionConfig(overrides: Record<string, unknown> = {}): CoreConfig {
+    return {
+      ...baseCfg(),
+      messages: {
+        ackReactionScope: "direct",
+        statusReactions: {
+          enabled: true,
+          emojis: { thinking: "🤔" },
+          timing: { debounceMs: 0 },
+        },
+        ...overrides,
+      },
+    } as unknown as CoreConfig;
+  }
+
+  it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
+    const controller = await installStatusController();
+    const runtime = installRuntime();
+    const statusSink = vi.fn();
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        expect(replyOptions).toEqual(
+          expect.objectContaining({
+            suppressDefaultToolProgressMessages: true,
+            allowProgressCallbacksWhenSourceDeliverySuppressed: true,
+          }),
+        );
+        await dispatcherOptions.onReplyStart();
+        await replyOptions.onReasoningStream();
+        await replyOptions.onToolStart({ name: "web_search" });
+        await replyOptions.onCompactionStart();
+        await replyOptions.onCompactionEnd();
+        await dispatcherOptions.deliver("invalid core payload", { kind: "partial" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        conversationMessageId: 42,
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: statusReactionConfig(),
+      runtime: createVkRuntimeEnv(),
+      statusSink,
+    });
+
+    expect(runtime.channel.reactions.shouldAckReaction).toHaveBeenCalledWith({
+      scope: "direct",
+      isDirect: true,
+      isGroup: false,
+      isMentionableGroup: false,
+      requireMention: false,
+      canDetectMention: true,
+      effectiveWasMentioned: false,
+    });
+    expect(controller.setQueued).toHaveBeenCalledOnce();
+    expect(controller.setThinking).toHaveBeenCalledTimes(3);
+    expect(controller.setTool).toHaveBeenCalledWith("web_search");
+    expect(controller.setCompacting).toHaveBeenCalledOnce();
+    expect(controller.cancelPending).toHaveBeenCalledOnce();
+    expect(controller.setDone).toHaveBeenCalledOnce();
+    expect(controller.setError).not.toHaveBeenCalled();
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(String(SENDER_ID), {}, {
+      accountId: "default",
+    });
+    expect(statusSink).toHaveBeenCalledWith({ lastOutboundAt: expect.any(Number) });
+  });
+
+  it("reports dispatch and reaction cleanup failures while preserving the dispatch error", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = await installStatusController({
+        setError: vi.fn().mockRejectedValue(new Error("final reaction failed")),
+        clear: vi.fn().mockRejectedValue(new Error("clear reaction failed")),
+      });
+      const runtime = installRuntime();
+      const runtimeEnv = createVkRuntimeEnv();
+      const logSpy = vi.spyOn(runtimeEnv, "log").mockImplementation(() => {});
+      const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
+      vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+        async ({ dispatcherOptions }: any) => {
+          dispatcherOptions.onError(new Error("delivery failed"), { kind: "final" });
+          throw new Error("dispatch failed");
+        },
+      );
+
+      await expect(
+        handleVkInbound({
+          message: makeMessage({
+            senderId: SENDER_ID,
+            peerId: SENDER_ID,
+            conversationMessageId: 43,
+          }),
+          account: makeAccount({ config: { dmPolicy: "open" } }),
+          config: statusReactionConfig({ removeAckAfterReply: true }),
+          runtime: runtimeEnv,
+        }),
+      ).rejects.toThrow("dispatch failed");
+
+      expect(errorSpy).toHaveBeenCalledWith("vk final reply failed: Error: delivery failed");
+      expect(controller.setError).toHaveBeenCalledOnce();
+      expect(controller.setDone).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(
+        "vk: status-reaction finalize failed: Error: final reaction failed",
+      );
+      expect(controller.clear).not.toHaveBeenCalled();
+
+      await vi.runAllTimersAsync();
+
+      expect(controller.clear).toHaveBeenCalledOnce();
+      expect(logSpy).toHaveBeenCalledWith(
+        "vk: status-reaction clear failed: Error: clear reaction failed",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("logs session metadata persistence errors and still dispatches the message", async () => {
+    const runtime = installRuntime();
+    const runtimeEnv = createVkRuntimeEnv();
+    const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
+    vi.mocked(runtime.channel.session.recordInboundSession).mockImplementation(
+      async ({ onRecordError }: any) => {
+        onRecordError(new Error("session store unavailable"));
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: runtimeEnv,
+    });
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "vk: failed updating session meta: Error: session store unavailable",
+    );
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
+  });
+
+  it("does not report outbound activity when VK returns no send result", async () => {
+    const runtime = installRuntime({
+      upsertPairingRequest: vi.fn().mockResolvedValue({ code: "PAIR00", created: true }),
+    });
+    const statusSink = vi.fn();
+    mockSendPayloadVk.mockResolvedValueOnce(undefined as never);
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "pairing", allowFrom: [] } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+      statusSink,
+    });
+
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      { text: "pairing-reply-text" },
+      { accountId: "default" },
+    );
+    expect(statusSink).toHaveBeenCalledTimes(1);
+    expect(statusSink).toHaveBeenCalledWith({ lastInboundAt: 1_700_000_000_000 });
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+
+  it("labels unsupported attachment kinds as unknown in the agent media context", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "shared link",
+        attachments: [
+          {
+            type: "link",
+            kind: "link",
+            url: "https://example.com/article",
+            title: "Article",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(runtime.channel.reply.finalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        media: [
+          expect.objectContaining({
+            url: "https://example.com/article",
+            fileName: "Article",
+            kind: "unknown",
+          }),
+        ],
+      }),
+    );
+  });
+});

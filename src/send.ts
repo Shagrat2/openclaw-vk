@@ -6,7 +6,7 @@ import {
 } from "./format.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
-import { getVkRuntime } from "./runtime.js";
+import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
@@ -395,7 +395,7 @@ function recordOutboundActivity(accountId: string): void {
 
 function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: string }) {
   const runtime = getVkRuntime();
-  const cfg = (params.cfg ?? runtime.config.loadConfig()) as CoreConfig;
+  const cfg = params.cfg ?? readVkRuntimeConfig(runtime);
   const account = resolveVkAccount({ cfg, accountId: params.accountId });
   if (!account.token) {
     throw new Error("VK token not configured");
