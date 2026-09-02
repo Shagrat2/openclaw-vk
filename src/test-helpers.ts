@@ -28,7 +28,14 @@ export function makeVkRuntime(opts: {
     },
     logging: {
       shouldLogVerbose: vi.fn().mockReturnValue(false),
-      getChildLogger: vi.fn(),
+      // Контракт рантайма обещает логгер, а не undefined: мок, отдающий
+      // undefined, прячет падение в вызывающем коде до самого прода.
+      getChildLogger: vi.fn().mockReturnValue({
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      }),
     },
     channel: {
       pairing: {

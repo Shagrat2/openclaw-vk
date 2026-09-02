@@ -37,11 +37,40 @@ import { makeAccount } from "./test-helpers.js";
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  // Ядро сериализует задачи по ключу; здесь та же семантика в трёх строках,
+  // чтобы тесты видели реальный порядок, а не заглушку-проходную.
+  enqueueKeyedTask: async <T,>({
+    tails,
+    key,
+    task,
+  }: {
+    tails: Map<string, Promise<void>>;
+    key: string;
+    task: () => Promise<T>;
+  }): Promise<T> => {
+    const previous = tails.get(key) ?? Promise.resolve();
+    const next = previous.then(task, task);
+    tails.set(
+      key,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return await next;
+  },
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   normalizeAccountId: (id?: string) => id?.trim() || "default",
+}));
+
+const mockUploadLogger = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
 }));
 
 const mockGetVkRuntime = vi.hoisted(() =>
@@ -50,11 +79,16 @@ const mockGetVkRuntime = vi.hoisted(() =>
       activity: { record: vi.fn() },
     },
     config: { loadConfig: vi.fn().mockReturnValue({}) },
+    logging: {
+      shouldLogVerbose: vi.fn().mockReturnValue(false),
+      getChildLogger: vi.fn().mockReturnValue(mockUploadLogger),
+    },
   }),
 );
 
 vi.mock("./runtime.js", () => ({
   getVkRuntime: mockGetVkRuntime,
+  tryGetVkRuntime: mockGetVkRuntime,
 }));
 
 const mockMessagesSend = vi.hoisted(() => vi.fn());
@@ -468,6 +502,59 @@ describe("sendPhotoVk", () => {
       }),
     );
     expect(result).toEqual({ messageId: "99", chatId: "123" });
+  });
+
+  it("serializes concurrent uploads for one account so transfers never overlap", async () => {
+    const gates: Array<() => void> = [];
+    let inFlight = 0;
+    let peak = 0;
+    mockUploadPhoto.mockReset().mockImplementation(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      inFlight -= 1;
+      return "photo123_456";
+    });
+    mockMessagesSend.mockResolvedValue(1);
+
+    const sends = [
+      sendPhotoVk("123", Buffer.from("a"), undefined, { cfg }),
+      sendPhotoVk("456", Buffer.from("b"), undefined, { cfg }),
+    ];
+
+    // Обе отправки уже запущены, но до upload-сервера дошла ровно одна: вторая
+    // ждёт очереди. Без неё здесь было бы два шлюза сразу.
+    await vi.waitFor(() => expect(gates.length).toBe(1));
+    gates[0]?.();
+    await vi.waitFor(() => expect(gates.length).toBe(2));
+    gates[1]?.();
+    await Promise.all(sends);
+
+    expect(peak).toBe(1);
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+  });
+
+  it("logs a failed upload with the VK error code and no payload details", async () => {
+    const failure = Object.assign(new Error("file is undefined"), { code: 100 });
+    mockUploadPhoto.mockReset().mockRejectedValue(failure);
+    mockMessagesSend.mockResolvedValue(1);
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ kind: "photo", code: 100, bytes: 3 }),
+    );
+    const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(Object.keys(meta ?? {}).sort()).toEqual([
+      "attempt",
+      "bytes",
+      "code",
+      "error",
+      "kind",
+    ]);
   });
 
   it("sends empty message text when no caption", async () => {

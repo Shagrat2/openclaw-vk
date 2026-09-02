@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import { loadCoreBridge } from "./sdk-compat.js";
@@ -22,7 +23,7 @@ import {
 } from "./tts-parts.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
-import { getVkRuntime } from "./runtime.js";
+import { getVkRuntime, tryGetVkRuntime } from "./runtime.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
@@ -155,12 +156,21 @@ function isVkScopeDeniedError(error: unknown): boolean {
   return message.includes("access denied") && message.includes("scope");
 }
 
-function isVkPhotoSourceRejectedError(error: unknown): boolean {
+/**
+ * VK отвечает кодом 100 «X is undefined», когда не принял переданный источник:
+ * `photo` — на стадии сохранения, `file` — на оборванной multipart-передаче.
+ * Формулировка одна на оба случая, поэтому и разбор один.
+ */
+function isVkUndefinedSourceError(error: unknown, subject: "file" | "photo"): boolean {
   if (readVkErrorCode(error) !== 100) {
     return false;
   }
   const message = readVkErrorMessage(error).toLowerCase();
-  return message.includes("photo is undefined") || message.includes("photo undefined");
+  return message.includes(`${subject} is undefined`) || message.includes(`${subject} undefined`);
+}
+
+function isVkPhotoSourceRejectedError(error: unknown): boolean {
+  return isVkUndefinedSourceError(error, "photo");
 }
 
 function isVkImageUploadFallbackError(error: unknown): boolean {
@@ -172,12 +182,13 @@ function isVkImageUploadFallbackError(error: unknown): boolean {
 // mid-flight (transient, same family as the error-15 batching failure). Unlike a
 // genuine invalid-parameter 100, a re-issued upload succeeds, so treat only this
 // specific message as retryable — not every code=100.
+/**
+ * Транзиентный отказ ЗАГРУЗКИ: оборванная multipart-передача, когда VK
+ * отвечает кодом 100 «file is undefined». Запрос идемпотентен — повтор
+ * проходит.
+ */
 function isVkTransientFileUndefinedError(error: unknown): boolean {
-  if (readVkErrorCode(error) !== 100) {
-    return false;
-  }
-  const message = readVkErrorMessage(error).toLowerCase();
-  return message.includes("file is undefined") || message.includes("file undefined");
+  return isVkUndefinedSourceError(error, "file");
 }
 
 function isHttpUrl(value: string): boolean {
@@ -220,6 +231,108 @@ function isRetryableVkError(error: unknown): boolean {
   );
 }
 
+/**
+ * Диагностика доставки вложений.
+ *
+ * Путь загрузки раньше не сообщал ничего: по логам нельзя было отличить отказ
+ * VK от молчаливой потери. Пишем только безопасные поля — вид вложения, размер,
+ * номер попытки и код ошибки; ни URL, ни путей, ни peer id, потому что такие
+ * записи легко утекают в общие логи и в отчёты об ошибках.
+ *
+ * Успех идёт под verbose-гейтом, отказ — всегда: именно он нужен при разборе.
+ * Логгер берём через tryGetVkRuntime: загрузка может случиться раньше, чем
+ * плагин зарегистрирован, и это не повод падать.
+ */
+type MediaUploadKind = "photo" | "document" | "audio";
+
+const MEDIA_UPLOAD_LOG_BINDINGS = { module: "vk-media-upload" } as const;
+
+function logMediaUploadOutcome(params: {
+  kind: MediaUploadKind;
+  bytes?: number;
+  attempt: number;
+  error?: unknown;
+}): void {
+  const runtime = tryGetVkRuntime();
+  if (!runtime) {
+    return;
+  }
+  const meta: Record<string, unknown> = { kind: params.kind, attempt: params.attempt };
+  if (params.bytes !== undefined) {
+    meta.bytes = params.bytes;
+  }
+  if (!params.error) {
+    if (runtime.logging.shouldLogVerbose()) {
+      runtime.logging.getChildLogger(MEDIA_UPLOAD_LOG_BINDINGS).info("vk upload ok", meta);
+    }
+    return;
+  }
+  runtime.logging.getChildLogger(MEDIA_UPLOAD_LOG_BINDINGS).error("vk upload failed", {
+    ...meta,
+    code: readVkErrorCode(params.error) ?? null,
+    error: params.error instanceof Error ? params.error.name : typeof params.error,
+  });
+}
+
+/**
+ * Очередь загрузок: на один токен — одна передача за раз.
+ *
+ * Внутри одного ответа медиа и так уходит последовательно (sendPayloadMediaVk
+ * ждёт каждое вложение), но разные ответы независимы — догоняющие части
+ * озвучки, параллельные диалоги — и попадают на upload-сервер одновременно.
+ * Ключ по токену держит порядок там, где состояние общее, и не заставляет один
+ * аккаунт ждать другой.
+ *
+ * Ретраи и паузы между ними намеренно ЗА пределами очереди: держать замок во
+ * время сна значит останавливать чужие загрузки без всякой пользы.
+ */
+const mediaUploadTails = new Map<string, Promise<void>>();
+
+
+/** Пауза с джиттером: разводит повторы разных отправок, чтобы они не сходились. */
+function retryDelayMs(attempt: number): number {
+  const base = 250 * attempt;
+  return base + Math.floor(Math.random() * base);
+}
+
+/**
+ * Загрузка вложения: очередь на время передачи, ретрай на транзиентных отказах
+ * и единая диагностика. Вызывающему коду остаётся сказать, что он грузит.
+ */
+function runMediaUpload<T>(params: {
+  kind: MediaUploadKind;
+  source: string | Buffer;
+  token: string;
+  upload: () => Promise<T>;
+  /** Своя политика повторов, если у вида вложения она отличается от общей. */
+  retry?: {
+    extraRetryableCodes?: readonly number[];
+    extraRetryablePredicate?: (error: unknown) => boolean;
+    maxAttempts?: number;
+  };
+}): Promise<T> {
+  const bytes = Buffer.isBuffer(params.source) ? params.source.byteLength : undefined;
+  let attempt = 0;
+  return withVkRetry(
+    async () => {
+      attempt += 1;
+      try {
+        const result = await enqueueKeyedTask({
+          tails: mediaUploadTails,
+          key: params.token,
+          task: params.upload,
+        });
+        logMediaUploadOutcome({ kind: params.kind, bytes, attempt });
+        return result;
+      } catch (error) {
+        logMediaUploadOutcome({ kind: params.kind, bytes, attempt, error });
+        throw error;
+      }
+    },
+    params.retry ?? { extraRetryablePredicate: isVkTransientFileUndefinedError },
+  );
+}
+
 async function withVkRetry<T>(
   operation: () => Promise<T>,
   opts?: {
@@ -243,7 +356,7 @@ async function withVkRetry<T>(
       if (attempt >= maxAttempts || !retryable) {
         throw error;
       }
-      await sleep(250 * attempt);
+      await sleep(retryDelayMs(attempt));
     }
   }
 }
@@ -563,15 +676,19 @@ export async function sendPhotoVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
-  const attachment = await withVkRetry(async () => {
-    return await vk.upload.messagePhoto({
-      peer_id: peerId,
-      source: buildVkUploadSource({
-        source: photoSource,
-        filename: uploadMeta?.filename,
-        contentType: uploadMeta?.contentType,
+  const attachment = await runMediaUpload({
+    kind: "photo",
+    source: photoSource,
+    token: account.token,
+    upload: () =>
+      vk.upload.messagePhoto({
+        peer_id: peerId,
+        source: buildVkUploadSource({
+          source: photoSource,
+          filename: uploadMeta?.filename,
+          contentType: uploadMeta?.contentType,
+        }),
       }),
-    });
   });
   const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
   const firstResult = await sendVkApiMessage({
@@ -617,16 +734,20 @@ export async function sendDocumentVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
-  const attachment = await withVkRetry(async () => {
-    return await vk.upload.messageDocument({
-      peer_id: peerId,
-      source: buildVkUploadSource({
-        source: docSource,
-        filename: title,
-        contentType: uploadMeta?.contentType,
+  const attachment = await runMediaUpload({
+    kind: "document",
+    source: docSource,
+    token: account.token,
+    upload: () =>
+      vk.upload.messageDocument({
+        peer_id: peerId,
+        source: buildVkUploadSource({
+          source: docSource,
+          filename: title,
+          contentType: uploadMeta?.contentType,
+        }),
+        title,
       }),
-      title,
-    });
   });
   const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
   const firstResult = await sendVkApiMessage({
@@ -697,6 +818,7 @@ async function materializeLocalAudioFile(
 
 async function uploadVkAudioMessage(params: {
   vk: VK;
+  token: string;
   peerId: number;
   source: string | Buffer;
   filename: string;
@@ -723,9 +845,12 @@ async function uploadVkAudioMessage(params: {
   // 15 as transient here and retry — a re-issued (unbatched) call succeeds.
   // Same idempotent path also hits a transient code=100 "file is undefined" when
   // the multipart upload is dropped mid-flight — retry that specific case too.
-  const attachment = await withVkRetry(
-    async () => {
-      return await params.vk.upload.audioMessage({
+  const attachment = await runMediaUpload({
+    kind: "audio",
+    source: params.source,
+    token: params.token,
+    upload: () =>
+      params.vk.upload.audioMessage({
         peer_id: params.peerId,
         source: buildVkUploadSource({
           source: params.source,
@@ -733,14 +858,13 @@ async function uploadVkAudioMessage(params: {
           contentType: params.contentType,
         }),
         title: params.filename,
-      });
-    },
-    {
+      }),
+    retry: {
       extraRetryableCodes: [15],
       extraRetryablePredicate: isVkTransientFileUndefinedError,
       maxAttempts: 5,
     },
-  );
+  });
   return String(attachment);
 }
 
@@ -788,6 +912,7 @@ async function deliverTtsContinuation(params: {
         const source = sources[index] as string;
         const attachment = await uploadVkAudioMessage({
           vk: params.vk,
+          token: params.account.token,
           peerId: params.peerId,
           source,
           filename: `voice-part-${String(part.index).padStart(2, "0")}-${index + 1}${
@@ -901,6 +1026,7 @@ export async function sendAudioMessageVk(
   // ── Single-message path (short audio / split unavailable) ─────────────────
   const attachment = await uploadVkAudioMessage({
     vk,
+    token: account.token,
     peerId,
     source: audioSource,
     filename: title,
@@ -968,6 +1094,7 @@ async function sendVkAudioSegments(params: {
 
     const attachment = await uploadVkAudioMessage({
       vk: params.vk,
+      token: params.account.token,
       peerId: params.peerId,
       source: segment,
       filename: `voice-${String(index + 1).padStart(2, "0")}.ogg`,
