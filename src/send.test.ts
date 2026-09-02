@@ -97,6 +97,9 @@ vi.mock("./runtime.js", () => ({
 }));
 
 const mockMessagesSend = vi.hoisted(() => vi.fn());
+const mockGetMessagesUploadServer = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ upload_url: "https://upload.vk.example/audio" }),
+);
 const mockMessagesMarkAsRead = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSetActivity = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSendReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
@@ -117,6 +120,9 @@ vi.mock("vk-io", () => ({
   VK: vi.fn().mockImplementation(function () {
     return {
       api: {
+        docs: {
+          getMessagesUploadServer: mockGetMessagesUploadServer,
+        },
         groups: {
           getById: mockGroupsGetById,
         },
@@ -200,6 +206,9 @@ beforeEach(() => {
   mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
   mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
   mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGetMessagesUploadServer
+    .mockReset()
+    .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
   mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
   mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
   // Reset constructor counters between tests.
@@ -680,6 +689,9 @@ describe("sendAudioMessageVk", () => {
     clearVkInstances();
     mockMessagesSend.mockReset();
     mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGetMessagesUploadServer
+    .mockReset()
+    .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
     mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
     mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
     mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
@@ -693,11 +705,22 @@ describe("sendAudioMessageVk", () => {
       cfg,
     });
 
+    // Сервер загрузки берётся отдельным запросом (у него свой узкий повтор),
+    // и передача идёт по готовому uploadUrl — vk-io за сервером уже не ходит.
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledWith({
+      type: "audio_message",
+      peer_id: 456,
+    });
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 456,
       source: {
-        value: "https://example.com/voice.mp3",
-        filename: "voice.mp3",
+        uploadUrl: "https://upload.vk.example/audio",
+        values: [
+          {
+            value: "https://example.com/voice.mp3",
+            filename: "voice.mp3",
+          },
+        ],
       },
       title: "voice.mp3",
     });
@@ -712,6 +735,47 @@ describe("sendAudioMessageVk", () => {
     // Remote URL → split is skipped entirely (not a local path).
     expect(mockProbeAudioDurationMs).not.toHaveBeenCalled();
     expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+  });
+
+  it("retries only the upload-server request on a transient code=15", async () => {
+    // Ревью требовало сузить повтор: раньше на код 15 переигрывался весь
+    // конвейер (взять сервер → залить → сохранить), и повтор после удачной
+    // заливки мог создать документ дважды.
+    const batchedError = Object.assign(new Error("Access denied"), { code: 15 });
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockRejectedValueOnce(batchedError)
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/audio" });
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk(
+      "456",
+      "https://example.com/voice.mp3",
+      "voice.mp3",
+      "caption",
+      { cfg },
+    );
+
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
+    // Файл заливается ровно один раз — дубля документа быть не может.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("does not replay the upload when code=15 comes from a later stage", async () => {
+    // Постоянный отказ по правам на самой заливке: повторять нечего, лишние
+    // попытки только оттягивают штатный переход на отправку документом.
+    const scopeError = Object.assign(
+      new Error("Access denied: no access to call this method with current scopes"),
+      { code: 15 },
+    );
+    mockUploadAudioMessage.mockReset().mockRejectedValue(scopeError);
+
+    await expect(
+      sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
   });
 
   it("retries audio upload on transient code=100 \"file is undefined\"", async () => {
@@ -782,7 +846,9 @@ describe("sendAudioMessageVk", () => {
     // Two voice uploads, one per segment.
     expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
     expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
-      source: expect.objectContaining({ value: "/tmp/part-0.ogg" }),
+      source: expect.objectContaining({
+        values: [expect.objectContaining({ value: "/tmp/part-0.ogg" })],
+      }),
     });
     // Two voice messages sent in order; caption + replyTo on first only.
     expect(mockMessagesSend).toHaveBeenCalledTimes(2);
@@ -835,7 +901,9 @@ describe("sendAudioMessageVk", () => {
     // Falls back to the single upload of the original source.
     expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
     expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
-      source: expect.objectContaining({ value: "/tmp/long.ogg" }),
+      source: expect.objectContaining({
+        values: [expect.objectContaining({ value: "/tmp/long.ogg" })],
+      }),
     });
     expect(mockMessagesSend).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ messageId: "88", chatId: "456" });
@@ -1603,9 +1671,14 @@ describe("sendPayloadVk", () => {
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/voice.mp3",
-        filename: "voice.mp3",
-        contentType: "audio/mpeg",
+        uploadUrl: "https://upload.vk.example/audio",
+        values: [
+          {
+            value: "https://example.com/voice.mp3",
+            filename: "voice.mp3",
+            contentType: "audio/mpeg",
+          },
+        ],
       },
       title: "voice.mp3",
     });

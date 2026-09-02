@@ -864,13 +864,33 @@ async function uploadVkAudioMessage(params: {
     peerId: params.peerId,
     filename: params.filename,
   });
-  // Even with a valid peer_id, docs.getMessagesUploadServer(type=audio_message)
-  // intermittently returns error 15 when the call gets batched with concurrent
-  // requests on the shared (apiLimit) VK client. Verified ~20% failure under
-  // concurrency vs 0% sequentially. The call is otherwise idempotent, so treat
-  // 15 as transient here and retry — a re-issued (unbatched) call succeeds.
-  // Same idempotent path also hits a transient code=100 "file is undefined" when
-  // the multipart upload is dropped mid-flight — retry that specific case too.
+  // Повтор бьёт ТОЧНО по запросу upload-сервера, а не по всей загрузке.
+  //
+  // `docs.getMessagesUploadServer(type=audio_message)` под нагрузкой отдаёт
+  // code=15 транзиентно (замер: ~20% против нуля при последовательной
+  // отправке), и повторный запрос проходит. Раньше в повтор был обёрнут весь
+  // конвейер — «взять сервер → залить файл → сохранить документ», до пяти раз.
+  // Это неверно по двум причинам: настоящий отказ по правам постоянен, и пять
+  // попыток лишь тянут время до штатного перехода на документ; а повтор после
+  // успешной заливки может создать документ дважды.
+  //
+  // Запрос сервера идемпотентен — его повторять безопасно. vk-io позволяет
+  // отдать готовый `uploadUrl` в источнике: тогда `conduct` не ходит за
+  // сервером сам, и заливка с сохранением выполняются ровно один раз.
+  const uploadUrl = await withVkRetry(
+    async () => {
+      const server = (await params.vk.api.docs.getMessagesUploadServer({
+        type: "audio_message",
+        peer_id: params.peerId,
+      })) as { upload_url?: string };
+      if (!server?.upload_url) {
+        throw new Error("VK audio upload: getMessagesUploadServer returned no upload_url");
+      }
+      return server.upload_url;
+    },
+    { extraRetryableCodes: [15] },
+  );
+
   const attachment = await runMediaUpload({
     kind: "audio",
     source: params.source,
@@ -879,18 +899,21 @@ async function uploadVkAudioMessage(params: {
     upload: () =>
       params.vk.upload.audioMessage({
         peer_id: params.peerId,
-        source: buildVkUploadSource({
-          source: params.source,
-          filename: params.filename,
-          contentType: params.contentType,
-        }),
+        source: {
+          uploadUrl,
+          values: [
+            buildVkUploadSource({
+              source: params.source,
+              filename: params.filename,
+              contentType: params.contentType,
+            }),
+          ],
+        },
         title: params.filename,
       }),
-    retry: {
-      extraRetryableCodes: [15],
-      extraRetryablePredicate: isVkTransientFileUndefinedError,
-      maxAttempts: 5,
-    },
+    // Оборванная multipart-передача (code=100 «file is undefined») повторяется:
+    // файл до VK не доехал, дубля быть не может.
+    retry: { extraRetryablePredicate: isVkTransientFileUndefinedError },
   });
   return String(attachment);
 }
