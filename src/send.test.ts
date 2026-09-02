@@ -61,6 +61,11 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
   },
 }));
 
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
+}));
+
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   normalizeAccountId: (id?: string) => id?.trim() || "default",
@@ -534,8 +539,37 @@ describe("sendPhotoVk", () => {
     expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
   });
 
+  it("retries a local photo on transient «photo is undefined» instead of falling back to a document", async () => {
+    // Живой случай 02.09: кадр на 177 КБ отвалился с attempt=1, и вместо
+    // картинки собеседник получил серую плашку «JPG · 173 KB» — откат в
+    // документ сработал на отказе, который проходит с повтора.
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-photo-"));
+    const filePath = join(tempDir, "frame.jpg");
+    await writeFile(filePath, "jpeg-bytes");
+    const transient = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto
+      .mockReset()
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValueOnce("photo123_456");
+    mockUploadDocument.mockReset();
+    mockMessagesSend.mockResolvedValueOnce(77);
+
+    const result = await sendPayloadVk(
+      "123",
+      { text: "кадр", mediaUrl: pathToFileURL(filePath).toString() },
+      { cfg, mediaLocalRoots: [tempDir] },
+    );
+
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(result).toEqual({ messageId: "77", chatId: "123" });
+  });
+
   it("logs a failed upload with the VK error code and no payload details", async () => {
-    const failure = Object.assign(new Error("file is undefined"), { code: 100 });
+    const failure = Object.assign(new Error("boom"), { code: 100 });
     mockUploadPhoto.mockReset().mockRejectedValue(failure);
     mockMessagesSend.mockResolvedValue(1);
 
@@ -547,14 +581,9 @@ describe("sendPhotoVk", () => {
       "vk upload failed",
       expect.objectContaining({ kind: "photo", code: 100, bytes: 3 }),
     );
+    // Содержимое вложения не пишется никогда — Buffer превращается в вид источника.
     const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
-    expect(Object.keys(meta ?? {}).sort()).toEqual([
-      "attempt",
-      "bytes",
-      "code",
-      "error",
-      "kind",
-    ]);
+    expect((meta as { source?: unknown })?.source).toBe("buffer");
   });
 
   it("sends empty message text when no caption", async () => {

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
+import { vkDiag, vkDiagFailure } from "./diagnostics.js";
+import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
 import { loadCoreBridge } from "./sdk-compat.js";
 import {
   cleanupAudioSegments,
@@ -23,7 +25,7 @@ import {
 } from "./tts-parts.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
-import { getVkRuntime, tryGetVkRuntime } from "./runtime.js";
+import { getVkRuntime } from "./runtime.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
@@ -44,22 +46,6 @@ const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
   "Attachment could not be delivered; sent as text instead.";
 
-// Opt-in diagnostics: when VK_VOICE_DEBUG_LOG points at a writable file path,
-// append voice/media send breadcrumbs there. No-op otherwise. Used to capture
-// the real cause of intermittent audio_message upload failures (e.g. a missing
-// peer_id surfaces from VK as a misleading "access denied / scopes" error 15).
-async function logVkVoiceDebug(line: string): Promise<void> {
-  const target = process.env.VK_VOICE_DEBUG_LOG;
-  if (!target) {
-    return;
-  }
-  try {
-    const { appendFileSync } = await import("node:fs");
-    appendFileSync(target, `[${new Date().toISOString()}] ${line}\n`);
-  } catch {
-    /* diagnostics only — never break a send */
-  }
-}
 const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
 export type SendVkOptions = {
@@ -120,33 +106,7 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function readVkErrorCode(error: unknown): number | undefined {
-  if (!error || typeof error !== "object") {
-    return undefined;
-  }
-  const record = error as Record<string, unknown>;
-  if (typeof record.code === "number") {
-    return record.code;
-  }
-  if (typeof record.error_code === "number") {
-    return record.error_code;
-  }
-  return undefined;
-}
 
-function readVkErrorMessage(error: unknown): string {
-  if (!error || typeof error !== "object") {
-    return "";
-  }
-  const record = error as Record<string, unknown>;
-  return [
-    typeof record.message === "string" ? record.message : "",
-    typeof record.name === "string" ? record.name : "",
-    typeof record.description === "string" ? record.description : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
 
 function isVkScopeDeniedError(error: unknown): boolean {
   if (readVkErrorCode(error) === 15) {
@@ -177,11 +137,24 @@ function isVkImageUploadFallbackError(error: unknown): boolean {
   return isVkScopeDeniedError(error) || isVkPhotoSourceRejectedError(error);
 }
 
-// audio_message uploads intermittently fail with code=100 "file is undefined"
-// when the multipart upload to the getMessagesUploadServer endpoint is dropped
-// mid-flight (transient, same family as the error-15 batching failure). Unlike a
-// genuine invalid-parameter 100, a re-issued upload succeeds, so treat only this
-// specific message as retryable — not every code=100.
+/**
+ * Повторяем загрузку ФОТО на коде 100 «photo is undefined».
+ *
+ * Долгое время этот отказ считался приговором источнику и сразу уводил в
+ * откат «фото → документ» — собеседник получал серую плашку с файлом вместо
+ * картинки. Замер 02.09 показал обратное: кадр на 177 КБ отвалился с
+ * attempt=1, те же байты через восемь секунд ушли документом без ошибки, а
+ * следующие два кадра загрузились фотографиями с первой попытки. Это тот же
+ * оборванный multipart, что и «file is undefined» на голосовых, только на
+ * фото-эндпоинте.
+ *
+ * Если источник и правда не годится в фото, повторы стоят меньше секунды и
+ * откат в документ всё равно сработает — предикат отката не тронут.
+ */
+function isVkRetryablePhotoUploadError(error: unknown): boolean {
+  return isVkTransientFileUndefinedError(error) || isVkPhotoSourceRejectedError(error);
+}
+
 /**
  * Транзиентный отказ ЗАГРУЗКИ: оборванная multipart-передача, когда VK
  * отвечает кодом 100 «file is undefined». Запрос идемпотентен — повтор
@@ -234,44 +207,40 @@ function isRetryableVkError(error: unknown): boolean {
 /**
  * Диагностика доставки вложений.
  *
- * Путь загрузки раньше не сообщал ничего: по логам нельзя было отличить отказ
- * VK от молчаливой потери. Пишем только безопасные поля — вид вложения, размер,
- * номер попытки и код ошибки; ни URL, ни путей, ни peer id, потому что такие
- * записи легко утекают в общие логи и в отчёты об ошибках.
+ * Пишем в тот же VK_VOICE_DEBUG_LOG, где уже лежат следы медиа-пути
+ * (ENTRY sendPayloadVk, uploadVkAudioMessage): одна лента на весь путь
+ * отправки читается, а разнесённая по двум каналам — нет. Первая версия
+ * писала через runtime.logging и оказалась немой: успех там под
+ * verbose-гейтом, а гейт на проде закрыт.
  *
- * Успех идёт под verbose-гейтом, отказ — всегда: именно он нужен при разборе.
- * Логгер берём через tryGetVkRuntime: загрузка может случиться раньше, чем
- * плагин зарегистрирован, и это не повод падать.
+ * Отказ дублируется в общий лог рантайма — он не под гейтом и виден без
+ * включённого opt-in файла.
+ *
+ * Поля только безопасные: вид вложения, размер, номер попытки, код ошибки.
+ * Ни URL, ни путей, ни peer id — такие записи легко утекают в отчёты об ошибках.
  */
 type MediaUploadKind = "photo" | "document" | "audio";
 
-const MEDIA_UPLOAD_LOG_BINDINGS = { module: "vk-media-upload" } as const;
-
 function logMediaUploadOutcome(params: {
   kind: MediaUploadKind;
+  source: string | Buffer;
+  mime?: string;
   bytes?: number;
   attempt: number;
   error?: unknown;
 }): void {
-  const runtime = tryGetVkRuntime();
-  if (!runtime) {
+  const fields = {
+    kind: params.kind,
+    source: params.source,
+    mime: params.mime,
+    bytes: params.bytes,
+    attempt: params.attempt,
+  };
+  if (params.error) {
+    vkDiagFailure("vk upload failed", params.error, fields);
     return;
   }
-  const meta: Record<string, unknown> = { kind: params.kind, attempt: params.attempt };
-  if (params.bytes !== undefined) {
-    meta.bytes = params.bytes;
-  }
-  if (!params.error) {
-    if (runtime.logging.shouldLogVerbose()) {
-      runtime.logging.getChildLogger(MEDIA_UPLOAD_LOG_BINDINGS).info("vk upload ok", meta);
-    }
-    return;
-  }
-  runtime.logging.getChildLogger(MEDIA_UPLOAD_LOG_BINDINGS).error("vk upload failed", {
-    ...meta,
-    code: readVkErrorCode(params.error) ?? null,
-    error: params.error instanceof Error ? params.error.name : typeof params.error,
-  });
+  vkDiag("vk upload ok", fields);
 }
 
 /**
@@ -302,6 +271,7 @@ function retryDelayMs(attempt: number): number {
 function runMediaUpload<T>(params: {
   kind: MediaUploadKind;
   source: string | Buffer;
+  mime?: string;
   token: string;
   upload: () => Promise<T>;
   /** Своя политика повторов, если у вида вложения она отличается от общей. */
@@ -322,10 +292,17 @@ function runMediaUpload<T>(params: {
           key: params.token,
           task: params.upload,
         });
-        logMediaUploadOutcome({ kind: params.kind, bytes, attempt });
+        logMediaUploadOutcome({ kind: params.kind, source: params.source, mime: params.mime, bytes, attempt });
         return result;
       } catch (error) {
-        logMediaUploadOutcome({ kind: params.kind, bytes, attempt, error });
+        logMediaUploadOutcome({
+          kind: params.kind,
+          source: params.source,
+          mime: params.mime,
+          bytes,
+          attempt,
+          error,
+        });
         throw error;
       }
     },
@@ -651,7 +628,7 @@ export async function sendMessageVk(
   text: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
-  await logVkVoiceDebug(`ENTRY sendMessageVk to=${JSON.stringify(to)} textLen=${(text ?? "").length}`);
+  vkDiag("send text", { to, textLen: (text ?? "").length });
   const parsed = resolveVkMarkdownAttachmentPayload(text);
   const results = await sendPayloadResultsVk({
     to,
@@ -668,7 +645,18 @@ export async function sendPhotoVk(
   photoSource: string | Buffer,
   text?: string | VkPreparedFormattedMessage,
   opts: SendVkOptions = {},
-  uploadMeta?: { filename?: string; contentType?: string },
+  uploadMeta?: {
+    filename?: string;
+    contentType?: string;
+    /**
+     * Повторять ли «photo is undefined» вместо немедленного отказа. Вызывающий
+     * говорит это сам, потому что знает, есть ли у него запасной ход: у
+     * картинки по ссылке он есть (скачать и попробовать байтами), у локального
+     * файла — нет, и там повтор единственное, что отделяет фото от серой
+     * плашки с документом.
+     */
+    retryTransientPhotoErrors?: boolean;
+  },
 ): Promise<SendVkResult> {
   const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: opts.cfg,
@@ -679,7 +667,12 @@ export async function sendPhotoVk(
   const attachment = await runMediaUpload({
     kind: "photo",
     source: photoSource,
+    mime: uploadMeta?.contentType,
     token: account.token,
+    retry:
+      uploadMeta?.retryTransientPhotoErrors === true
+        ? { extraRetryablePredicate: isVkRetryablePhotoUploadError }
+        : undefined,
     upload: () =>
       vk.upload.messagePhoto({
         peer_id: peerId,
@@ -737,6 +730,7 @@ export async function sendDocumentVk(
   const attachment = await runMediaUpload({
     kind: "document",
     source: docSource,
+    mime: uploadMeta?.contentType,
     token: account.token,
     upload: () =>
       vk.upload.messageDocument({
@@ -828,16 +822,20 @@ async function uploadVkAudioMessage(params: {
   // error 15 "access denied … with current scopes", even though the token's
   // scopes are fine). Fail loud and accurate instead.
   if (!Number.isFinite(params.peerId) || params.peerId <= 0) {
-    await logVkVoiceDebug(
-      `uploadVkAudioMessage ABORT invalid peerId=${JSON.stringify(params.peerId)} filename=${params.filename}`,
-    );
+    vkDiagFailure("audio upload aborted: invalid peer", null, {
+      peerId: params.peerId,
+      filename: params.filename,
+    });
     throw new Error(
       `VK audio upload aborted: invalid peer_id (${JSON.stringify(params.peerId)}); peer_id is required for audio_message uploads`,
     );
   }
-  await logVkVoiceDebug(
-    `uploadVkAudioMessage peerId=${params.peerId} filename=${params.filename}`,
-  );
+  vkDiag("audio upload start", {
+    source: params.source,
+    mime: params.contentType,
+    peerId: params.peerId,
+    filename: params.filename,
+  });
   // Even with a valid peer_id, docs.getMessagesUploadServer(type=audio_message)
   // intermittently returns error 15 when the call gets batched with concurrent
   // requests on the shared (apiLimit) VK client. Verified ~20% failure under
@@ -848,6 +846,7 @@ async function uploadVkAudioMessage(params: {
   const attachment = await runMediaUpload({
     kind: "audio",
     source: params.source,
+    mime: params.contentType,
     token: params.token,
     upload: () =>
       params.vk.upload.audioMessage({
@@ -886,15 +885,17 @@ async function deliverTtsContinuation(params: {
   if (!manifest) {
     return;
   }
-  await logVkVoiceDebug(
-    `tts continuation START dir=${params.dir} parts=${manifest.parts.length} peerId=${params.peerId}`,
-  );
+  vkDiag("tts continuation start", {
+    parts: manifest.parts.length,
+    dir: params.dir,
+    peerId: params.peerId,
+  });
   const maxMs = getVkAudioMessageMaxMs();
 
   for (const entry of manifest.parts) {
     const part = await waitForTtsPart(params.dir, entry.index);
     if (!part) {
-      await logVkVoiceDebug(`tts continuation SKIP part=${entry.index} (not ready)`);
+      vkDiag("tts continuation skip", { part: entry.index, reason: "not ready" });
       continue;
     }
     const file = join(params.dir, part.file);
@@ -933,14 +934,14 @@ async function deliverTtsContinuation(params: {
           },
         });
       }
-      await logVkVoiceDebug(
-        `tts continuation SENT part=${part.index}/${manifest.parts.length} segments=${sources.length}`,
-      );
+      vkDiag("tts continuation sent", {
+        part: part.index,
+        total: manifest.parts.length,
+        segments: sources.length,
+      });
     } catch (error) {
       // One lost part must not swallow the rest of the reply.
-      await logVkVoiceDebug(
-        `tts continuation FAILED part=${part.index}: ${(error as Error).message}`,
-      );
+      vkDiagFailure("tts continuation failed", error, { part: part.index });
     } finally {
       if (segments.length >= 2) {
         await cleanupAudioSegments(segments);
@@ -949,7 +950,7 @@ async function deliverTtsContinuation(params: {
   }
 
   await discardTtsParts(params.dir);
-  await logVkVoiceDebug(`tts continuation DONE dir=${params.dir}`);
+  vkDiag("tts continuation done", { parts: manifest.parts.length, dir: params.dir });
 }
 
 function startTtsContinuation(params: {
@@ -960,8 +961,8 @@ function startTtsContinuation(params: {
   dir: string;
   opts: SendVkOptions;
 }): void {
-  void deliverTtsContinuation(params).catch(async (error: unknown) => {
-    await logVkVoiceDebug(`tts continuation ERROR: ${(error as Error).message}`);
+  void deliverTtsContinuation(params).catch((error: unknown) => {
+    vkDiagFailure("tts continuation error", error);
   });
 }
 
@@ -1152,7 +1153,7 @@ export async function sendFormattedMediaVk(
   mediaUrl: string,
   opts: SendVkOptions = {},
 ): Promise<SendVkResult> {
-  await logVkVoiceDebug(`ENTRY sendFormattedMediaVk to=${JSON.stringify(to)} mediaUrl=${JSON.stringify(mediaUrl)} textLen=${(text ?? "").length}`);
+  vkDiag("send media", { to, mediaUrl, textLen: (text ?? "").length });
   const result = await sendPayloadVk(
     to,
     {
@@ -1430,6 +1431,7 @@ async function sendResolvedMediaVk(params: {
       return await sendPhotoVk(params.to, photoSource, params.caption, params.opts, {
         filename: media.title,
         contentType: media.mimeType,
+        retryTransientPhotoErrors: !sourceUrl,
       });
     } catch (error) {
       photoError = error;
@@ -1476,13 +1478,10 @@ async function sendResolvedMediaVk(params: {
       // Voice is best-effort: log the *real* VK error (code/message) for
       // diagnosis, then fall back to text rather than dropping the reply or
       // mislabelling it as a scopes problem.
-      await logVkVoiceDebug(
-        `audio send FAILED to=${JSON.stringify(params.to)} code=${
-          (audioError as { code?: unknown })?.code
-        } scopeDenied=${isVkScopeDeniedError(audioError)} msg=${String(
-          (audioError as { message?: unknown })?.message ?? "",
-        ).slice(0, 200)}`,
-      );
+      vkDiagFailure("audio send failed", audioError, {
+        to: params.to,
+        scopeDenied: isVkScopeDeniedError(audioError),
+      });
       return await sendSourceUrlFallback();
     }
   }
@@ -1522,6 +1521,14 @@ async function sendPayloadMediaVk(params: {
         buttons: shouldApplyKeyboard ? params.opts.buttons : undefined,
         clearKeyboard: shouldApplyKeyboard ? params.opts.clearKeyboard : undefined,
       },
+    });
+    // Замыкает след пути отправки: загрузка отчиталась выше, здесь видно, дошло
+    // ли вложение до сообщения. Без этого «картинка не пришла» неотличимо от
+    // «картинка не отправлялась».
+    vkDiag("media sent", {
+      index: index + 1,
+      total: params.mediaRefs.length,
+      messageId: result.messageId || null,
     });
     results.push(result);
     firstCaption = undefined;
@@ -1569,9 +1576,12 @@ export async function sendPayloadVk(
   opts: SendVkOptions = {},
 ): Promise<SendVkResult | null> {
   const { text, mediaRefs, buttons, replyTo, clearKeyboard } = resolveVkPayloadParts(payload, opts);
-  await logVkVoiceDebug(
-    `ENTRY sendPayloadVk to=${JSON.stringify(to)} mediaRefs=${JSON.stringify((mediaRefs ?? []).map((r) => r?.url))} textLen=${(text ?? "").length}`,
-  );
+  vkDiag("send payload", {
+    to,
+    media: (mediaRefs ?? []).length,
+    mediaRefs: (mediaRefs ?? []).map((r) => r?.url),
+    textLen: (text ?? "").length,
+  });
 
   return getLastSendResult(
     await sendPayloadResultsVk({

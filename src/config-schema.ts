@@ -1,4 +1,5 @@
 import { DmPolicySchema, GroupPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
+import { VK_DIAG_LEVELS } from "./types.js";
 import { z } from "zod";
 
 function requireOpenAllowFrom(params: {
@@ -60,6 +61,17 @@ const VkStreamingSchema = z
   .passthrough()
   .optional();
 
+// Диагностика канала (`channels.vk.diagnostics`). Уровень вместо тумблера:
+// "off" молчит, "redacted" пишет ход без имён файлов и ссылок, "full" — всё.
+// Подробности и таблица — в src/diagnostics.ts.
+const VkDiagnosticsSchema = z
+  .object({
+    // Набор уровней объявлен один раз — в diagnostics.ts, где и разбирается.
+    level: z.enum(VK_DIAG_LEVELS).optional(),
+  })
+  .strict()
+  .optional();
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
@@ -73,6 +85,7 @@ const VkAccountSchemaBase = z
     groupAllowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     groups: z.record(z.string(), VkGroupConfigSchema).optional(),
     streaming: VkStreamingSchema,
+    diagnostics: VkDiagnosticsSchema,
   })
   .strict();
 

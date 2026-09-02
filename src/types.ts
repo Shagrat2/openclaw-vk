@@ -1,9 +1,14 @@
+/** Уровни диагностики канала. Разбор и обезличивание — в src/diagnostics.ts. */
+export const VK_DIAG_LEVELS = ["off", "redacted", "full"] as const;
+export type VkDiagLevel = (typeof VK_DIAG_LEVELS)[number];
+
 export type DmPolicy = "pairing" | "allowlist" | "open" | "disabled";
 type GroupPolicy = "open" | "disabled" | "allowlist";
 
 export type VkAccountConfig = {
   name?: string;
   enabled?: boolean;
+  diagnostics?: { level?: VkDiagLevel };
   token?: string;
   tokenFile?: string;
   dmPolicy?: DmPolicy;
