@@ -41,6 +41,20 @@ export type VkProgressDraftParams = {
 };
 
 /**
+ * Метка живого черновика из `channels.vk.streaming.progress.label`.
+ * Ею помечаются и черновик, и промежуточные сообщения с медиа — по её
+ * отсутствию видно, что пришёл итоговый ответ.
+ */
+export function resolveVkProgressLabel(cfg: unknown): string | undefined {
+  const label = (
+    cfg as
+      | { channels?: { vk?: { streaming?: { progress?: { label?: unknown } } } } }
+      | undefined
+  )?.channels?.vk?.streaming?.progress?.label;
+  return typeof label === "string" && label.trim() ? label.trim() : undefined;
+}
+
+/**
  * Handle to the single live draft message. Exposed so the deliver/finalize path
  * can rewrite it into the final answer (or delete it) without re-sending.
  */
@@ -73,13 +87,7 @@ export function createVkProgressDraftCompositor(
   // шагах инструментов не менялась при заданной метке. Ставим сами и здесь, в
   // единственной точке записи, чтобы покрыть и шаги, и текстовые куски.
   // Проверка startsWith защищает от дубля, если метка уже добавлена выше.
-  const resolveProgressLabel = (): string | undefined => {
-    const cfg = params.cfg as
-      | { channels?: { vk?: { streaming?: { progress?: { label?: unknown } } } } }
-      | undefined;
-    const label = cfg?.channels?.vk?.streaming?.progress?.label;
-    return typeof label === "string" && label.trim() ? label.trim() : undefined;
-  };
+  const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.cfg);
 
   const overwrite = async (rawText: string): Promise<void> => {
     if (closed) {

@@ -205,6 +205,12 @@ vi.mock("openclaw/plugin-sdk/channel-message", () => ({
 }));
 
 vi.mock("./progress-draft.js", () => ({
+  // Резолвер метки живёт в том же модуле — в моке отдаём настоящий разбор
+  // конфига, иначе тест не проверит, что метка вообще берётся из настроек.
+  resolveVkProgressLabel: (cfg: any) => {
+    const label = cfg?.channels?.vk?.streaming?.progress?.label;
+    return typeof label === "string" && label.trim() ? label.trim() : undefined;
+  },
   createVkProgressDraftCompositor: mockCreateVkProgressDraft,
 }));
 
@@ -1641,6 +1647,41 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
 
     expect(mockDraftRemove).toHaveBeenCalled();
     expect(mockSendPayloadVk).toHaveBeenCalled();
+  });
+
+  it("промежуточный блок с картинкой уходит своим сообщением, но помечен", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(777);
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          { text: "Кадр 38, проба 1", mediaUrl: "https://example/frame.jpg" },
+          { kind: "block" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 9 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({
+        streaming: { mode: "progress", progress: { label: "⏳ Работаю" } },
+      }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // Картинку в черновик не положишь, поэтому такой кусок уходит отдельным
+    // сообщением — метка нужна, чтобы он не выглядел готовым ответом.
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        text: expect.stringContaining("⏳ Работаю"),
+        mediaUrl: "https://example/frame.jpg",
+      }),
+      expect.anything(),
+    );
   });
 
   it("editing into the answer also works for media replies (voice follows separately)", async () => {

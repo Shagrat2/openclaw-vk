@@ -39,7 +39,9 @@ import {
 } from "./send.js";
 import { renderVkMarkdownChunks } from "./format.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
-import { createVkProgressDraftCompositor } from "./progress-draft.js";
+import { createVkProgressDraftCompositor,
+  resolveVkProgressLabel,
+} from "./progress-draft.js";
 import type { VkProgressDraftHandle } from "./progress-draft.js";
 import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
 import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
@@ -603,6 +605,20 @@ export async function handleVkInbound(params: {
             } catch (err) {
               runtime.log?.(`vk: block → draft failed: ${String(err)}`);
               // не смогли переписать черновик — пусть уходит обычным путём
+            }
+          }
+
+          // ── Промежуточный блок С МЕДИА → своим сообщением, но с меткой ────
+          // Картинку в черновик не положишь: это одно текстовое сообщение,
+          // которое мы правим через messages.edit, вложение туда не подставить.
+          // Убирать подпись в черновик тоже нельзя — она относится к самому
+          // снимку и читается вместе с ним. Поэтому помечаем такие сообщения
+          // той же меткой, что и черновик: тогда ход отличим от ответа, даже
+          // когда ход состоит из картинок.
+          if (progressDraft && !isFinal && normalized.text?.trim()) {
+            const label = resolveVkProgressLabel(config);
+            if (label && !normalized.text.startsWith(label)) {
+              normalized.text = `${label} ${normalized.text}`;
             }
           }
 
