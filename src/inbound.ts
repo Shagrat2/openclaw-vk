@@ -1,55 +1,57 @@
+import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth-native";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
-  issuePairingChallengeCompat,
-  loadChannelMessageBits,
-  loadCoreBridge,
-  type StreamingCompatEntry,
-} from "./sdk-compat.js";
+  DEFAULT_TIMING,
+  type StatusReactionController,
+} from "openclaw/plugin-sdk/channel-feedback";
+import {
+  logInboundDrop,
+  toInboundMediaFacts,
+  type ChannelInboundMediaInput,
+} from "openclaw/plugin-sdk/channel-inbound";
+import {
+  createReplyPrefixOptions,
+  createTypingCallbacks,
+  logTypingFailure,
+} from "openclaw/plugin-sdk/channel-outbound";
+import {
+  buildChannelProgressDraftLineForEntry,
+  resolveChannelPreviewStreamMode,
+} from "openclaw/plugin-sdk/channel-message";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
-import { logInboundDrop } from "openclaw/plugin-sdk/channel-inbound";
 import {
   readStoreAllowFromForDmPolicy,
   resolveEffectiveAllowFromLists,
 } from "openclaw/plugin-sdk/channel-policy";
-import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import {
+  GROUP_POLICY_BLOCKED_LABEL,
   resolveAllowlistProviderRuntimeGroupPolicy,
   resolveDefaultGroupPolicy,
-  GROUP_POLICY_BLOCKED_LABEL,
   warnMissingProviderGroupPolicyFallbackOnce,
-} from "openclaw/plugin-sdk/config-runtime";
-import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/runtime-group-policy";
 import { redactVkId, vkDiag } from "./diagnostics.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
-import {
-  resolveVkInboundBodyText,
-  resolveVkInboundResolvedMedia,
-  resolveVkInboundResolvedMediaPaths,
-  resolveVkInboundResolvedMediaTypes,
-  resolveVkInboundResolvedMediaUrls,
-  resolveVkInboundMediaTypes,
-  resolveVkInboundMediaUrls,
-} from "./media.js";
+import { resolveVkInboundBodyText, resolveVkInboundResolvedMedia } from "./media.js";
+import { createVkStatusReactionController } from "./reactions-controller.js";
 import { getVkRuntime } from "./runtime.js";
 import {
   clearVkInstances,
   editMessageVk,
   markMessageReadVk,
+  sendMessageVk,
   sendPayloadVk,
   sendTypingVk,
-  sendMessageVk,
 } from "./send.js";
 import { renderVkMarkdownChunks } from "./format.js";
-import { createVkStatusReactionController } from "./reactions-controller.js";
-import { createVkProgressDraftCompositor,
-  resolveVkProgressLabel,
-} from "./progress-draft.js";
-import type { VkProgressDraftHandle } from "./progress-draft.js";
-import { DEFAULT_TIMING } from "openclaw/plugin-sdk/channel-feedback";
-import type { StatusReactionController } from "openclaw/plugin-sdk/channel-feedback";
 import {
-  buildChannelProgressDraftLineForEntry,
-  resolveChannelPreviewStreamMode,
-} from "openclaw/plugin-sdk/channel-message";
+  createVkProgressDraftCompositor,
+  resolveVkProgressLabel,
+  type VkProgressDraftHandle,
+} from "./progress-draft.js";
+// Мост совместимости: ядро переносит эти символы между версиями SDK, и
+// статический импорт молча ломает загрузку плагина целиком.
+import { loadCoreBridge } from "./sdk-compat.js";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -82,6 +84,21 @@ function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number
   return {
     allowed: params.allowFrom.some((entry) => entry === senderStr || entry === `vk:${senderStr}`),
   };
+}
+
+type VkInboundMediaKind = NonNullable<ChannelInboundMediaInput["kind"]>;
+
+function resolveVkInboundMediaKind(kind: string): VkInboundMediaKind {
+  switch (kind) {
+    case "image":
+    case "video":
+    case "audio":
+    case "document":
+    case "sticker":
+      return kind;
+    default:
+      return "unknown";
+  }
 }
 
 type VkDispatchPayload = {
@@ -132,11 +149,7 @@ export async function handleVkInbound(params: {
 }): Promise<void> {
   const { message, account, config, runtime, statusSink, abortSignal } = params;
   const core = getVkRuntime();
-  // Значения тянем через компат-слой: ядро переносит эти символы между
-  // версиями SDK, и статический импорт молча ломает загрузку плагина целиком.
   vkDiag("inbound entered");
-  const { createReplyPrefixOptions, createTypingCallbacks, logTypingFailure } =
-    await loadChannelMessageBits();
   const bridge = await loadCoreBridge(core);
   vkDiag("inbound sdk bits loaded");
   const pairing = createChannelPairingController({
@@ -238,14 +251,7 @@ export async function handleVkInbound(params: {
       });
       if (!dmAllowed.allowed) {
         if (dmPolicy === "pairing") {
-          // 8.1 убрала issuePairingChallenge из публичного SDK: тот же вызов
-          // теперь идёт через контроллер. На старом ядре контроллер метода не
-          // имеет — компат-слой откатывается на прямой вызов.
-          await issuePairingChallengeCompat({
-            controller: pairing,
-            channel: CHANNEL_ID,
-            upsertPairingRequest: pairing.upsertPairingRequest,
-            challenge: {
+          await pairing.issueChallenge({
             senderId: senderDisplay,
             senderIdLine: `Your VK user id: ${senderDisplay}`,
             meta: {},
@@ -261,7 +267,6 @@ export async function handleVkInbound(params: {
             },
             onReplyError: (err) => {
               runtime.error?.(`vk: pairing reply failed for ${senderDisplay}: ${String(err)}`);
-            },
             },
           });
         }
@@ -359,13 +364,16 @@ export async function handleVkInbound(params: {
     mediaRuntime: core.channel.media,
     logError: (line) => runtime.log?.(line),
   });
-  const mediaPaths = resolveVkInboundResolvedMediaPaths(resolvedMedia);
-  const downloadedMediaUrls = resolveVkInboundResolvedMediaUrls(resolvedMedia);
-  const downloadedMediaTypes = resolveVkInboundResolvedMediaTypes(resolvedMedia);
-  const mediaUrls =
-    mediaPaths.length > 0 ? downloadedMediaUrls : resolveVkInboundMediaUrls(message.attachments);
-  const mediaTypes =
-    mediaPaths.length > 0 ? downloadedMediaTypes : resolveVkInboundMediaTypes(message.attachments);
+  const media = toInboundMediaFacts(
+    resolvedMedia.map((entry) => ({
+      path: entry.path,
+      url: entry.url,
+      contentType: entry.contentType ?? entry.attachment.mimeType,
+      fileName: entry.attachment.title,
+      kind: resolveVkInboundMediaKind(entry.attachment.kind),
+    })),
+    { messageId: message.messageId },
+  );
 
   const ctxPayload = bridge.finalizeInboundContext({
     Body: body,
@@ -390,12 +398,7 @@ export async function handleVkInbound(params: {
     OriginatingChannel: CHANNEL_ID,
     OriginatingTo: `vk:${peerId}`,
     CommandAuthorized: commandGate.commandAuthorized,
-    MediaPath: mediaPaths[0],
-    MediaUrl: mediaUrls[0],
-    MediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
-    MediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
-    MediaType: mediaTypes[0],
-    MediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
+    media: media.length > 0 ? media : undefined,
     ReplyToId: message.replyToMessageId,
     ReplyToIdFull: message.replyToMessageId,
     ReplyToBody: message.replyToText,
