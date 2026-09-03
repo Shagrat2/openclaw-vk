@@ -502,6 +502,9 @@ export async function handleVkInbound(params: {
   }
 
   let progressDraft: VkProgressDraftHandle | null = null;
+  // Лёг ли в черновик текст ОТВЕТА (а не только список шагов). Живёт на весь
+  // ход, а не на одну доставку: блок приходит раньше финала.
+  let draftHoldsAnswer = false;
   if (progressDraftEnabled) {
     progressDraft = createVkProgressDraftCompositor({
       to: String(message.peerId),
@@ -595,6 +598,7 @@ export async function handleVkInbound(params: {
             const draftText = chunks[0]?.text ?? normalized.text;
             try {
               await progressDraft.overwrite(draftText);
+              draftHoldsAnswer = true;
               vkDiag("block into draft", { len: draftText.length });
               return;
             } catch (err) {
@@ -721,7 +725,17 @@ export async function handleVkInbound(params: {
           if (progressDraft && isFinal && !draftHandled) {
             progressDraft.compositor.markFinalReplyDelivered();
             progressDraft.close();
-            await progressDraft.remove();
+            // Черновик сносим только если ответ пришёл чем-то другим. Когда
+            // финал пуст, а в черновике уже лежит текст ответа (модель отдала
+            // его блоками по ходу), удаление уничтожает единственный экземпляр
+            // ответа — собеседник остаётся с одной голосовой. Так ломалось при
+            // переключении на локальную модель: у облачных финал несёт весь
+            // текст, у Qwen он приходит пустым.
+            if (draftHoldsAnswer && !normalized.text?.trim()) {
+              vkDiag("draft kept as answer");
+            } else {
+              await progressDraft.remove();
+            }
           }
         },
         onError: onDispatchError,

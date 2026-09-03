@@ -1556,6 +1556,42 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the draft when the final carries no text but the draft already holds the answer", async () => {
+    // Инцидент 02.09: после переключения на локальную модель текст ответа
+    // приходил блоком по ходу и ложился в черновик, а финал был пустым (только
+    // голосовая). Черновик при этом сносился — и собеседник оставался без
+    // текста вовсе. У облачных моделей финал несёт весь текст, поэтому там
+    // проблема не проявлялась.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        // Ответ приходит блоком и ложится в черновик…
+        await dispatcherOptions.deliver({ text: "вот полный ответ" }, { kind: "block" });
+        // …а финал несёт только голосовую, без текста.
+        await dispatcherOptions.deliver(
+          { text: "", mediaUrl: "/tmp/voice.ogg" },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // Черновик остаётся: он и есть ответ.
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
   it("builds no draft when streaming mode is off (default reactions/plain path)", async () => {
     mockResolveStreamMode.mockReturnValue("off");
     const runtime = installRuntime();
