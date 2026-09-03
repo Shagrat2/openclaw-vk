@@ -432,6 +432,9 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         config: ctx.cfg as CoreConfig,
         runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
+        // С 2026.8.1 состоянием канала владеет ядро: плагин публикует, что
+        // видит у своего long-poll, а перезапуск и бэкофф делает ядро.
+        setStatus: ctx.setStatus,
       });
 
       return monitor;

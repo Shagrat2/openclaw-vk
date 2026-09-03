@@ -1,6 +1,17 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk";
 import { VK } from "vk-io";
+import {
+  createAccountStatusSink,
+  createArmableStallWatchdog,
+  waitUntilAbort,
+} from "openclaw/plugin-sdk/channel-lifecycle";
+import {
+  channelReadyPatch,
+  channelStoppedPatch,
+  createTransportActivityStatusPatch,
+} from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveVkAccount } from "./accounts.js";
+import { instrumentPollingTransport } from "./transport-liveness.js";
 import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
 import { handleVkInbound } from "./inbound.js";
 import {
@@ -54,6 +65,13 @@ export type VkMonitorOptions = {
   config: CoreConfig;
   runtime: RuntimeEnv;
   abortSignal?: AbortSignal;
+  /**
+   * Приём состояния канала ядром. С 2026.8.1 перезапуском, бэкоффом и
+   * health-мониторингом владеет ядро — плагин только сообщает, что видит у
+   * своего long-poll. Патчи собираем каноническими билдерами SDK, чтобы
+   * значения совпадали с тем, что читает health-policy.
+   */
+  setStatus?: Parameters<typeof createAccountStatusSink>[0]["setStatus"];
 };
 
 // ── Long-poll watchdog tunables (env-overridable) ──────────────────────────
@@ -74,13 +92,17 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 // How often to inspect the poller heartbeat.
-const WATCHDOG_INTERVAL_MS = envInt("VK_LP_WATCHDOG_INTERVAL_MS", 30_000);
+/**
+ * Порог тишины транспорта. Ядро следит за `lastTransportActivityAt` и само,
+ * но с дефолтом в 30 минут; здесь мы лишь УСКОРЯЕМ ту же проверку до пары
+ * минут. Long poll ждёт события до ~25 с, поэтому 150 с — заведомо аномалия,
+ * а не спокойный диалог.
+ */
+const TRANSPORT_SILENCE_MS = envInt("VK_LP_SILENCE_MS", 150_000);
 // When the `ts` cursor is static or unreadable, probe the API after this much
 // idle, and restart after this many consecutive probe failures. (VK_LP_TS_STALE_MS
 // is retired: VK's `ts` is an event cursor that legitimately stays static on an
 // idle channel, so cursor staleness alone must never trigger a restart.)
-const IDLE_BEFORE_PROBE_MS = envInt("VK_LP_IDLE_PROBE_MS", 90_000);
-const PROBE_FAIL_LIMIT = envInt("VK_LP_PROBE_FAIL_LIMIT", 3);
 /**
  * Нужна ли per-peer сериализация входящих.
  *
@@ -111,7 +133,6 @@ const CORE_VERSION_WITH_MIRROR_FIX = "2026.7.1";
 // has the reply-session reentrancy fix, so the flush after a turn can't hit
 // #98562). ~1000-2000ms is a reasonable window for catching a quick follow-up.
 const INBOUND_DEBOUNCE_MS = envInt("VK_INBOUND_DEBOUNCE_MS", 0);
-const RESTART_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
 /**
  * Check whether the Bots Long Poll API is accessible for this token.
@@ -134,54 +155,6 @@ async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: numb
   } catch {
     return { ok: false };
   }
-}
-
-/**
- * Read vk-io's internal long-poll cursor (`ts`) as a string. VK's `ts` is an
- * EVENT cursor, not a per-request heartbeat: it advances only when the poll
- * delivers new events, and empty (idle) polls return the SAME value. User Long
- * Poll exposes it as a number; Bots Long Poll (groups.getLongPollServer) returns
- * it as a JSON string (e.g. "9") and vk-io stores it unchanged — so both types
- * must be accepted. Returns undefined when the field is not accessible (e.g.
- * webhook mode or a vk-io version that renames it).
- */
-export function readPollingCursor(vk: VK): string | undefined {
-  const transport = (vk.updates as unknown as { pollingTransport?: { ts?: unknown } })
-    ?.pollingTransport;
-  const ts = transport?.ts;
-  if (typeof ts === "number") return String(ts);
-  if (typeof ts === "string" && ts.length > 0) return ts;
-  return undefined;
-}
-
-/**
- * Fallback liveness probe (used only when the `ts` cursor is unreadable):
- * confirms the token can still reach VK. Uses groups.getById, which does NOT
- * touch the active long-poll key.
- */
-async function probeTokenAlive(vk: VK): Promise<boolean> {
-  try {
-    await vk.api.groups.getById({});
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Resolve after `ms`, or immediately when the abort signal fires. */
-function interruptibleDelay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }
 
 /**
@@ -210,8 +183,6 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     return;
   }
   opts.abortSignal?.addEventListener("abort", onAbort, { once: true });
-
-  let restartAttempt = 0;
 
   // One debouncer per monitor — buffers survive vk-io restarts (the `vk` client
   // is recreated inside the loop; the debouncer is not). Its per-key
@@ -302,16 +273,17 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     });
 
   try {
-    while (!stopped) {
+    {
       const vk = new VK({ token: opts.token, apiLimit: 20 });
-      let needRestart = false;
-      let restartReason = "";
-
-      const requestRestart = (reason: string) => {
-        if (needRestart) return;
-        needRestart = true;
-        restartReason = reason;
-      };
+      // Свой сигнал остановки: сторож тишины завершает задачу аккаунта, и
+      // ядро поднимает канал заново со своим бэкоффом.
+      const localStop = new AbortController();
+      const stopSignal = opts.abortSignal
+        ? AbortSignal.any([opts.abortSignal, localStop.signal])
+        : localStop.signal;
+      const publishStatus = opts.setStatus
+        ? createAccountStatusSink({ accountId: opts.accountId, setStatus: opts.setStatus })
+        : undefined;
 
       // Датчик на ВСЕ апдейты: показывает, доходят ли до плагина события
       // вообще. Без него «канал молчит» неотличимо от «VK не присылает
@@ -365,7 +337,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           outbox: context.isOutbox,
           len: (context.text ?? "").length,
         });
-        if (stopped || needRestart) {
+        if (stopped) {
           return;
         }
         // Skip outgoing messages
@@ -447,76 +419,81 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           await vk.updates.startPolling();
         }
 
-        // Poller started successfully — reset backoff.
-        restartAttempt = 0;
+        // ── Живость транспорта вместо своего сторожа ───────────────────
+        // Ядро с 2026.8.1 владеет перезапуском и бэкоффом, поэтому плагин
+        // больше не перезапускается сам: он публикует состояние и завершает
+        // задачу аккаунта, если long-poll залип.
+        //
+        // Честный признак живости один — HTTP-запрос за обновлениями вернулся.
+        // Курсор для этого не годится: он двигается по СОБЫТИЯМ, поэтому на
+        // тихом канале стоит часами, а `isStarted` остаётся true на залипшем
+        // транспорте. Проба токена подтверждает лишь, что жив обычный API.
+        //
+        // ⚠️ Инструментировать можно только ПОСЛЕ старта: `updates.start()`
+        // пересоздаёт транспорт, и обёртка, поставленная раньше, легла бы на
+        // выброшенный объект.
+        const stallWatchdog = createArmableStallWatchdog({
+          label: `vk:${opts.accountId} long-poll`,
+          timeoutMs: TRANSPORT_SILENCE_MS,
+          abortSignal: stopSignal,
+          runtime: opts.runtime,
+          onTimeout: ({ idleMs }) => {
+            const silentSec = Math.round(idleMs / 1000);
+            publishStatus?.(
+              channelStoppedPatch({
+                lastError: `no completed long-poll request for ${silentSec}s`,
+                lastDisconnect: {
+                  at: Date.now(),
+                  error: `long poll silent for ${silentSec}s`,
+                },
+              }),
+            );
+            opts.runtime.log(
+              `${tag} long poll silent for ${silentSec}s — handing restart to the gateway`,
+            );
+            localStop.abort();
+          },
+        });
 
-        // ── Watchdog loop (probe-based liveness) ────────────────────────
-        // A MOVING cursor is a free liveness proof. A static cursor is
-        // ambiguous — it means EITHER a genuinely idle channel (empty polls
-        // don't advance VK's event cursor) OR a wedged poll loop — so it never
-        // restarts anything on its own. When the cursor is static or unreadable
-        // for long enough, we actively probe the token and restart only after
-        // repeated probe failures (a real outage), never on quiet alone.
-        let lastCursor = readPollingCursor(vk);
-        let lastBeatAt = Date.now();
-        let probeFailures = 0;
-        while (!stopped && !needRestart) {
-          await interruptibleDelay(WATCHDOG_INTERVAL_MS, opts.abortSignal);
-          if (stopped || needRestart) break;
+        const instrumented = instrumentPollingTransport(vk.updates, () => {
+          stallWatchdog.touch();
+          publishStatus?.(createTransportActivityStatusPatch());
+        });
 
-          // The polling transport stopped entirely.
-          if (!vk.updates.isStarted) {
-            requestRestart("polling transport stopped (isStarted=false)");
-            break;
-          }
+        const startedAt = Date.now();
+        publishStatus?.(
+          channelReadyPatch({
+            lastConnectedAt: startedAt,
+            ...createTransportActivityStatusPatch(startedAt),
+            mode: "longpoll",
+          }),
+        );
 
-          const cursor = readPollingCursor(vk);
-          if (cursor !== undefined && cursor !== lastCursor) {
-            // Cursor advanced → the poll loop delivered events. Alive.
-            lastCursor = cursor;
-            lastBeatAt = Date.now();
-            probeFailures = 0;
-            continue;
-          }
-
-          // Cursor static or unreadable → probe the token after a long idle.
-          // Restart only on repeated probe failures, never on a quiet cursor.
-          if (Date.now() - lastBeatAt >= IDLE_BEFORE_PROBE_MS) {
-            const alive = await probeTokenAlive(vk);
-            lastBeatAt = Date.now();
-            if (alive) {
-              probeFailures = 0;
-            } else {
-              probeFailures += 1;
-              opts.runtime.log?.(
-                `${tag} VK token probe failed (${probeFailures}/${PROBE_FAIL_LIMIT})`,
-              );
-              if (probeFailures >= PROBE_FAIL_LIMIT) {
-                requestRestart("VK token unreachable");
-                break;
-              }
-            }
-          }
+        if (instrumented) {
+          stallWatchdog.arm();
+        } else {
+          // Снять сигнал не вышло — говорим вслух, вместо того чтобы делать
+          // вид, что канал под наблюдением. Ядро заметит застой по своему
+          // порогу, просто позже.
+          opts.runtime.log(
+            `${tag} poll instrumentation unavailable — transport liveness will not be reported`,
+          );
         }
+
+        await waitUntilAbort(stopSignal);
       } catch (err) {
+        // Ошибку публикуем и выходим: перезапуском владеет ядро.
         const msg = err instanceof Error ? err.message : String(err);
-        requestRestart(`poller error: ${msg}`);
+        publishStatus?.(
+          channelStoppedPatch({
+            lastError: msg,
+            lastDisconnect: { at: Date.now(), error: msg },
+          }),
+        );
+        opts.runtime.log(`${tag} VK long-poll failed — handing restart to the gateway: ${msg}`);
       } finally {
         await stopVk();
       }
-
-      if (stopped) {
-        break;
-      }
-
-      // Backoff before recreating the poller.
-      const backoff =
-        RESTART_BACKOFF_MS[Math.min(restartAttempt, RESTART_BACKOFF_MS.length - 1)];
-      restartAttempt += 1;
-      opts.runtime.log?.(
-        `${tag} VK long-poll restarting in ${Math.round(backoff / 1000)}s — ${restartReason || "unknown reason"}`,
-      );
-      await interruptibleDelay(backoff, opts.abortSignal);
     }
   } finally {
     opts.abortSignal?.removeEventListener("abort", onAbort);

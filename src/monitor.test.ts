@@ -2,6 +2,41 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (for transitive accounts.ts and runtime.ts imports) ────────────
 
+const mockStatusPatches = vi.hoisted(() => [] as unknown[]);
+const mockPollingTransport = vi.hoisted(() => ({
+  fetchUpdates: vi.fn().mockResolvedValue(undefined),
+}));
+const mockWatchdog = vi.hoisted(() => ({
+  arm: vi.fn(),
+  touch: vi.fn(),
+  disarm: vi.fn(),
+}));
+vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
+  createAccountStatusSink:
+    ({ accountId }: { accountId: string }) =>
+    (patch: Record<string, unknown>) =>
+      mockStatusPatches.push({ accountId, ...patch }),
+  createArmableStallWatchdog: vi.fn(() => mockWatchdog),
+  waitUntilAbort: (signal: AbortSignal) =>
+    new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    }),
+}));
+vi.mock("openclaw/plugin-sdk/gateway-runtime", () => ({
+  channelReadyPatch: (extras: Record<string, unknown> = {}) => ({
+    lifecycle: "ready",
+    ...extras,
+  }),
+  channelStoppedPatch: (extras: Record<string, unknown> = {}) => ({
+    lifecycle: "stopped",
+    ...extras,
+  }),
+  createTransportActivityStatusPatch: (at?: number) => ({
+    lastTransportActivityAt: at ?? Date.now(),
+  }),
+}));
+
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
   redactSensitiveText: (text: string) => text,
@@ -32,9 +67,9 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
 import {
   combineVkInboundMessages,
   monitorVkProvider,
-  readPollingCursor,
   resolveSerializeInbound,
 } from "./monitor.js";
+import { createArmableStallWatchdog } from "openclaw/plugin-sdk/channel-lifecycle";
 import { VK } from "vk-io";
 import { setVkRuntime } from "./runtime.js";
 import {
@@ -77,6 +112,9 @@ vi.mock("vk-io", () => ({
         startPolling: mockUpdatesStartPolling,
         stop: mockUpdatesStop,
         on: mockUpdatesOn,
+        use: vi.fn(),
+        // Через него снимается сигнал живости: обёртка вокруг fetchUpdates.
+        pollingTransport: mockPollingTransport,
       },
     };
   }),
@@ -109,6 +147,13 @@ vi.mock("./sdk-compat.js", () => ({
 }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Даёт стартовой части монитора добежать до ожидания сигнала остановки. */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 20; i += 1) {
+    await Promise.resolve();
+  }
+}
 
 function baseCfg(): CoreConfig {
   return { channels: { vk: { token: "test-token" } } };
@@ -538,33 +583,6 @@ describe("combineVkInboundMessages", () => {
   });
 });
 
-describe("readPollingCursor", () => {
-  const vkWith = (ts: unknown): VK =>
-    ({ updates: { pollingTransport: { ts } } }) as unknown as VK;
-
-  it("reads a numeric ts (User Long Poll) as a string", () => {
-    expect(readPollingCursor(vkWith(5))).toBe("5");
-  });
-
-  it("reads a string ts (Bots Long Poll) — primary liveness path engages", () => {
-    // Regression guard for finding #1: VK's groups.getLongPollServer returns
-    // `ts` as a JSON string ("9"), and vk-io stores it unchanged. The old
-    // numeric-only check dropped it, so in Bots LP mode the cursor was always
-    // unreadable and the watchdog silently degraded to the fallback probe.
-    expect(readPollingCursor(vkWith("9"))).toBe("9");
-  });
-
-  it("treats an empty string ts as unreadable", () => {
-    expect(readPollingCursor(vkWith(""))).toBeUndefined();
-  });
-
-  it("returns undefined when ts is missing or the transport is absent", () => {
-    expect(readPollingCursor(vkWith(undefined))).toBeUndefined();
-    expect(readPollingCursor({ updates: {} } as unknown as VK)).toBeUndefined();
-    expect(readPollingCursor({} as unknown as VK)).toBeUndefined();
-  });
-});
-
 // ── Watchdog liveness policy (end-to-end over the supervision loop) ──────────
 //
 // The unit tests above cover how the cursor is READ; these cover what the
@@ -573,140 +591,71 @@ describe("readPollingCursor", () => {
 // tear down perfectly healthy idle channels), and nothing guarded the new
 // state transitions — a regression there is invisible until VK ingress either
 // dies silently or flaps in production.
-describe("monitorVkProvider — watchdog liveness policy", () => {
-  const WATCHDOG_TICK_MS = 30_000;
-  const IDLE_BEFORE_PROBE_MS = 90_000;
-
-  /** Drives the supervision loop `ticks` watchdog intervals forward. */
-  async function advanceTicks(ticks: number) {
-    for (let i = 0; i < ticks; i++) {
-      await vi.advanceTimersByTimeAsync(WATCHDOG_TICK_MS);
-      await flush();
-    }
-  }
-
-  /** Makes the mocked transport report a given cursor and started state. */
-  function transport(ts: unknown, isStarted = true) {
-    const updates = {
-      start: mockUpdatesStart,
-      startPolling: mockUpdatesStartPolling,
-      stop: mockUpdatesStop,
-      on: mockUpdatesOn,
-      isStarted,
-      pollingTransport: { ts },
-    };
-    (VK as unknown as { mockImplementation: (f: () => unknown) => void })
-      .mockImplementation(function () {
-        return {
-          api: {
-            groups: {
-              getById: mockGroupsGetById,
-              getLongPollServer: mockGroupsGetLongPollServer,
-            },
-          },
-          updates,
-        };
-      });
-    return updates;
-  }
-
+describe("monitorVkProvider — состояние канала для ядра", () => {
   beforeEach(() => {
-    vi.useFakeTimers();
+    mockStatusPatches.length = 0;
+    mockWatchdog.arm.mockClear();
+    mockWatchdog.touch.mockClear();
+    mockPollingTransport.fetchUpdates = vi.fn().mockResolvedValue(undefined);
+    delete (mockPollingTransport as Record<string, unknown>).__vkPollInstrumented;
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
+  it("сообщает о готовности с отметкой активности транспорта", async () => {
+    const setStatus = vi.fn();
+    const { promise, controller } = startMonitor({ setStatus });
+    await flushMicrotasks();
 
-  it("treats a moving string cursor as proof of life and never probes", async () => {
-    // Bots Long Poll delivers `ts` as a string; a cursor that advances means the
-    // poll loop is delivering events, so the token must not be probed at all.
-    const updates = transport("100");
-    const { controller, promise } = startMonitor();
-    await flush();
-    mockGroupsGetById.mockClear();
+    const ready = mockStatusPatches.find(
+      (p) => (p as { lifecycle?: string }).lifecycle === "ready",
+    ) as Record<string, unknown> | undefined;
+    expect(ready).toBeDefined();
+    expect(ready?.mode).toBe("longpoll");
+    expect(typeof ready?.lastTransportActivityAt).toBe("number");
+    expect(mockWatchdog.arm).toHaveBeenCalledTimes(1);
 
-    for (let i = 1; i <= 6; i++) {
-      updates.pollingTransport.ts = String(100 + i);
-      await advanceTicks(1);
-    }
-
-    expect(mockGroupsGetById).not.toHaveBeenCalled();
-    expect(mockUpdatesStop).not.toHaveBeenCalled();
     controller.abort();
     await promise;
   });
 
-  it("keeps a quiet channel alive for an hour while probes succeed", async () => {
-    // A static cursor is ambiguous — an idle chat looks exactly like a wedged
-    // poll loop. As long as the token answers, quiet must never cost a restart.
-    transport("42");
-    const { controller, promise } = startMonitor();
-    await flush();
-    mockUpdatesStop.mockClear();
-    mockGroupsGetById.mockClear();
+  it("считает живым каждый завершённый опрос, включая пустой", async () => {
+    const setStatus = vi.fn();
+    const { promise, controller } = startMonitor({ setStatus });
+    await flushMicrotasks();
+    mockStatusPatches.length = 0;
+    mockWatchdog.touch.mockClear();
 
-    await advanceTicks(120); // an hour of silence
+    // Пустой ответ long-poll — событий нет, но запрос завершился.
+    await mockPollingTransport.fetchUpdates();
 
-    expect(mockGroupsGetById.mock.calls.length).toBeGreaterThan(0); // probed
-    expect(mockUpdatesStop).not.toHaveBeenCalled(); // but never restarted
-    controller.abort();
-    await promise;
-  });
-
-  it("restarts only after repeated probe failures", async () => {
-    transport("42");
-    const { controller, promise } = startMonitor();
-    await flush();
-    mockUpdatesStop.mockClear();
-    mockGroupsGetById.mockClear();
-    mockGroupsGetById.mockRejectedValue(new Error("network down"));
-
-    // One failed probe is not enough — a single hiccup must not tear down VK.
-    await advanceTicks(IDLE_BEFORE_PROBE_MS / WATCHDOG_TICK_MS + 1);
-    expect(mockUpdatesStop).not.toHaveBeenCalled();
-
-    // Three consecutive failures mean a real outage → restart in place.
-    await advanceTicks(20);
-    expect(mockGroupsGetById.mock.calls.length).toBeGreaterThanOrEqual(3);
-    expect(mockUpdatesStop).toHaveBeenCalled();
-
-    mockGroupsGetById.mockResolvedValue({
-      groups: [{ id: 12345678, name: "Test Group" }],
+    expect(mockWatchdog.touch).toHaveBeenCalledTimes(1);
+    expect(mockStatusPatches.at(-1)).toMatchObject({
+      lastTransportActivityAt: expect.any(Number),
     });
+
     controller.abort();
     await promise;
   });
 
-  it("treats an unreadable cursor like a static one, not as a failure", async () => {
-    // Cursor unreadable (transport shape changed, empty ts, …) → same policy:
-    // probe, and restart only if the probe itself keeps failing.
-    transport(undefined);
-    const { controller, promise } = startMonitor();
-    await flush();
-    mockUpdatesStop.mockClear();
-    mockGroupsGetById.mockClear();
+  it("на залипшем транспорте сообщает разрыв и завершает задачу, а не перезапускается сам", async () => {
+    const setStatus = vi.fn();
+    const { promise, controller } = startMonitor({ setStatus });
+    await flushMicrotasks();
 
-    await advanceTicks(20);
+    // Сторож тишины сработал: имитируем его вызов.
+    const onTimeout = vi.mocked(createArmableStallWatchdog).mock.calls.at(-1)?.[0]
+      ?.onTimeout as ((info: { idleMs: number }) => void) | undefined;
+    expect(onTimeout).toBeTypeOf("function");
+    onTimeout?.({ idleMs: 150_000 });
 
-    expect(mockGroupsGetById.mock.calls.length).toBeGreaterThan(0);
-    expect(mockUpdatesStop).not.toHaveBeenCalled();
+    await promise; // задача аккаунта завершилась сама — рестарт делает ядро
+
+    const stopped = mockStatusPatches.find(
+      (p) => (p as { lifecycle?: string }).lifecycle === "stopped",
+    ) as Record<string, unknown> | undefined;
+    expect(stopped).toBeDefined();
+    expect(String(stopped?.lastError)).toContain("no completed long-poll request");
+    expect(stopped?.lastDisconnect).toMatchObject({ at: expect.any(Number) });
     controller.abort();
-    await promise;
-  });
-
-  it("restarts immediately when the transport reports isStarted=false", async () => {
-    // The poller stopped outright — no ambiguity here, no need to wait or probe.
-    transport("42", false);
-    const { controller, promise } = startMonitor();
-    await flush();
-    mockUpdatesStop.mockClear();
-
-    await advanceTicks(1);
-
-    expect(mockUpdatesStop).toHaveBeenCalled();
-    controller.abort();
-    await promise;
   });
 });
 
