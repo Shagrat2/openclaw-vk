@@ -101,7 +101,7 @@ type CoreBridge = {
 };
 
 type LooseCore = {
-  config?: { loadConfig?: unknown };
+  config?: { loadConfig?: unknown; current?: unknown };
   channel?: {
     reply?: Record<string, unknown>;
     session?: Record<string, unknown>;
@@ -114,13 +114,15 @@ let bridgePromise: Promise<CoreBridge> | null = null;
 export function loadCoreBridge(core: unknown): Promise<CoreBridge> {
   bridgePromise ??= (async () => {
     const legacy = core as LooseCore;
-    const [configRuntime, replyDispatch, channelInbound, commandAuth, sessionStore] =
+    // Только канонические подпути: широкие `config-runtime` и `command-auth`
+    // ядро объявило устаревшими, и guard репозитория их запрещает.
+    const [replyDispatch, channelInbound, commandAuth, sessionStore, sessionPaths] =
       await Promise.all([
-        import("openclaw/plugin-sdk/config-runtime"),
         import("openclaw/plugin-sdk/reply-dispatch-runtime"),
         import("openclaw/plugin-sdk/channel-inbound"),
-        import("openclaw/plugin-sdk/command-auth"),
+        import("openclaw/plugin-sdk/command-auth-native"),
         import("openclaw/plugin-sdk/session-store-runtime"),
+        import("openclaw/plugin-sdk/session-store-paths"),
       ]);
     const pick = <T>(fromCore: unknown, fromSdk: unknown, name: string): T => {
       const fn = typeof fromCore === "function" ? fromCore : fromSdk;
@@ -129,26 +131,36 @@ export function loadCoreBridge(core: unknown): Promise<CoreBridge> {
       }
       return fn as T;
     };
-    const sdk = configRuntime as Record<string, unknown>;
-    const sessions = sessionStore as Record<string, unknown>;
+    const sessions = {
+      ...(sessionPaths as Record<string, unknown>),
+      ...(sessionStore as Record<string, unknown>),
+    };
     const reply = replyDispatch as Record<string, unknown>;
     const inbound = channelInbound as Record<string, unknown>;
     const commands = commandAuth as Record<string, unknown>;
     return {
-      loadConfig: pick(legacy.config?.loadConfig, sdk.loadConfig, "loadConfig"),
+      // Конфиг берём у рантайма (`config.current()`), а на старом ядре — из
+      // его же `config.loadConfig`. Отдельного модуля для этого больше нет.
+      loadConfig: pick(
+        legacy.config?.loadConfig,
+        typeof legacy.config?.current === "function"
+          ? () => (legacy.config as { current: () => unknown }).current()
+          : undefined,
+        "loadConfig",
+      ),
       resolveStorePath: pick(
         legacy.channel?.session?.resolveStorePath,
-        sessions.resolveStorePath ?? sdk.resolveStorePath,
+        sessions.resolveStorePath,
         "resolveStorePath",
       ),
       readSessionUpdatedAt: pick(
         legacy.channel?.session?.readSessionUpdatedAt,
-        sessions.readSessionUpdatedAt ?? sdk.readSessionUpdatedAt,
+        sessions.readSessionUpdatedAt,
         "readSessionUpdatedAt",
       ),
       recordInboundSession: pick(
         legacy.channel?.session?.recordInboundSession,
-        sessions.recordInboundSessionMeta ?? sdk.recordSessionMetaFromInbound,
+        sessions.recordInboundSessionMeta ?? sessions.recordSessionMetaFromInbound,
         "recordInboundSession",
       ),
       dispatchReplyWithBufferedBlockDispatcher: pick(
