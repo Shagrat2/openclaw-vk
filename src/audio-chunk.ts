@@ -28,6 +28,17 @@ function getAudioSplitMaxTotalMs(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_TOTAL_MS", 60 * 60 * 1000);
 }
 
+/**
+ * Допуск на перелёт границы куска. `-c copy` режет только по ключевым кадрам,
+ * поэтому кусок стабильно выходит на десятки миллисекунд длиннее заказанного
+ * (замер: запрос 10.000 с → файл 10.020 с). Без допуска строгая проверка
+ * `actual > maxMs` выбрасывала ВСЮ нарезку, и длинный ответ уходил одним
+ * файлом, который VK отвергает — то есть лечение было хуже болезни.
+ */
+function getAudioSegmentToleranceMs(): number {
+  return readPositiveIntEnv("VK_AUDIO_SEGMENT_TOLERANCE_MS", 2_000);
+}
+
 /** Потолок числа кусков: столько голосовых подряд собеседник читать не станет. */
 function getAudioSplitMaxSegments(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_SEGMENTS", 12);
@@ -106,7 +117,7 @@ export async function probeAudioDurationMs(
       "-of",
       "default=nw=1:nk=1",
       file,
-    ]);
+    ], signal);
     const seconds = Number.parseFloat(stdout.trim());
     if (!Number.isFinite(seconds) || seconds <= 0) {
       return null;
@@ -375,7 +386,7 @@ export async function splitAudioAtSilence(
     } catch {
       actual = null;
     }
-    if (actual !== null && actual > maxMs) {
+    if (actual !== null && actual > maxMs + getAudioSegmentToleranceMs()) {
       await cleanupAudioSegments(outputs);
       await rm(dir, { recursive: true, force: true }).catch(() => {});
       return [];

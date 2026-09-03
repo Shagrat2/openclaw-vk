@@ -116,9 +116,17 @@ export function describeVkSourceKind(
  * строку выбросить нельзя — без неё непонятно, что случилось.
  */
 function scrubNames(text: string): string {
-  return text
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
-    .replace(/(?:~|\.)?(?:\/[\w.@+-]+){2,}\/?/g, "<path>");
+  return (
+    text
+      .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
+      // POSIX-пути.
+      .replace(/(?:~|\.)?(?:\/[\w.@+-]+){2,}\/?/g, "<path>")
+      // Windows-пути: `C:\Users\…` и UNC `\\host\share\…`. Раньше уходили
+      // в лог целиком — регулярка знала только про слэш вперёд.
+      .replace(/(?:[a-z]:)?(?:\\[\w.@+ -]+){2,}\\?/gi, "<path>")
+      // Одиночное имя файла без пути: тоже имя, и по нему опознаётся вложение.
+      .replace(/\b[\w.@+-]+\.(?:jpe?g|png|gif|webp|ogg|opus|mp3|m4a|wav|mp4|pdf|docx?|xlsx?|zip|json|md|txt)\b/gi, "<file>")
+  );
 }
 
 /** Строка, которая называет файл или адрес, а не описывает происходящее. */
@@ -136,13 +144,44 @@ function namesSomething(value: string): boolean {
  * Единственное место, где решается, что попадёт в лог. Все поля проходят здесь,
  * поэтому новое место вызова не может «забыть» обезличить своё значение.
  */
-function redactField(key: string, value: unknown, level: VkDiagLevel): unknown {
+function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0): unknown {
+  // Ограничитель глубины стоит ДО разбора массивов: иначе массив, ссылающийся
+  // сам на себя, уходит в бесконечную рекурсию и роняет отправку по стеку —
+  // `vkDiag` вызывается прямо на пути отправки и ни во что не завёрнут.
+  if (depth >= 4) {
+    return "[глубже 4 уровней]";
+  }
   if (Array.isArray(value)) {
-    return value.map((item) => redactField(key, item, level));
+    return value.map((item) => redactField(key, item, level, depth + 1));
   }
   if (Buffer.isBuffer(value)) {
     // Содержимое вложения не пишем никогда, ни на одном уровне.
     return "buffer";
+  }
+  if (value instanceof Error) {
+    // Ошибка как значение поля превращалась в `{}` — сообщение терялось.
+    return redactField(key, `${value.name}: ${value.message}`, level, depth + 1);
+  }
+  if (value && typeof value === "object") {
+    // Вложенные объекты раньше уходили в лог КАК ЕСТЬ, мимо редактора: любое
+    // поле-объект с путём или peer id было утечкой. Разбираем рекурсивно и
+    // ограничиваем глубину, чтобы циклическая ссылка не увела в бесконечность.
+    if (value instanceof Map || value instanceof Set) {
+      return `[${value.constructor.name}, ${value.size}]`;
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) {
+        out[k] = redactField(k, v, level, depth + 1);
+      }
+    }
+    return out;
+  }
+  // Идентификаторы приходят и числами (`peerId: 12324712`), а не только
+  // строками — проверку на них надо делать ДО отсечения нестрок, иначе peer id
+  // уходит в лог сырым. На этом и попались: тесты подавали id строкой.
+  if (typeof value === "number" && IDENTIFIER_FIELDS.has(key)) {
+    return level === "full" ? value : redactIdentifier(String(value));
   }
   if (typeof value !== "string") {
     return value;
@@ -267,9 +306,16 @@ function appendVkDiagFile(event: string, fields: Record<string, unknown>): void 
   if (!target) {
     return;
   }
-  const rendered = Object.entries(fields)
-    .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
-    .join(" ");
+  // Сериализация в try: циклическая ссылка в поле роняла `JSON.stringify`, а он
+  // стоит на пути отправки сообщения — диагностика не имеет права уронить ответ.
+  let rendered: string;
+  try {
+    rendered = Object.entries(fields)
+      .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+      .join(" ");
+  } catch {
+    rendered = "[поля не сериализуются]";
+  }
   const line = `[${new Date().toISOString()}] ${event}${rendered ? ` ${rendered}` : ""}\n`;
   diagFileTail = diagFileTail.then(
     () => appendFile(target, line).catch(() => undefined),

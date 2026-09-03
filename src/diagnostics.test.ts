@@ -151,6 +151,49 @@ describe("VK diagnostics levels", () => {
     expect(redactVkId(12324712)).toBe("12324712");
   });
 
+  it("не пропускает имена мимо редактора ни одним из обходных путей", () => {
+    // Каждый случай найден пробой 03.09 — все просачивались в лог как есть.
+    process.env.VK_DIAG_LEVEL = "redacted";
+    vkDiag("probe", {
+      windows: "C:\\Users\\ivan\\Secret\\frame.jpg",
+      bareFile: "frame-024-secret.jpg",
+      nested: { path: "/srv/media/secret.jpg", peerId: 12324712 },
+      // peerId числом: проверка идентификаторов раньше стояла после отсечения
+      // нестрок, поэтому числовой id уходил сырым.
+      peerId: 12324712,
+      failure: new Error("ENOENT: open '/srv/media/secret.jpg'"),
+    });
+    const f = lastFields(mockLogger.info);
+    const rendered = JSON.stringify(f);
+    expect(rendered).not.toContain("Secret");
+    expect(rendered).not.toContain("frame-024-secret");
+    expect(rendered).not.toContain("/srv/media");
+    expect(rendered).not.toContain("12324712");
+    expect(f.peerId).toBe("sha256:8");
+    expect((f.nested as Record<string, unknown>).peerId).toBe("sha256:8");
+    // Сообщение ошибки сохраняется — терялось как `{}`.
+    expect(String(f.failure)).toContain("ENOENT");
+  });
+
+  it("не падает на циклическом МАССИВЕ", () => {
+    // Ограничитель глубины стоял только в ветке объектов, поэтому массив,
+    // ссылающийся сам на себя, уходил в бесконечную рекурсию и ронял отправку.
+    process.env.VK_DIAG_LEVEL = "full";
+    const arr: unknown[] = ["x"];
+    arr.push(arr);
+    expect(() => vkDiag("probe", { arr })).not.toThrow();
+  });
+
+  it("не падает на циклической ссылке в поле", () => {
+    // JSON.stringify стоит на пути отправки: исключение здесь уронило бы ответ.
+    process.env.VK_DIAG_LEVEL = "full";
+    process.env.VK_VOICE_DEBUG_LOG = "/dev/null";
+    const cyclic: Record<string, unknown> = { name: "x" };
+    cyclic.self = cyclic;
+    expect(() => vkDiag("probe", { cyclic })).not.toThrow();
+    delete process.env.VK_VOICE_DEBUG_LOG;
+  });
+
   it("names the kind of source without naming the source", () => {
     expect(describeVkSourceKind("/srv/media/a.jpg")).toBe("local");
     expect(describeVkSourceKind("https://example.org/a.png")).toBe("remote");

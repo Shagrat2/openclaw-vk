@@ -808,6 +808,33 @@ describe("sendAudioMessageVk", () => {
     expect(result).toEqual({ messageId: "88", chatId: "456" });
   });
 
+  it("берёт свежий upload_url на каждую попытку заливки", async () => {
+    // upload_url у VK одноразовый: повтор multipart по уже использованному
+    // адресу падал бы всегда, и ретрай на «file is undefined» был бы бесполезен.
+    const fileUndefined = Object.assign(new Error("file is undefined"), { code: 100 });
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/first" })
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/second" });
+    mockUploadAudioMessage
+      .mockReset()
+      .mockRejectedValueOnce(fileUndefined)
+      .mockResolvedValueOnce("audio_message123_789");
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    await sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", undefined, {
+      cfg,
+    });
+
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]?.source?.uploadUrl).toBe(
+      "https://upload.vk.example/first",
+    );
+    expect(mockUploadAudioMessage.mock.calls[1]?.[0]?.source?.uploadUrl).toBe(
+      "https://upload.vk.example/second",
+    );
+  });
+
   it("does not replay the upload when code=15 comes from a later stage", async () => {
     // Постоянный отказ по правам на самой заливке: повторять нечего, лишние
     // попытки только оттягивают штатный переход на отправку документом.

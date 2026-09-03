@@ -936,39 +936,39 @@ async function uploadVkAudioMessage(params: {
   //
   // `docs.getMessagesUploadServer(type=audio_message)` под нагрузкой отдаёт
   // code=15 транзиентно (замер: ~20% против нуля при последовательной
-  // отправке), и повторный запрос проходит. Раньше в повтор был обёрнут весь
-  // конвейер — «взять сервер → залить файл → сохранить документ», до пяти раз.
-  // Это неверно по двум причинам: настоящий отказ по правам постоянен, и пять
-  // попыток лишь тянут время до штатного перехода на документ; а повтор после
-  // успешной заливки может создать документ дважды.
+  // отправке), и повторный запрос проходит. Оборачивать в повтор весь конвейер
+  // («взять сервер → залить → сохранить») неверно: настоящий отказ по правам
+  // постоянен, а повтор после успешной заливки может создать документ дважды.
   //
-  // Запрос сервера идемпотентен — его повторять безопасно. vk-io позволяет
-  // отдать готовый `uploadUrl` в источнике: тогда `conduct` не ходит за
-  // сервером сам, и заливка с сохранением выполняются ровно один раз.
-  const uploadUrl = await withVkRetry(
-    async () => {
-      const server = (await params.vk.api.docs.getMessagesUploadServer({
-        type: "audio_message",
-        peer_id: params.peerId,
-      })) as { upload_url?: string };
-      if (!server?.upload_url) {
-        throw new Error("VK audio upload: getMessagesUploadServer returned no upload_url");
-      }
-      return server.upload_url;
-    },
-    { extraRetryableCodes: [15] },
-  );
+  // Адрес берём на КАЖДУЮ попытку заливки, а не один раз: upload_url у VK
+  // короткоживущий и по сути одноразовый, поэтому повтор multipart по уже
+  // использованному адресу падал бы всегда — и ретрай на «file is undefined»
+  // был бы бесполезен.
+  const requestUploadUrl = (): Promise<string> =>
+    withVkRetry(
+      async () => {
+        const server = (await params.vk.api.docs.getMessagesUploadServer({
+          type: "audio_message",
+          peer_id: params.peerId,
+        })) as { upload_url?: string };
+        if (!server?.upload_url) {
+          throw new Error("VK audio upload: getMessagesUploadServer returned no upload_url");
+        }
+        return server.upload_url;
+      },
+      { extraRetryableCodes: [15] },
+    );
 
   const attachment = await runMediaUpload({
     kind: "audio",
     source: params.source,
     mime: params.contentType,
     token: params.token,
-    upload: () =>
-      params.vk.upload.audioMessage({
+    upload: async () =>
+      await params.vk.upload.audioMessage({
         peer_id: params.peerId,
         source: {
-          uploadUrl,
+          uploadUrl: await requestUploadUrl(),
           values: [
             buildVkUploadSource({
               source: params.source,
@@ -1021,7 +1021,9 @@ async function deliverTtsContinuation(params: {
     let segments: string[] = [];
     try {
       if ((part.durationMs ?? 0) > maxMs) {
-        segments = await splitAudioAtSilence(file, maxMs);
+        segments = await splitAudioAtSilence(file, maxMs, {
+          signal: params.opts.abortSignal,
+        });
       }
     } catch {
       segments = [];
@@ -1103,6 +1105,11 @@ export async function sendAudioMessageVk(
 
   // ── Attempt silence-based split for over-limit local audio ────────────────
   const local = await materializeLocalAudioFile(audioSource, title);
+  // Источник для одиночной отправки. Для ссылки это скачанный нами файл, а не
+  // сам URL: иначе vk-io тянет те же байты во второй раз — мы уже скачали их,
+  // чтобы измерить длительность.
+  let uploadSource: string | Buffer = audioSource;
+  let uploadCleanup: (() => Promise<void>) | null = null;
   // Head duration doubles as the key that claims this reply's continuation parts.
   let headDurationMs: number | null = null;
   if (local) {
@@ -1143,7 +1150,13 @@ export async function sendAudioMessageVk(
         await local.cleanup();
       }
     }
-    await local.cleanup();
+    if (typeof audioSource === "string" && isHttpUrl(audioSource)) {
+      // Скачанное оставляем до конца отправки и убираем после.
+      uploadSource = local.path;
+      uploadCleanup = local.cleanup;
+    } else {
+      await local.cleanup();
+    }
   }
 
   // ── Single-message path (short audio / split unavailable) ─────────────────
@@ -1151,9 +1164,11 @@ export async function sendAudioMessageVk(
     vk,
     token: account.token,
     peerId,
-    source: audioSource,
+    source: uploadSource,
     filename: title,
     contentType: uploadMeta?.contentType,
+  }).finally(async () => {
+    await uploadCleanup?.();
   });
   const firstResult = await sendVkApiMessage({
     to: normalizedTo,

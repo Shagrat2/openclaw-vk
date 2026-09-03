@@ -334,7 +334,9 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         // Датчик на самом входе: без него «канал принимает, но не отвечает»
         // неотличимо от «событие вообще не пришло» — а это разные поломки.
         vkDiag("inbound event", {
-          id: context.id,
+          // Именно `messageId`, а не `id`: обезличиваются поля из списка
+          // IDENTIFIER_FIELDS, и под именем `id` сырой VK message id уходил в лог.
+          messageId: context.id,
           peerId: context.peerId,
           outbox: context.isOutbox,
           len: (context.text ?? "").length,

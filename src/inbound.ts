@@ -507,9 +507,11 @@ export async function handleVkInbound(params: {
   }
 
   let progressDraft: VkProgressDraftHandle | null = null;
-  // Лёг ли в черновик текст ОТВЕТА (а не только список шагов). Живёт на весь
-  // ход, а не на одну доставку: блок приходит раньше финала.
-  let draftHoldsAnswer = false;
+  // Текст ОТВЕТА, лежащий сейчас в черновике (не список шагов). Живёт на весь
+  // ход, а не на одну доставку: блок приходит раньше финала. Сбрасывается,
+  // когда черновик перезатирают шагами инструментов — иначе сохранили бы как
+  // «ответ» список шагов.
+  let draftAnswerText: string | null = null;
   if (progressDraftEnabled) {
     progressDraft = createVkProgressDraftCompositor({
       to: String(message.peerId),
@@ -600,17 +602,32 @@ export async function handleVkInbound(params: {
             !(normalized.mediaUrls?.length ?? 0) &&
             !resolvedButtons
           ) {
-            const chunks = renderVkMarkdownChunks(normalized.text);
-            // Метку добавляет сам черновик (единственная точка записи).
-            const draftText = chunks[0]?.text ?? normalized.text;
-            try {
-              await progressDraft.overwrite(draftText);
-              draftHoldsAnswer = true;
-              vkDiag("block into draft", { len: draftText.length });
-              return;
-            } catch (err) {
-              runtime.log?.(`vk: block → draft failed: ${String(err)}`);
-              // не смогли переписать черновик — пусть уходит обычным путём
+            // Блоки — это КУСКИ ответа, а не его накопленная версия (ядро режет
+            // поток через block-chunker). Черновик перезаписывается целиком,
+            // поэтому копим сами: иначе на пустом финале мы сохранили бы как
+            // «ответ» только последний абзац, а в озвучке был бы весь текст.
+            const accumulated = draftAnswerText
+              ? `${draftAnswerText}\n\n${normalized.text.trim()}`
+              : normalized.text.trim();
+            const chunks = renderVkMarkdownChunks(accumulated);
+            if (chunks.length > 1) {
+              // Накопленное перестало влезать в одно сообщение VK. Дальше
+              // черновик ответом быть не может — отдаём этот блок обычным
+              // путём и забываем накопленное, чтобы не сохранить огрызок.
+              draftAnswerText = null;
+              vkDiag("block overflows draft", { len: accumulated.length });
+            } else {
+              // Метку добавляет сам черновик (единственная точка записи).
+              const draftText = chunks[0]?.text ?? accumulated;
+              try {
+                await progressDraft.overwrite(draftText);
+                draftAnswerText = draftText;
+                vkDiag("block into draft", { len: draftText.length });
+                return;
+              } catch (err) {
+                runtime.log?.(`vk: block → draft failed: ${String(err)}`);
+                // не смогли переписать черновик — пусть уходит обычным путём
+              }
             }
           }
 
@@ -740,8 +757,17 @@ export async function handleVkInbound(params: {
             // ответа — собеседник остаётся с одной голосовой. Так ломалось при
             // переключении на локальную модель: у облачных финал несёт весь
             // текст, у Qwen он приходит пустым.
-            if (draftHoldsAnswer && !normalized.text?.trim()) {
-              vkDiag("draft kept as answer");
+            const draftMsgId = progressDraft.currentMessageId();
+            if (draftAnswerText && !normalized.text?.trim() && draftMsgId !== undefined) {
+              // Черновик и есть ответ — но переписываем его БЕЗ метки хода.
+              // `overwrite` метку подставляет всегда, поэтому готовый ответ
+              // навсегда оставался бы с «⏳ Работаю» в шапке.
+              try {
+                await editMessageVk(String(message.peerId), draftMsgId, draftAnswerText, account);
+                vkDiag("draft kept as answer", { len: draftAnswerText.length });
+              } catch (err) {
+                runtime.log?.(`vk: draft finalize failed: ${String(err)}`);
+              }
             } else {
               await progressDraft.remove();
             }
@@ -788,6 +814,11 @@ export async function handleVkInbound(params: {
                   // Build the full draft line (like Telegram). Passing undefined
                   // leaves the compositor with nothing to render; startImmediately
                   // shows the step at once instead of waiting out the start gate.
+                  // Шаг инструмента перезатирает черновик своим списком, то
+                  // есть текст ответа, лежавший там от предыдущего блока,
+                  // пропадает. Забываем его: иначе на пустом финале мы бы
+                  // «сохранили как ответ» список шагов.
+                  draftAnswerText = null;
                   await progressDraft.compositor.pushToolProgress(
                     buildChannelProgressDraftLineForEntry(vkStreamingEntry, {
                       event: "tool",
