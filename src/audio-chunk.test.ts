@@ -161,3 +161,27 @@ describe("splitAudioAtSilence temp dir cleanup", () => {
     expect(await vkVoiceDirs()).toEqual(before); // no leaked vk-voice-* dir
   });
 });
+
+describe("предохранители нарезки", () => {
+  it("не режет запись длиннее общего потолка — это флуд, а не доставка", async () => {
+    mockExecFile.mockClear();
+    // Два часа при потолке в 4 минуты дали бы три десятка голосовых подряд.
+    const out = await splitAudioAtSilence("/tmp/huge.ogg", 240_000, {
+      knownDurationMs: 2 * 60 * 60 * 1000,
+    });
+    expect(out).toEqual([]);
+    // Ни ffprobe, ни ffmpeg не звали: решение принято по известной длительности.
+    expect(mockExecFile).not.toHaveBeenCalled();
+  });
+
+  it("не мерит длительность второй раз, если её передали", async () => {
+    mockExecFile.mockClear();
+    const out = await splitAudioAtSilence("/tmp/x.ogg", 240_000, {
+      knownDurationMs: 100_000,
+    });
+    // 100с меньше потолка 240с — резать нечего, и ffprobe звать было незачем.
+    expect(out).toEqual([]);
+    expect(mockExecFile).not.toHaveBeenCalled();
+  });
+});
+

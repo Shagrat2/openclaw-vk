@@ -99,10 +99,12 @@ async function deliverVkReply(params: {
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
   clearKeyboard?: boolean;
   log?: (msg: string) => void;
+  abortSignal?: AbortSignal;
 }) {
   const result = await sendPayloadVk(String(params.peerId), params.payload, {
     accountId: params.accountId,
     clearKeyboard: params.clearKeyboard,
+    abortSignal: params.abortSignal,
   });
   if (!result) {
     // Silent send failure: sendPayloadVk produced no result for a reply we meant
@@ -125,8 +127,10 @@ export async function handleVkInbound(params: {
   config: CoreConfig;
   runtime: RuntimeEnv;
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
+  /** Остановка гейта: доводится до ffmpeg при нарезке длинных голосовых. */
+  abortSignal?: AbortSignal;
 }): Promise<void> {
-  const { message, account, config, runtime, statusSink } = params;
+  const { message, account, config, runtime, statusSink, abortSignal } = params;
   const core = getVkRuntime();
   // Значения тянем через компат-слой: ядро переносит эти символы между
   // версиями SDK, и статический импорт молча ломает загрузку плагина целиком.
@@ -251,6 +255,7 @@ export async function handleVkInbound(params: {
                 peerId: message.senderId,
                 accountId: account.accountId,
                 statusSink,
+                abortSignal,
                 log: runtime.log,
               });
             },
@@ -530,8 +535,10 @@ export async function handleVkInbound(params: {
 
   let dispatchError = false;
   // Defensive guard mirroring the bundled channels' isProcessAborted() check
-  // (see core message-handler.process / telegram bot). VK has no abortSignal in
-  // this scope, so we use a local "settled" flag: once the turn finalizes
+  // (see core message-handler.process / telegram bot). VK now threads the
+  // gateway's abort signal down to the send path (ffmpeg splitting), but the
+  // dispatcher's own abort is not exposed in this scope, so we use a local
+  // "settled" flag: once the turn finalizes
   // (setDone/setError in finally), late-arriving progress callbacks become
   // no-ops. The SDK controller already guards on `finished`, so this is
   // belt-and-suspenders — but it keeps intent explicit and avoids redundant
@@ -692,6 +699,7 @@ export async function handleVkInbound(params: {
                           peerId: message.peerId,
                           accountId: account.accountId,
                           statusSink,
+                          abortSignal,
                           log: runtime.log,
                         });
                       } catch (err) {
@@ -718,6 +726,7 @@ export async function handleVkInbound(params: {
             peerId: message.peerId,
             accountId: account.accountId,
             statusSink,
+            abortSignal,
             log: runtime.log,
             clearKeyboard:
               payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,

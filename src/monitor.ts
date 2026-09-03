@@ -250,6 +250,8 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             account: currentAccount,
             config: currentCfg,
             runtime: opts.runtime,
+            // Остановка гейта доходит до внешних процессов отправки (ffmpeg).
+            abortSignal: opts.abortSignal,
           });
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);

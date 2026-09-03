@@ -42,6 +42,12 @@ export {
 const VK_MESSAGE_TEXT_LIMIT = 4096;
 const VK_TRANSIENT_RETRY_ATTEMPTS = 3;
 const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
+
+/** Потолок скачивания удалённого аудио: источник недоверенный. */
+function getVkRemoteAudioMaxBytes(): number {
+  const raw = Number.parseInt(process.env.VK_REMOTE_AUDIO_MAX_BYTES ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 128 * 1024 * 1024;
+}
 const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
   "Attachment could not be delivered; sent as text instead.";
@@ -49,6 +55,12 @@ const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
 const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
 export type SendVkOptions = {
+  /**
+   * Остановка гейта. Доходит до внешних процессов (ffmpeg при нарезке
+   * голосовых): без него выключение оставляло их работать, а результат уже
+   * некому забрать.
+   */
+  abortSignal?: AbortSignal;
   cfg?: CoreConfig;
   accountId?: string;
   replyTo?: string;
@@ -806,13 +818,58 @@ export async function sendDocumentVk(
  * cleanup callback. Buffers are written to a temp file. Non-local strings
  * (http/data/file:// etc.) yield `null` so the caller skips splitting.
  */
+/**
+ * Скачивает удалённое аудио с потолком по размеру.
+ *
+ * Потолок обязателен: ссылка приходит из ответа модели, то есть источник
+ * недоверенный, и без ограничения можно вытянуть в память сколько угодно.
+ * Читаем потоком и обрываем, как только перебрали лимит.
+ */
+async function fetchBoundedRemoteAudio(url: string): Promise<Buffer | null> {
+  if (typeof fetch !== "function") {
+    return null;
+  }
+  const maxBytes = getVkRemoteAudioMaxBytes();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok || !response.body) {
+      return null;
+    }
+    const declared = Number(response.headers.get("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      return null;
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        return null;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return total > 0 ? Buffer.concat(chunks, total) : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function materializeLocalAudioFile(
   audioSource: string | Buffer,
   title: string,
 ): Promise<{ path: string; cleanup: () => Promise<void> } | null> {
   if (Buffer.isBuffer(audioSource)) {
+    let dir: string;
     try {
-      const dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
+      dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
+    } catch {
+      return null;
+    }
+    try {
       const safeName = title.replace(/[\\/]/g, "_") || "voice.ogg";
       const path = join(dir, safeName);
       await writeFile(path, audioSource);
@@ -823,16 +880,27 @@ async function materializeLocalAudioFile(
         },
       };
     } catch {
+      // Каталог создан, а запись не удалась — убираем за собой. Раньше на этом
+      // пути в /tmp оставался пустой каталог на каждую неудачу.
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
       return null;
     }
   }
 
-  // Only plain local paths can be probed/split. http/data/file:// are skipped.
-  if (
-    isHttpUrl(audioSource) ||
-    /^data:/i.test(audioSource) ||
-    audioSource.startsWith("file://")
-  ) {
+  // Удалённое аудио материализуем во временный файл — иначе длинная запись по
+  // ссылке вообще не резалась и уходила одним куском, который VK отвергал.
+  // Скачиваем с потолком по размеру: чужая ссылка может отдать что угодно.
+  if (isHttpUrl(audioSource)) {
+    const body = await fetchBoundedRemoteAudio(audioSource);
+    if (!body) {
+      return null;
+    }
+    return await materializeLocalAudioFile(body, title);
+  }
+
+  // data: и file:// не трогаем: первое уже в памяти и приходит буфером,
+  // второе ядро разворачивает в обычный путь до нас.
+  if (/^data:/i.test(audioSource) || audioSource.startsWith("file://")) {
     return null;
   }
   return { path: audioSource, cleanup: async () => {} };
@@ -1043,7 +1111,10 @@ export async function sendAudioMessageVk(
     try {
       headDurationMs = await probeAudioDurationMs(local.path);
       if (headDurationMs !== null && headDurationMs > maxMs) {
-        segments = await splitAudioAtSilence(local.path, maxMs);
+        segments = await splitAudioAtSilence(local.path, maxMs, {
+          knownDurationMs: headDurationMs,
+          signal: opts.abortSignal,
+        });
       }
     } catch {
       segments = [];
@@ -1123,6 +1194,13 @@ export async function sendAudioMessageVk(
  * remaining text chunks. The first text chunk + replyTo ride the first voice;
  * buttons/clearKeyboard apply only to the very last sent message.
  */
+/** Расширение куска нарезки: контейнер после `-c copy` остаётся исходным. */
+function vkAudioSegmentExtension(segment: string): string {
+  const base = segment.split(/[\\/]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot) : ".ogg";
+}
+
 async function sendVkAudioSegments(params: {
   to: string;
   peerId: number;
@@ -1138,20 +1216,36 @@ async function sendVkAudioSegments(params: {
   const hasTail = tailChunks.length > 0;
   const results: SendVkResult[] = [];
 
+  // Сначала грузим ВСЕ куски, и только потом отправляем.
+  //
+  // Раньше каждый кусок уходил сразу после своей загрузки, и сбой на втором
+  // оставлял собеседника с обрезанным ответом: первая половина фразы
+  // доставлена, второй нет и уже не будет. Загрузка ничего не показывает
+  // собеседнику, поэтому её отказ можно обработать целиком — и тогда
+  // вызывающий код штатно откатится на отправку одним файлом.
+  const attachments: string[] = [];
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index] as string;
+    attachments.push(
+      await uploadVkAudioMessage({
+        vk: params.vk,
+        token: params.account.token,
+        peerId: params.peerId,
+        source: segment,
+        // Расширение берём у самого куска: нарезка идёт `-c copy`, то есть
+        // контейнер остаётся исходным, и назвать mp3-кусок «.ogg» значит
+        // соврать VK о формате.
+        filename: `voice-${String(index + 1).padStart(2, "0")}${vkAudioSegmentExtension(segment)}`,
+        contentType: params.contentType,
+      }),
+    );
+  }
+
+  for (let index = 0; index < segments.length; index += 1) {
     const isFirst = index === 0;
     const isLastSegment = index === segments.length - 1;
     const applyKeyboard = isLastSegment && !hasTail;
-
-    const attachment = await uploadVkAudioMessage({
-      vk: params.vk,
-      token: params.account.token,
-      peerId: params.peerId,
-      source: segment,
-      filename: `voice-${String(index + 1).padStart(2, "0")}.ogg`,
-      contentType: params.contentType,
-    });
+    const attachment = attachments[index] as string;
 
     const result = await sendVkApiMessage({
       to: params.to,

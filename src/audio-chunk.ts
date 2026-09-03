@@ -13,6 +13,26 @@ export function getVkAudioMessageMaxMs(): number {
   return readPositiveIntEnv("VK_AUDIO_MESSAGE_MAX_MS", 270_000);
 }
 
+/** Дедлайн на всю операцию нарезки. */
+function getAudioSplitDeadlineMs(): number {
+  return readPositiveIntEnv("VK_AUDIO_SPLIT_DEADLINE_MS", 5 * 60 * 1000);
+}
+
+/** Потолок размера входного файла: гигабайт не режем. */
+function getAudioSplitMaxInputBytes(): number {
+  return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_INPUT_BYTES", 512 * 1024 * 1024);
+}
+
+/** Потолок общей длительности: дальше нарезка теряет смысл. */
+function getAudioSplitMaxTotalMs(): number {
+  return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_TOTAL_MS", 60 * 60 * 1000);
+}
+
+/** Потолок числа кусков: столько голосовых подряд собеседник читать не станет. */
+function getAudioSplitMaxSegments(): number {
+  return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_SEGMENTS", 12);
+}
+
 function getAudioSplitTimeoutMs(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_TIMEOUT_MS", 120_000);
 }
@@ -38,12 +58,22 @@ function readPositiveIntEnv(name: string, fallback: number): number {
 
 type ExecResult = { stdout: string; stderr: string };
 
-function runProcess(bin: string, args: string[]): Promise<ExecResult> {
+/**
+ * Запуск ffmpeg/ffprobe с пробросом отмены.
+ *
+ * Без `signal` остановка гейта оставляла работать ffmpeg: процесс живёт своей
+ * жизнью, пишет в /tmp и держит диск, а вернуться к его результату уже некому.
+ */
+function runProcess(
+  bin: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     execFile(
       bin,
       args,
-      { timeout: getAudioSplitTimeoutMs(), maxBuffer: 32 * 1024 * 1024 },
+      { timeout: getAudioSplitTimeoutMs(), maxBuffer: 32 * 1024 * 1024, signal },
       (error, stdout, stderr) => {
         if (error) {
           // Attach captured stderr for debugging but still reject.
@@ -63,7 +93,10 @@ function runProcess(bin: string, args: string[]): Promise<ExecResult> {
  * Returns container duration in milliseconds, or null if it could not be
  * determined (missing ffprobe, unreadable file, etc.). Never throws.
  */
-export async function probeAudioDurationMs(file: string): Promise<number | null> {
+export async function probeAudioDurationMs(
+  file: string,
+  signal?: AbortSignal,
+): Promise<number | null> {
   try {
     const { stdout } = await runProcess(getFfprobeBin(), [
       "-v",
@@ -188,18 +221,55 @@ function fileExtension(file: string): string {
  * copy can only cut on keyframes, so the actual boundaries may drift slightly
  * from the requested cut points — acceptable for voice.
  */
-export async function splitAudioAtSilence(file: string, maxMs: number): Promise<string[]> {
+export async function splitAudioAtSilence(
+  file: string,
+  maxMs: number,
+  opts: {
+    /** Уже измеренная длительность: вызывающий обычно знает её — не мерим второй раз. */
+    knownDurationMs?: number | null;
+    /** Остановка гейта не должна оставлять ffmpeg работать. */
+    signal?: AbortSignal;
+  } = {},
+): Promise<string[]> {
   if (!file || maxMs <= 0) {
     return [];
   }
 
-  let totalMs: number | null;
+  // Общий дедлайн на всю операцию: нарезка не должна тянуться дольше, чем
+  // собеседник готов ждать голосовое. Складывается с отменой от гейта.
+  const deadline = AbortSignal.timeout(getAudioSplitDeadlineMs());
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, deadline])
+    : deadline;
+
+  // Потолок размера входа: гигабайтную запись не стоит даже открывать.
+  // Не смогли узнать размер — не повод отказываться от нарезки: ffmpeg всё
+  // равно споткнётся о негодный файл, и вызывающий откатится штатно.
   try {
-    totalMs = await probeAudioDurationMs(file);
+    const { stat } = await import("node:fs/promises");
+    if ((await stat(file)).size > getAudioSplitMaxInputBytes()) {
+      return [];
+    }
   } catch {
-    return [];
+    /* размер неизвестен — идём дальше */
+  }
+
+  let totalMs: number | null;
+  if (typeof opts.knownDurationMs === "number" && opts.knownDurationMs > 0) {
+    totalMs = opts.knownDurationMs;
+  } else {
+    try {
+      totalMs = await probeAudioDurationMs(file, signal);
+    } catch {
+      return [];
+    }
   }
   if (totalMs === null || totalMs <= maxMs) {
+    return [];
+  }
+  // Предохранитель: слишком длинную запись не режем вовсе — сотни кусков это
+  // не доставка, а флуд, и вызывающий должен уйти на отправку документом.
+  if (totalMs > getAudioSplitMaxTotalMs()) {
     return [];
   }
 
@@ -215,7 +285,7 @@ export async function splitAudioAtSilence(file: string, maxMs: number): Promise<
       "-f",
       "null",
       "-",
-    ]);
+    ], signal);
     silenceStderr = result.stderr;
   } catch (error) {
     silenceStderr = String((error as { stderr?: string }).stderr ?? "");
@@ -237,6 +307,9 @@ export async function splitAudioAtSilence(file: string, maxMs: number): Promise<
   ranges.push({ start: prev, end: totalMs });
 
   if (ranges.length < 2) {
+    return [];
+  }
+  if (ranges.length > getAudioSplitMaxSegments()) {
     return [];
   }
 
@@ -269,7 +342,7 @@ export async function splitAudioAtSilence(file: string, maxMs: number): Promise<
         args.push("-t", durSec);
       }
       args.push("-c", "copy", out);
-      await runProcess(getFfmpegBin(), args);
+      await runProcess(getFfmpegBin(), args, signal);
       outputs.push(out);
     }
   } catch {
@@ -288,6 +361,25 @@ export async function splitAudioAtSilence(file: string, maxMs: number): Promise<
     await cleanupAudioSegments(outputs);
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
+  }
+
+  // Проверяем, что получилось, а не верим тому, что заказывали. Stream copy
+  // режет только по ключевым кадрам, поэтому кусок может выйти длиннее
+  // запрошенного — и тогда VK отвергнет его ровно так же, как исходник.
+  // Отдавать заведомо негодную нарезку хуже, чем не резать вовсе: вызывающий
+  // хотя бы уйдёт на отправку документом.
+  for (const out of outputs) {
+    let actual: number | null;
+    try {
+      actual = await probeAudioDurationMs(out, signal);
+    } catch {
+      actual = null;
+    }
+    if (actual !== null && actual > maxMs) {
+      await cleanupAudioSegments(outputs);
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      return [];
+    }
   }
   return outputs;
 }

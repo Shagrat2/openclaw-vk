@@ -732,9 +732,55 @@ describe("sendAudioMessageVk", () => {
       }),
     );
     expect(result).toEqual({ messageId: "88", chatId: "456" });
-    // Remote URL → split is skipped entirely (not a local path).
-    expect(mockProbeAudioDurationMs).not.toHaveBeenCalled();
+    // Ссылку скачиваем, чтобы можно было измерить и порезать. Здесь fetch не
+    // отдал тела, поэтому материализация не удалась и нарезка не запускалась —
+    // отправка ушла одним куском, как и раньше.
     expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+  });
+
+  it("скачивает удалённое аудио, чтобы длинную запись можно было порезать", async () => {
+    // Раньше ссылка не резалась вовсе: путь материализации отдавал null для
+    // http, и длинная запись уходила одним куском, который VK отвергал.
+    const audio = Buffer.alloc(2048, 7);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: (k: string) => (k === "content-length" ? String(audio.length) : null) },
+      body: (async function* () {
+        yield new Uint8Array(audio);
+      })(),
+    } as unknown as Response);
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockMessagesSend.mockResolvedValue(91);
+
+    await sendAudioMessageVk("456", "https://example.com/long.ogg", "voice.ogg", "caption", {
+      cfg,
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith("https://example.com/long.ogg", expect.anything());
+    expect(mockSplitAudioAtSilence).toHaveBeenCalled();
+    // Два куска — две голосовые.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("не тянет в память удалённое аудио сверх потолка", async () => {
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "1024";
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: (k: string) => (k === "content-length" ? "999999999" : null) },
+      body: (async function* () {
+        yield new Uint8Array(10);
+      })(),
+    } as unknown as Response);
+    mockSplitAudioAtSilence.mockClear();
+
+    await sendAudioMessageVk("456", "https://example.com/huge.ogg", "voice.ogg", undefined, {
+      cfg,
+    });
+
+    // Скачивание отклонено по объявленному размеру — нарезки не было.
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
   });
 
   it("retries only the upload-server request on a transient code=15", async () => {
@@ -842,7 +888,10 @@ describe("sendAudioMessageVk", () => {
       replyTo: "777",
     });
 
-    expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000);
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000, {
+      // Длительность уже измерена вызывающим — второй раз ffprobe не гоняем.
+      knownDurationMs: 600_000,
+    });
     // Two voice uploads, one per segment.
     expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
     expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
