@@ -10,6 +10,10 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  parseStrictPositiveInteger: (v: unknown) => {
+    const n = Number.parseInt(String(v ?? ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  },
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
@@ -85,6 +89,9 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
       ...entry,
       messageId: entry.messageId ?? defaults.messageId,
     })),
+  formatAgentEnvelope: (...a: any[]) => currentRuntime.value.channel.reply.formatAgentEnvelope(...a),
+  resolveEnvelopeFormatOptions: (...a: any[]) =>
+    currentRuntime.value.channel.reply.resolveEnvelopeFormatOptions(...a),
 }));
 
 const mockStatusReactionCtrl = vi.hoisted(() => ({
@@ -143,6 +150,7 @@ vi.mock("openclaw/plugin-sdk/command-auth-native", () => ({
     shouldBlock: false,
     commandAuthorized: false,
   })),
+  hasControlCommand: (...a: any[]) => currentRuntime.value.channel.text.hasControlCommand(...a),
 }));
 
 vi.mock("openclaw/plugin-sdk/runtime-group-policy", () => ({
@@ -168,40 +176,28 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
 // Мокаем компат-слой, а не конкретные пути SDK: он на то и заведён, чтобы
 // прятать переезды символов между версиями ядра, а в тестовой среде пакета
 // openclaw нет вовсе, и динамический импорт резолвиться не может.
-vi.mock("./sdk-compat.js", () => ({
-  loadCoreBridge: async (core: any) => ({
-    loadConfig: () => core.config.loadConfig(),
-    resolveStorePath: (...a: any[]) => core.channel.session.resolveStorePath(...a),
-    readSessionUpdatedAt: (...a: any[]) => core.channel.session.readSessionUpdatedAt(...a),
-    recordInboundSession: (...a: any[]) => core.channel.session.recordInboundSession(...a),
-    dispatchReplyWithBufferedBlockDispatcher: (...a: any[]) =>
-      core.channel.reply.dispatchReplyWithBufferedBlockDispatcher(...a),
-    finalizeInboundContext: (...a: any[]) => core.channel.reply.finalizeInboundContext(...a),
-    formatAgentEnvelope: (...a: any[]) => core.channel.reply.formatAgentEnvelope(...a),
-    resolveEnvelopeFormatOptions: (...a: any[]) =>
-      core.channel.reply.resolveEnvelopeFormatOptions(...a),
-    hasControlCommand: (...a: any[]) => core.channel.text.hasControlCommand(...a),
-  }),
-  loadChannelMessageBits: async () => ({
-    createReplyPrefixOptions: mockCreateReplyPrefixOptions,
-    createTypingCallbacks: mockCreateTypingCallbacks,
-    logTypingFailure: mockLogTypingFailure,
-  }),
-  issuePairingChallengeCompat: async ({
-    channel,
-    upsertPairingRequest,
-    challenge,
-  }: Record<string, any>) => {
-    const result = await upsertPairingRequest({ channel, id: challenge.senderId });
-    if (result.created && challenge.sendPairingReply) {
-      try {
-        await challenge.sendPairingReply("pairing-reply-text");
-      } catch (err) {
-        challenge.onReplyError?.(err);
-      }
-    }
-  },
+// Мост совместимости снят: инбаунд импортирует канонические подпути напрямую,
+// поэтому мокаем именно их. Тестовая среда не имеет пакета openclaw, так что
+// без моков модуль не загрузится вовсе.
+const currentRuntime = vi.hoisted(() => ({ value: null as any }));
+
+vi.mock("openclaw/plugin-sdk/reply-dispatch-runtime", () => ({
+  dispatchReplyWithBufferedBlockDispatcher: (...a: any[]) =>
+    currentRuntime.value.channel.reply.dispatchReplyWithBufferedBlockDispatcher(...a),
+  finalizeInboundContext: (...a: any[]) => currentRuntime.value.channel.reply.finalizeInboundContext(...a),
 }));
+
+vi.mock("openclaw/plugin-sdk/session-store-runtime", () => ({
+  resolveStorePath: (...a: any[]) => currentRuntime.value.channel.session.resolveStorePath(...a),
+  readSessionUpdatedAt: (...a: any[]) => currentRuntime.value.channel.session.readSessionUpdatedAt(...a),
+  recordSessionMetaFromInbound: (...a: any[]) =>
+    currentRuntime.value.channel.session.recordInboundSession(...a),
+}));
+
+vi.mock("./sdk-compat.js", () => ({
+  coreAtLeast: () => true,
+}));
+
 
 // Step-progress: default mode "off" keeps the existing (reactions/plain) paths;
 // individual tests flip resolveChannelPreviewStreamMode to "progress".
@@ -300,6 +296,9 @@ function baseCfg(vkOverrides: Record<string, unknown> = {}): CoreConfig {
 function installRuntime(opts: Parameters<typeof makeVkRuntime>[0] = {}) {
   const runtime = makeVkRuntime(opts);
   setVkRuntime(runtime);
+  // Канонические подпути SDK замоканы на шпионов этого же рантайма — так
+  // существующие проверки «ядро вызвано с тем-то» продолжают работать.
+  currentRuntime.value = runtime;
   return runtime;
 }
 

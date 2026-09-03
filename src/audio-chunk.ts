@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,21 +23,15 @@ function getAudioSplitMaxInputBytes(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_INPUT_BYTES", 512 * 1024 * 1024);
 }
 
-/** Потолок общей длительности: дальше нарезка теряет смысл. */
-function getAudioSplitMaxTotalMs(): number {
-  return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_TOTAL_MS", 60 * 60 * 1000);
-}
 
 /**
- * Допуск на перелёт границы куска. `-c copy` режет только по ключевым кадрам,
- * поэтому кусок стабильно выходит на десятки миллисекунд длиннее заказанного
- * (замер: запрос 10.000 с → файл 10.020 с). Без допуска строгая проверка
- * `actual > maxMs` выбрасывала ВСЮ нарезку, и длинный ответ уходил одним
- * файлом, который VK отвергает — то есть лечение было хуже болезни.
+ * Запас при ПЛАНИРОВАНИИ резов. `-c copy` режет по ключевым кадрам, поэтому
+ * кусок выходит длиннее заказанного (замер: запрос 10.000 с → файл 10.020 с).
+ * Компенсируем это здесь, а не допуском на приёмке: допуск в секунды делал
+ * проверку беззубой — кусок, вылезший за лимит VK почти на две секунды, её бы
+ * прошёл и был бы отвергнут уже на заливке.
  */
-function getAudioSegmentToleranceMs(): number {
-  return readPositiveIntEnv("VK_AUDIO_SEGMENT_TOLERANCE_MS", 2_000);
-}
+const SEGMENT_PLANNING_MARGIN_MS = 250;
 
 /** Потолок числа кусков: столько голосовых подряд собеседник читать не станет. */
 function getAudioSplitMaxSegments(): number {
@@ -186,9 +180,13 @@ export function selectCutPointsMs(
     .filter((ms) => Number.isFinite(ms) && ms > 0 && ms < totalMs)
     .sort((a, b) => a - b);
 
+  // Планируем с запасом: stream copy сдвигает рез до ближайшего ключевого
+  // кадра ВПЕРЁД, поэтому цель ставим чуть раньше лимита — тогда куски
+  // укладываются в лимит по построению, а проверка на выходе остаётся строгой.
+  const target = Math.max(1, maxMs - SEGMENT_PLANNING_MARGIN_MS);
   let segmentStart = 0;
   while (totalMs - segmentStart > maxMs) {
-    const limit = segmentStart + maxMs;
+    const limit = segmentStart + target;
     // Last candidate strictly within (segmentStart, limit].
     let chosen: number | null = null;
     for (const candidate of candidates) {
@@ -257,7 +255,6 @@ export async function splitAudioAtSilence(
   // Не смогли узнать размер — не повод отказываться от нарезки: ffmpeg всё
   // равно споткнётся о негодный файл, и вызывающий откатится штатно.
   try {
-    const { stat } = await import("node:fs/promises");
     if ((await stat(file)).size > getAudioSplitMaxInputBytes()) {
       return [];
     }
@@ -278,9 +275,12 @@ export async function splitAudioAtSilence(
   if (totalMs === null || totalMs <= maxMs) {
     return [];
   }
-  // Предохранитель: слишком длинную запись не режем вовсе — сотни кусков это
-  // не доставка, а флуд, и вызывающий должен уйти на отправку документом.
-  if (totalMs > getAudioSplitMaxTotalMs()) {
+  // Ранний выход по ЕДИНСТВЕННОЙ ручке: если кусков заведомо выйдет больше
+  // потолка, резать бессмысленно — и не стоит гонять дорогой поиск тишины
+  // (на двухчасовой записи это секунды впустую). Раньше тот же предохранитель
+  // стоял вторым, отдельным потолком по длительности: две ручки про одно, и их
+  // приходилось держать согласованными вручную.
+  if (Math.ceil(totalMs / maxMs) > getAudioSplitMaxSegments()) {
     return [];
   }
 
@@ -357,19 +357,14 @@ export async function splitAudioAtSilence(
       outputs.push(out);
     }
   } catch {
-    // Any extraction failure → clean up and bail so caller falls back. When the
-    // first extraction fails, `outputs` is empty, so cleanupAudioSegments can't
-    // derive the temp dir — remove it explicitly so the mkdtemp dir (and any
-    // partial file) never leaks.
-    await cleanupAudioSegments(outputs);
+    // Любой сбой извлечения — сносим каталог целиком: все куски лежат внутри
+    // него, отдельная уборка файлов была лишней.
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }
 
   if (outputs.length < 2) {
-    // Not enough segments to be worth splitting. Same leak guard: with zero
-    // outputs the dir must be removed explicitly.
-    await cleanupAudioSegments(outputs);
+    // Резать оказалось нечего.
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }
@@ -386,8 +381,7 @@ export async function splitAudioAtSilence(
     } catch {
       actual = null;
     }
-    if (actual !== null && actual > maxMs + getAudioSegmentToleranceMs()) {
-      await cleanupAudioSegments(outputs);
+    if (actual !== null && actual > maxMs) {
       await rm(dir, { recursive: true, force: true }).catch(() => {});
       return [];
     }

@@ -32,7 +32,7 @@ export type ChannelProgressDraftMode = "off" | "partial" | "block" | "progress";
  */
 let cachedCoreVersion: string | null | undefined;
 
-export function resolveCoreVersion(): string | null {
+function resolveCoreVersion(): string | null {
   if (cachedCoreVersion !== undefined) {
     return cachedCoreVersion;
   }
@@ -88,107 +88,3 @@ export function coreAtLeast(version: string): boolean {
  * Резолвим по наличию: сначала пробуем старое место (ядро 7.x отдаёт всё через
  * core), затем SDK-подпуть 8.x. Кэшируем — вызывается на каждое сообщение.
  */
-type CoreBridge = {
-  loadConfig: () => unknown;
-  resolveStorePath: (...args: never[]) => unknown;
-  readSessionUpdatedAt: (...args: never[]) => unknown;
-  recordInboundSession: (...args: never[]) => unknown;
-  dispatchReplyWithBufferedBlockDispatcher: (...args: never[]) => unknown;
-  finalizeInboundContext: (...args: never[]) => unknown;
-  formatAgentEnvelope: (...args: never[]) => unknown;
-  resolveEnvelopeFormatOptions: (...args: never[]) => unknown;
-  hasControlCommand: (...args: never[]) => unknown;
-};
-
-type LooseCore = {
-  config?: { loadConfig?: unknown; current?: unknown };
-  channel?: {
-    reply?: Record<string, unknown>;
-    session?: Record<string, unknown>;
-    text?: Record<string, unknown>;
-  };
-};
-
-let bridgePromise: Promise<CoreBridge> | null = null;
-
-export function loadCoreBridge(core: unknown): Promise<CoreBridge> {
-  bridgePromise ??= (async () => {
-    const legacy = core as LooseCore;
-    // Только канонические подпути: широкие `config-runtime` и `command-auth`
-    // ядро объявило устаревшими, и guard репозитория их запрещает.
-    const [replyDispatch, channelInbound, commandAuth, sessionStore, sessionPaths] =
-      await Promise.all([
-        import("openclaw/plugin-sdk/reply-dispatch-runtime"),
-        import("openclaw/plugin-sdk/channel-inbound"),
-        import("openclaw/plugin-sdk/command-auth-native"),
-        import("openclaw/plugin-sdk/session-store-runtime"),
-        import("openclaw/plugin-sdk/session-store-paths"),
-      ]);
-    const pick = <T>(fromCore: unknown, fromSdk: unknown, name: string): T => {
-      const fn = typeof fromCore === "function" ? fromCore : fromSdk;
-      if (typeof fn !== "function") {
-        throw new Error(`vk: не найден ${name} ни в core, ни в plugin-sdk`);
-      }
-      return fn as T;
-    };
-    const sessions = {
-      ...(sessionPaths as Record<string, unknown>),
-      ...(sessionStore as Record<string, unknown>),
-    };
-    const reply = replyDispatch as Record<string, unknown>;
-    const inbound = channelInbound as Record<string, unknown>;
-    const commands = commandAuth as Record<string, unknown>;
-    return {
-      // Конфиг берём у рантайма (`config.current()`), а на старом ядре — из
-      // его же `config.loadConfig`. Отдельного модуля для этого больше нет.
-      loadConfig: pick(
-        legacy.config?.loadConfig,
-        typeof legacy.config?.current === "function"
-          ? () => (legacy.config as { current: () => unknown }).current()
-          : undefined,
-        "loadConfig",
-      ),
-      resolveStorePath: pick(
-        legacy.channel?.session?.resolveStorePath,
-        sessions.resolveStorePath,
-        "resolveStorePath",
-      ),
-      readSessionUpdatedAt: pick(
-        legacy.channel?.session?.readSessionUpdatedAt,
-        sessions.readSessionUpdatedAt,
-        "readSessionUpdatedAt",
-      ),
-      recordInboundSession: pick(
-        legacy.channel?.session?.recordInboundSession,
-        sessions.recordInboundSessionMeta ?? sessions.recordSessionMetaFromInbound,
-        "recordInboundSession",
-      ),
-      dispatchReplyWithBufferedBlockDispatcher: pick(
-        legacy.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher,
-        reply.dispatchReplyWithBufferedBlockDispatcher,
-        "dispatchReplyWithBufferedBlockDispatcher",
-      ),
-      finalizeInboundContext: pick(
-        legacy.channel?.reply?.finalizeInboundContext,
-        reply.finalizeInboundContext,
-        "finalizeInboundContext",
-      ),
-      formatAgentEnvelope: pick(
-        legacy.channel?.reply?.formatAgentEnvelope,
-        inbound.formatAgentEnvelope,
-        "formatAgentEnvelope",
-      ),
-      resolveEnvelopeFormatOptions: pick(
-        legacy.channel?.reply?.resolveEnvelopeFormatOptions,
-        inbound.resolveEnvelopeFormatOptions,
-        "resolveEnvelopeFormatOptions",
-      ),
-      hasControlCommand: pick(
-        legacy.channel?.text?.hasControlCommand,
-        commands.hasControlCommand,
-        "hasControlCommand",
-      ),
-    };
-  })();
-  return bridgePromise;
-}

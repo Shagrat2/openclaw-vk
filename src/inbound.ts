@@ -49,9 +49,20 @@ import {
   resolveVkProgressLabel,
   type VkProgressDraftHandle,
 } from "./progress-draft.js";
-// Мост совместимости: ядро переносит эти символы между версиями SDK, и
-// статический импорт молча ломает загрузку плагина целиком.
-import { loadCoreBridge } from "./sdk-compat.js";
+import {
+  dispatchReplyWithBufferedBlockDispatcher,
+  finalizeInboundContext,
+} from "openclaw/plugin-sdk/reply-dispatch-runtime";
+import {
+  formatAgentEnvelope,
+  resolveEnvelopeFormatOptions,
+} from "openclaw/plugin-sdk/channel-inbound";
+import { hasControlCommand } from "openclaw/plugin-sdk/command-auth-native";
+import {
+  readSessionUpdatedAt,
+  recordSessionMetaFromInbound,
+  resolveStorePath,
+} from "openclaw/plugin-sdk/session-store-runtime";
 import type { ResolvedVkAccount } from "./types.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -150,7 +161,6 @@ export async function handleVkInbound(params: {
   const { message, account, config, runtime, statusSink, abortSignal } = params;
   const core = getVkRuntime();
   vkDiag("inbound entered");
-  const bridge = await loadCoreBridge(core);
   vkDiag("inbound sdk bits loaded");
   const pairing = createChannelPairingController({
     core,
@@ -290,7 +300,7 @@ export async function handleVkInbound(params: {
     allowFrom: isGroup ? effectiveGroupSenderAllowFrom : effectiveAllowFrom,
     senderId: message.senderId,
   }).allowed;
-  const hasControlCommand = bridge.hasControlCommand(rawBody, config as OpenClawConfig);
+  const isControlCommand = hasControlCommand(rawBody, config as OpenClawConfig);
   const commandGate = resolveControlCommandGate({
     useAccessGroups,
     authorizers: [
@@ -300,7 +310,7 @@ export async function handleVkInbound(params: {
       },
     ],
     allowTextCommands,
-    hasControlCommand,
+    hasControlCommand: isControlCommand,
   });
 
   if (isGroup && commandGate.shouldBlock) {
@@ -318,7 +328,7 @@ export async function handleVkInbound(params: {
   const wasMentioned = core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes);
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
-  if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
+  if (isGroup && requireMention && !wasMentioned && !isControlCommand) {
     runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (mention required)`);
     return;
   }
@@ -338,18 +348,18 @@ export async function handleVkInbound(params: {
   });
 
   const fromLabel = isGroup ? `vk:chat:${message.peerId}` : `vk:${message.senderId}`;
-  const storePath = bridge.resolveStorePath(
+  const storePath = resolveStorePath(
     (config as Record<string, Record<string, unknown>>).session?.store as string | undefined,
     {
       agentId: route.agentId,
     },
   );
-  const envelopeOptions = bridge.resolveEnvelopeFormatOptions(config as OpenClawConfig);
-  const previousTimestamp = bridge.readSessionUpdatedAt({
+  const envelopeOptions = resolveEnvelopeFormatOptions(config as OpenClawConfig);
+  const previousTimestamp = readSessionUpdatedAt({
     storePath,
     sessionKey: route.sessionKey,
   });
-  const body = bridge.formatAgentEnvelope({
+  const body = formatAgentEnvelope({
     channel: "VK",
     from: fromLabel,
     timestamp: message.timestamp,
@@ -375,7 +385,7 @@ export async function handleVkInbound(params: {
     { messageId: message.messageId },
   );
 
-  const ctxPayload = bridge.finalizeInboundContext({
+  const ctxPayload = finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
     RawBody: visibleBody || rawBody,
@@ -435,7 +445,7 @@ export async function handleVkInbound(params: {
     accountId: account.accountId,
   });
 
-  await bridge.recordInboundSession({
+  await recordSessionMetaFromInbound({
     storePath,
     ctx: ctxPayload,
     sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
@@ -551,7 +561,7 @@ export async function handleVkInbound(params: {
   let turnSettled = false;
   try {
     vkDiag("inbound dispatching to core", { peerId: message.peerId });
-    await bridge.dispatchReplyWithBufferedBlockDispatcher({
+    await dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config as OpenClawConfig,
       dispatcherOptions: {
@@ -577,7 +587,7 @@ export async function handleVkInbound(params: {
             const p = payload as { text?: string; mediaUrl?: string } | null;
             vkDiag("deliver", {
               kind: info?.kind ?? "?",
-              len: (p?.text ?? "").replace(/\s+/g, " ").length,
+              len: p?.text?.length ?? 0,
               media: Boolean(p?.mediaUrl),
             });
           }

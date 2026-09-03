@@ -67,28 +67,25 @@ describe("instrumentPollingTransport", () => {
 
     expect(order).toEqual(["fetch", "signal"]);
   });
-  it("переживает смену транспорта: после повторного start обёртка на новом объекте", async () => {
-    // `Updates.start()` создаёт НОВЫЙ PollingTransport. Обёртка, поставленная на
-    // прежний, осталась бы на выброшенном объекте — канал молча лишился бы
-    // признака живости, и сторож тишины объявил бы здоровый канал мёртвым.
+  it("на новом транспорте требует повторной инструментовки — по контракту", () => {
+    // `Updates.start()` создаёт новый PollingTransport. Мы НЕ подменяем методы
+    // старта ради самовосстановления: в жизни монитора повторного `start()` не
+    // бывает (при застое задача аккаунта завершается, и ядро поднимает канал с
+    // новым `VK`), а подмена публичных методов чужой библиотеки — самая
+    // хрупкая часть модуля. Контракт: инструментовать ПОСЛЕ старта.
     const beats: number[] = [];
     const first = { fetchUpdates: vi.fn().mockResolvedValue(undefined) };
     const second = { fetchUpdates: vi.fn().mockResolvedValue(undefined) };
-    const updates: Record<string, unknown> = {
-      pollingTransport: first,
-      start: vi.fn(async () => {
-        updates.pollingTransport = second;
-      }),
-    };
+    const updates: Record<string, unknown> = { pollingTransport: first };
 
     expect(instrumentPollingTransport(updates, () => beats.push(1))).toBe(true);
-    await (updates.pollingTransport as typeof first).fetchUpdates();
-    expect(beats).toHaveLength(1);
-
-    // Транспорт подменился под нами.
-    await (updates.start as () => Promise<void>)();
-    await (updates.pollingTransport as typeof second).fetchUpdates();
-    expect(beats).toHaveLength(2);
+    updates.pollingTransport = second;
+    // Новый транспакт не обёрнут — и это видно вызывающему, когда он
+    // инструментует заново.
+    expect(instrumentPollingTransport(updates, () => beats.push(1))).toBe(true);
+    return (second.fetchUpdates as () => Promise<void>)().then(() => {
+      expect(beats).toHaveLength(1);
+    });
   });
 
   it("перепривязывает получателя сигнала при повторной инструментовке", async () => {

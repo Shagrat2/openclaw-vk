@@ -24,6 +24,9 @@ export function makeVkRuntime(opts: {
   return {
     version: "0.0.0",
     config: {
+      // Снимок конфига — штатная поверхность PluginRuntimeCore; мок без него
+      // прятал бы падение вызывающего до самого прода.
+      current: vi.fn().mockReturnValue({}),
       loadConfig: vi.fn().mockReturnValue({}),
       writeConfigFile: vi.fn(),
     },

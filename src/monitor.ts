@@ -10,6 +10,7 @@ import {
   channelStoppedPatch,
   createTransportActivityStatusPatch,
 } from "openclaw/plugin-sdk/gateway-runtime";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
 import { resolveVkAccount } from "./accounts.js";
 import { instrumentPollingTransport } from "./transport-liveness.js";
 import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
@@ -19,7 +20,7 @@ import {
   resolveVkInboundReplyContext,
 } from "./media.js";
 import { getVkRuntime } from "./runtime.js";
-import { coreAtLeast, loadCoreBridge } from "./sdk-compat.js";
+import { coreAtLeast } from "./sdk-compat.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
@@ -39,8 +40,16 @@ import type { CoreConfig, VkInboundMessage } from "./types.js";
 // sequential behavior with no added latency. Set it > 0 to enable coalescing.
 
 /**
- * Merge a buffered burst of text messages into one inbound. Keeps the last
- * message's ids/timestamp so replies/reactions target the latest message.
+ * Долгоживущий приём VK: long-poll, разбор входящих и публикация состояния.
+ *
+ * Перезапуском, бэкоффом и health-мониторингом владеет ядро (2026.8.1+).
+ * Плагин лишь сообщает, что видит у своего транспорта, и завершает задачу
+ * аккаунта, когда опросы прекратились, — поднимает канал заново гейт.
+ */
+/**
+ * Склеивает пачку входящих в одно сообщение: тексты через перевод строки,
+ * идентичность — от последнего. Нужна дебаунсеру, когда собеседник шлёт
+ * несколько сообщений подряд.
  */
 export function combineVkInboundMessages(
   items: VkInboundMessage[],
@@ -59,50 +68,17 @@ export function combineVkInboundMessages(
   return { ...last, text: combinedText };
 }
 
-export type VkMonitorOptions = {
-  token: string;
-  accountId: string;
-  config: CoreConfig;
-  runtime: RuntimeEnv;
-  abortSignal?: AbortSignal;
-  /**
-   * Приём состояния канала ядром. С 2026.8.1 перезапуском, бэкоффом и
-   * health-мониторингом владеет ядро — плагин только сообщает, что видит у
-   * своего long-poll. Патчи собираем каноническими билдерами SDK, чтобы
-   * значения совпадали с тем, что читает health-policy.
-   */
-  setStatus?: Parameters<typeof createAccountStatusSink>[0]["setStatus"];
-};
-
-// ── Long-poll watchdog tunables (env-overridable) ──────────────────────────
-// vk-io's polling has internal retry but it is SILENT (debug-only) and can get
-// wedged so that the long-poll request stops delivering updates while the API
-// itself stays healthy — which manifests as "VK goes silent until the gateway
-// is restarted" (commonly right after a gateway restart). The watchdog below
-// supervises the poller via vk-io's internal `ts` event cursor plus an active
-// token probe: a moving cursor proves liveness for free, while a static or
-// unreadable cursor triggers a probe (never an immediate restart — VK's cursor
-// does NOT advance on empty idle polls). When the token is genuinely
-// unreachable, the poller is recreated in-place (no gateway restart), with a
-// logged reason and backoff.
+/** Положительное целое из окружения. Разбор — строгий, из ядра. */
 function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+  return parseStrictPositiveInteger(process.env[name]) ?? fallback;
 }
-// How often to inspect the poller heartbeat.
+
 /**
- * Порог тишины транспорта. Ядро следит за `lastTransportActivityAt` и само,
- * но с дефолтом в 30 минут; здесь мы лишь УСКОРЯЕМ ту же проверку до пары
- * минут. Long poll ждёт события до ~25 с, поэтому 150 с — заведомо аномалия,
- * а не спокойный диалог.
+ * Порог тишины транспорта. Ядро следит за `lastTransportActivityAt` и само, но
+ * с дефолтом в полчаса; здесь мы лишь УСКОРЯЕМ ту же проверку. Long poll ждёт
+ * события до ~25 с, поэтому 150 с — заведомо аномалия, а не спокойный диалог.
  */
 const TRANSPORT_SILENCE_MS = envInt("VK_LP_SILENCE_MS", 150_000);
-// When the `ts` cursor is static or unreadable, probe the API after this much
-// idle, and restart after this many consecutive probe failures. (VK_LP_TS_STALE_MS
-// is retired: VK's `ts` is an event cursor that legitimately stays static on an
-// idle channel, so cursor staleness alone must never trigger a restart.)
 /**
  * Нужна ли per-peer сериализация входящих.
  *
@@ -163,8 +139,6 @@ async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: numb
  * User Long Poll (messages.getLongPollServer) when only `messages` is available.
  *
  * The poller is supervised: if it stalls (heartbeat frozen) or stops, it is
- * torn down and recreated in-place (with backoff) so VK ingress recovers
- * WITHOUT a gateway restart. Every restart is logged (vk-io's own retries are
  * debug-only/silent).
  */
 export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
@@ -239,8 +213,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           return;
         }
         try {
-          const bridge = await loadCoreBridge(core);
-          const currentCfg = bridge.loadConfig() as CoreConfig;
+          const currentCfg = core.config.current() as CoreConfig;
           const currentAccount = resolveVkAccount({
             cfg: currentCfg,
             accountId: account.accountId,
@@ -443,6 +416,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           runtime: opts.runtime,
           onTimeout: ({ idleMs }) => {
             const silentSec = Math.round(idleMs / 1000);
+            const reason = `no completed long-poll request for ${silentSec}s`;
             publishStatus?.(
               channelStoppedPatch({
                 lastError: `no completed long-poll request for ${silentSec}s`,

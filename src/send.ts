@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
@@ -6,7 +7,6 @@ import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } from "./diagnostics.js";
 import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
-import { loadCoreBridge } from "./sdk-compat.js";
 import {
   cleanupAudioSegments,
   getVkAudioMessageMaxMs,
@@ -297,10 +297,6 @@ async function localSourceSize(source: string | Buffer): Promise<number | undefi
     return undefined;
   }
   try {
-    const [{ stat }, { fileURLToPath }] = await Promise.all([
-      import("node:fs/promises"),
-      import("node:url"),
-    ]);
     const path = source.startsWith("file://") ? fileURLToPath(source) : source;
     return (await stat(path)).size;
   } catch {
@@ -586,7 +582,7 @@ async function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string;
   const runtime = getVkRuntime();
   // 8.1 убрала runtime.config — конфиг берём через мост совместимости.
   const cfg = (params.cfg ??
-    (await loadCoreBridge(runtime)).loadConfig()) as CoreConfig;
+    runtime.config.current()) as CoreConfig;
   const account = resolveVkAccount({ cfg, accountId: params.accountId });
   if (!account.token) {
     throw new Error("VK token not configured");

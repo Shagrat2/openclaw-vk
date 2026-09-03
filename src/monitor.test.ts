@@ -3,6 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ── SDK mocks (for transitive accounts.ts and runtime.ts imports) ────────────
 
 const mockStatusPatches = vi.hoisted(() => [] as unknown[]);
+// Транспорт пересоздаётся на каждый тест: модуль живучести помнит обёрнутые
+// объекты в WeakSet, и переиспользование одного означало бы, что во втором
+// тесте обёртка не ставится.
+const transportHolder = vi.hoisted(() => ({
+  current: { fetchUpdates: vi.fn().mockResolvedValue(undefined) },
+}));
 const mockPollingTransport = vi.hoisted(() => ({
   fetchUpdates: vi.fn().mockResolvedValue(undefined),
 }));
@@ -45,6 +51,10 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  parseStrictPositiveInteger: (v: unknown) => {
+    const n = Number.parseInt(String(v ?? ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  },
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
@@ -114,7 +124,9 @@ vi.mock("vk-io", () => ({
         on: mockUpdatesOn,
         use: vi.fn(),
         // Через него снимается сигнал живости: обёртка вокруг fetchUpdates.
-        pollingTransport: mockPollingTransport,
+        get pollingTransport() {
+          return transportHolder.current;
+        },
       },
     };
   }),
@@ -131,19 +143,6 @@ vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
 const mockCoreAtLeast = vi.hoisted(() => vi.fn(() => true));
 vi.mock("./sdk-compat.js", () => ({
   coreAtLeast: mockCoreAtLeast,
-  loadCoreBridge: async (core: any) => ({
-    loadConfig: () => core.config.loadConfig(),
-    resolveStorePath: (...a: any[]) => core.channel.session.resolveStorePath(...a),
-    readSessionUpdatedAt: (...a: any[]) => core.channel.session.readSessionUpdatedAt(...a),
-    recordInboundSession: (...a: any[]) => core.channel.session.recordInboundSession(...a),
-    dispatchReplyWithBufferedBlockDispatcher: (...a: any[]) =>
-      core.channel.reply.dispatchReplyWithBufferedBlockDispatcher(...a),
-    finalizeInboundContext: (...a: any[]) => core.channel.reply.finalizeInboundContext(...a),
-    formatAgentEnvelope: (...a: any[]) => core.channel.reply.formatAgentEnvelope(...a),
-    resolveEnvelopeFormatOptions: (...a: any[]) =>
-      core.channel.reply.resolveEnvelopeFormatOptions(...a),
-    hasControlCommand: (...a: any[]) => core.channel.text.hasControlCommand(...a),
-  }),
 }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -533,7 +532,8 @@ describe("message_new handler", () => {
     await flush();
     await getMessageHandler()(makeCtx());
 
-    expect(vi.mocked(core.config.loadConfig)).toHaveBeenCalled();
+    // Конфиг берётся снимком рантайма, а не отдельным загрузчиком.
+    expect(vi.mocked(core.config.current)).toHaveBeenCalled();
   });
 
   it("handles messages without attachments or replyMessage", async () => {
@@ -596,8 +596,7 @@ describe("monitorVkProvider — состояние канала для ядра"
     mockStatusPatches.length = 0;
     mockWatchdog.arm.mockClear();
     mockWatchdog.touch.mockClear();
-    mockPollingTransport.fetchUpdates = vi.fn().mockResolvedValue(undefined);
-    delete (mockPollingTransport as Record<string, unknown>).__vkPollInstrumented;
+    transportHolder.current = { fetchUpdates: vi.fn().mockResolvedValue(undefined) };
   });
 
   it("сообщает о готовности с отметкой активности транспорта", async () => {
@@ -625,7 +624,7 @@ describe("monitorVkProvider — состояние канала для ядра"
     mockWatchdog.touch.mockClear();
 
     // Пустой ответ long-poll — событий нет, но запрос завершился.
-    await mockPollingTransport.fetchUpdates();
+    await transportHolder.current.fetchUpdates();
 
     expect(mockWatchdog.touch).toHaveBeenCalledTimes(1);
     expect(mockStatusPatches.at(-1)).toMatchObject({

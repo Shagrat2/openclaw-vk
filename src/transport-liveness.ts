@@ -10,30 +10,30 @@
  * - `groups.getById()` подтверждает лишь, что токен и обычный VK API живы.
  *
  * Честный признак один: HTTP-запрос за обновлениями вернулся. В vk-io это
- * `PollingTransport.fetchUpdates()`, вызываемый в цикле, — его и оборачиваем.
- * Обёртка узкая и не меняет поведения: возврат и ошибки пробрасываются как
- * есть (сам метод по контракту vk-io возвращает void), а сигнал даётся только
- * на успешное завершение запроса — в том числе когда событий не пришло.
+ * `PollingTransport.fetchUpdates()` — метод публичный, приватен только путь к
+ * нему через `Updates.pollingTransport`. Его и оборачиваем: возврат и ошибки
+ * пробрасываются как есть, сигнал даётся на успешное завершение запроса — в
+ * том числе когда событий не пришло.
  *
- * ⚠️ Ставить обёртку можно только ПОСЛЕ `updates.start()`: он пересоздаёт
- * транспорт, и патч, наложенный раньше, останется на выброшенном объекте.
+ * ⚠️ Ставить обёртку можно только ПОСЛЕ `updates.start()`: он создаёт новый
+ * транспорт, и патч, наложенный раньше, остался бы на выброшенном объекте.
+ * Повторного `start()` в жизни монитора не бывает — при застое задача аккаунта
+ * завершается, и ядро поднимает канал заново с новым `VK`. Внутренний рестарт
+ * vk-io (`PollingTransport.stop()/start()`) работает на том же экземпляре, так
+ * что обёртка его переживает.
+ *
+ * Состояние держим в модульных `WeakMap`/`WeakSet`, а не полями на чужом
+ * объекте: так vk-io остаётся неразмеченным, а запись исчезает вместе с
+ * транспортом.
  */
-
 type PollingTransportLike = {
   fetchUpdates?: (...args: unknown[]) => Promise<unknown>;
-  __vkPollInstrumented?: boolean;
-  /** Текущий получатель сигнала. Хранится на транспорте, чтобы повторная
-   *  инструментовка перепривязывала колбэк, а не молча теряла новый. */
-  __vkPollProbe?: () => void;
 };
 
-type UpdatesLike = {
-  pollingTransport?: PollingTransportLike;
-  start?: (...args: unknown[]) => Promise<unknown>;
-  startPolling?: (...args: unknown[]) => Promise<unknown>;
-  __vkStartInstrumented?: boolean;
-  __vkLatestProbe?: () => void;
-};
+type Probe = () => void;
+
+const instrumented = new WeakSet<object>();
+const probes = new WeakMap<object, Probe>();
 
 /**
  * @returns `true`, если сигнал удалось снять. `false` означает, что транспорт
@@ -42,59 +42,26 @@ type UpdatesLike = {
  */
 export function instrumentPollingTransport(
   updates: unknown,
-  onPollCompleted: () => void,
+  onPollCompleted: Probe,
 ): boolean {
-  const target = updates as UpdatesLike | undefined;
-  if (!target) {
-    return false;
-  }
-  // Переживаем смену транспорта. Внутренний рестарт vk-io объект не
-  // пересоздаёт (`PollingTransport.stop()/start()` на том же экземпляре), но
-  // `Updates.start()` — создаёт новый. Обёртка, поставленная на прежний,
-  // осталась бы на выброшенном объекте, и канал молча лишился бы признака
-  // живости: сторож тишины через свой порог объявил бы здоровый канал мёртвым.
-  // Поэтому подшиваемся к самим методам старта и переинструментовываем после
-  // каждого.
-  target.__vkLatestProbe = onPollCompleted;
-  if (!target.__vkStartInstrumented) {
-    for (const name of ["start", "startPolling"] as const) {
-      const original = target[name];
-      if (typeof original !== "function") {
-        continue;
-      }
-      target[name] = async (...args: unknown[]) => {
-        const result = await original.apply(target, args);
-        // Колбэк берём не захваченный, а текущий: инструментовка могла быть
-        // переставлена после этой обёртки.
-        attachPollProbe(target, target.__vkLatestProbe ?? onPollCompleted);
-        return result;
-      };
-    }
-    target.__vkStartInstrumented = true;
-  }
-  return attachPollProbe(target, onPollCompleted);
-}
-
-/** Ставит обёртку на текущий транспорт. Повторный вызов безопасен. */
-function attachPollProbe(target: UpdatesLike, onPollCompleted: () => void): boolean {
-  const transport = target.pollingTransport;
+  const transport = (updates as { pollingTransport?: PollingTransportLike })
+    ?.pollingTransport;
   if (typeof transport?.fetchUpdates !== "function") {
     return false;
   }
-  // Уже обёрнут — перепривязываем получателя. Ранний `return true` без этого
-  // означал бы: вызывающий видит успех, вооружает сторож тишины, а сигнал
-  // уходит прежнему (мёртвому) колбэку — здоровый канал через порог тишины
-  // объявляется мёртвым, и так по кругу.
-  transport.__vkPollProbe = onPollCompleted;
-  if (transport.__vkPollInstrumented) {
+  // Перепривязываем получателя и при повторном вызове: ранний выход по флагу
+  // означал бы, что вызывающий видит успех, вооружает сторож тишины, а сигнал
+  // уходит прежнему колбэку.
+  probes.set(transport, onPollCompleted);
+  if (instrumented.has(transport)) {
     return true;
   }
   const original = transport.fetchUpdates;
   transport.fetchUpdates = async (...args) => {
     const result = await original.apply(transport, args);
-    transport.__vkPollProbe?.();
+    probes.get(transport)?.();
     return result;
   };
-  transport.__vkPollInstrumented = true;
+  instrumented.add(transport);
   return true;
 }

@@ -119,8 +119,10 @@ describe("selectCutPointsMs", () => {
   });
 
   it("cuts hard at max when no silence fits in the window", () => {
+    // Резы ставятся с запасом в 250 мс: stream copy сдвигает границу вперёд до
+    // ключевого кадра, и без запаса кусок вылезал бы за лимит VK.
     const cuts = selectCutPointsMs([], 600_000, 270_000);
-    expect(cuts).toEqual([270_000, 540_000]);
+    expect(cuts).toEqual([269_750, 539_500]);
   });
 });
 
@@ -163,14 +165,14 @@ describe("splitAudioAtSilence temp dir cleanup", () => {
 });
 
 describe("предохранители нарезки", () => {
-  it("не режет запись длиннее общего потолка — это флуд, а не доставка", async () => {
+  it("не режет, когда кусков вышло бы больше потолка — и не тратит на это ffmpeg", async () => {
     mockExecFile.mockClear();
     // Два часа при потолке в 4 минуты дали бы три десятка голосовых подряд.
     const out = await splitAudioAtSilence("/tmp/huge.ogg", 240_000, {
       knownDurationMs: 2 * 60 * 60 * 1000,
     });
     expect(out).toEqual([]);
-    // Ни ffprobe, ни ffmpeg не звали: решение принято по известной длительности.
+    // Решение принято по известной длительности — дорогой поиск тишины не запускался.
     expect(mockExecFile).not.toHaveBeenCalled();
   });
 
