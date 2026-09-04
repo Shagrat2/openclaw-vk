@@ -94,13 +94,24 @@ if (hostZod && localZod && hostZod !== localZod) {
   );
 }
 
+/**
+ * Two passes.
+ *
+ * `tsconfig.json` covers the shipped source strictly. `tsconfig.tests.json`
+ * adds the tests and helpers with `strictNullChecks` off: they are full of
+ * `plugin.messaging!.sendText!(...)`, which alone produced 147 identical
+ * complaints and drowned out the point of checking them at all — that a test
+ * can call the core with a shape the core does not accept.
+ */
 let output = "";
 let tscFailed = false;
-try {
-  execFileSync("npx", ["tsc", "--noEmit"], { cwd: root, encoding: "utf8" });
-} catch (error) {
-  tscFailed = true;
-  output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+for (const project of ["tsconfig.json", "tsconfig.tests.json"]) {
+  try {
+    execFileSync("npx", ["tsc", "--noEmit", "-p", project], { cwd: root, encoding: "utf8" });
+  } catch (error) {
+    tscFailed = true;
+    output += `${error.stdout ?? ""}${error.stderr ?? ""}`;
+  }
 }
 
 /** `src/file.ts(12,34): error TS2353: message` → a location-independent key. */

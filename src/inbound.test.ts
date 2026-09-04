@@ -204,7 +204,7 @@ const mockProgressCompositor = vi.hoisted(() => ({
 }));
 // currentMessageId defaults to undefined (no live draft); the edit-into-answer
 // test overrides it to a number to exercise the single-bubble finalize.
-const mockCurrentMessageId = vi.hoisted(() => vi.fn<[], number | undefined>(() => undefined));
+const mockCurrentMessageId = vi.hoisted(() => vi.fn<() => number | undefined>(() => undefined));
 const mockDraftRemove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockDraftClose = vi.hoisted(() => vi.fn());
 // `overwrite` resolves to whether the text made it into the draft; shared so a
@@ -273,6 +273,19 @@ import {
   makeVkRuntime,
 } from "./test-helpers.js";
 import type { CoreConfig } from "./types.js";
+
+/**
+ * Replaces the core reply dispatcher with a loose implementation.
+ *
+ * The tests drive it with a hand-written params shape rather than the full
+ * dispatcher contract, so the cast lives here instead of at thirteen call sites.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mockReplyDispatcher(runtime: any, impl: (params: any) => Promise<void>): void {
+  vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    impl as never,
+  );
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -967,7 +980,7 @@ describe("dispatch payload", () => {
 
   it("forwards full reply payloads to sendPayloadVk without stripping channelData", async () => {
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver({
           text: "Providers:",
@@ -1005,7 +1018,7 @@ describe("dispatch payload", () => {
 
   it("clears the old keyboard after a button-triggered final reply with no new choices", async () => {
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver(
           {
@@ -1039,7 +1052,7 @@ describe("dispatch payload", () => {
 
   it("keeps the keyboard when a button-triggered final reply still has choices", async () => {
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver(
           {
@@ -1159,6 +1172,7 @@ describe("dispatch payload", () => {
       contentType: "image/heic",
     } as Awaited<ReturnType<typeof runtime.channel.media.fetchRemoteMedia>>);
     vi.mocked(runtime.channel.media.saveMediaBuffer).mockResolvedValueOnce({
+      id: "IMG_0001",
       path: "/tmp/openclaw/media/inbound/IMG_0001.HEIC",
       contentType: "image/heic",
       size: 4,
@@ -1587,7 +1601,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
   it("routes execution steps to the edit-in-place draft and finalizes on the last block", async () => {
     mockResolveStreamMode.mockReturnValue("progress");
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions, replyOptions }: any) => {
         await dispatcherOptions.onReplyStart?.();
@@ -1627,7 +1641,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockCurrentMessageId.mockReturnValue(4242);
     mockDraftRemove.mockClear();
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.onReplyStart?.();
@@ -1663,7 +1677,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockDraftOverwrite.mockResolvedValueOnce(false);
     mockSendPayloadVk.mockClear();
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.onReplyStart?.();
@@ -1705,7 +1719,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockResolveStreamMode.mockReturnValue("progress");
     const runtime = installRuntime();
     vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ replyOptions }: any) => {
         await replyOptions.onToolStart?.({ name: "Bash" });
@@ -1735,7 +1749,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockResolveStreamMode.mockReturnValue("progress");
     mockCurrentMessageId.mockReturnValue(555); // a live draft exists
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
@@ -1766,7 +1780,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockCurrentMessageId.mockReturnValue(555);
     mockEditMessageVk.mockResolvedValue(false); // edit fails
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
@@ -1788,7 +1802,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockResolveStreamMode.mockReturnValue("progress");
     mockCurrentMessageId.mockReturnValue(777);
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver(
@@ -1823,7 +1837,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockResolveStreamMode.mockReturnValue("progress");
     mockCurrentMessageId.mockReturnValue(555);
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver(
@@ -1896,7 +1910,7 @@ describe("status reaction lifecycle", () => {
     const runtime = installRuntime();
     const statusSink = vi.fn();
     vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions, replyOptions }: any) => {
         expect(replyOptions).toEqual(
           expect.objectContaining({
@@ -1959,7 +1973,7 @@ describe("status reaction lifecycle", () => {
       const logSpy = vi.spyOn(runtimeEnv, "log").mockImplementation(() => {});
       const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
       vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
-      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      mockReplyDispatcher(runtime, 
         async ({ dispatcherOptions }: any) => {
           dispatcherOptions.onError(new Error("delivery failed"), { kind: "final" });
           throw new Error("dispatch failed");

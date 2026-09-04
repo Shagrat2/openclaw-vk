@@ -61,7 +61,9 @@
     "src/setup-surface.ts",
     "src/stall-watchdog.ts",
     "src/tts-parts.ts",
-    "src/types.ts"
+    "src/types.ts",
+    "tsconfig.json",
+    "tsconfig.tests.json"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

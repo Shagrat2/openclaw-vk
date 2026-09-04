@@ -1447,7 +1447,7 @@ describe("sendPayloadVk", () => {
         get: () => "image/png",
       },
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(34);
 
     const result = await sendPayloadVk(
@@ -1497,7 +1497,7 @@ describe("sendPayloadVk", () => {
         get: () => "image/png",
       },
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(38);
 
     const result = await sendPayloadVk(
@@ -1579,7 +1579,7 @@ describe("sendPayloadVk", () => {
         get: () => "text/html; charset=utf-8",
       },
       arrayBuffer: async () => Buffer.from("<html>not image</html>").buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(36);
 
     const result = await sendPayloadVk(
@@ -1904,7 +1904,7 @@ describe("sendPayloadVk", () => {
               : null,
       },
       body: { cancel },
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(47);
 
     const result = await sendPayloadVk(

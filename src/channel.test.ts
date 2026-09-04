@@ -358,15 +358,15 @@ describe("messaging", () => {
 
 describe("config", () => {
   it("isConfigured returns true when token is non-empty", () => {
-    expect(vkPlugin.config.isConfigured({ token: "tok" } as never)).toBe(true);
+    expect(vkPlugin.config.isConfigured({ token: "tok" } as never, {} as never)).toBe(true);
   });
 
   it("isConfigured returns false when token is empty", () => {
-    expect(vkPlugin.config.isConfigured({ token: "" } as never)).toBe(false);
+    expect(vkPlugin.config.isConfigured({ token: "" } as never, {} as never)).toBe(false);
   });
 
   it("isConfigured returns false when token is whitespace", () => {
-    expect(vkPlugin.config.isConfigured({ token: "   " } as never)).toBe(false);
+    expect(vkPlugin.config.isConfigured({ token: "   " } as never, {} as never)).toBe(false);
   });
 
   it("describeAccount returns correct shape", () => {
@@ -378,7 +378,7 @@ describe("config", () => {
       tokenSource: "config" as const,
       config: {},
     };
-    const desc = vkPlugin.config.describeAccount(account as never);
+    const desc = vkPlugin.config.describeAccount(account as never, {} as never);
     expect(desc).toEqual({
       accountId: "sales",
       name: "Sales Bot",
@@ -390,7 +390,7 @@ describe("config", () => {
 
   it("describeAccount marks unconfigured when no token", () => {
     const account = { accountId: "x", enabled: true, token: "", config: {} };
-    const desc = vkPlugin.config.describeAccount(account as never);
+    const desc = vkPlugin.config.describeAccount(account as never, {} as never);
     expect(desc.configured).toBe(false);
   });
 
@@ -735,8 +735,8 @@ describe("status", () => {
     });
   });
 
-  it("buildAccountSnapshot includes tokenSource and mode", () => {
-    const snapshot = vkPlugin.status!.buildAccountSnapshot({
+  it("buildAccountSnapshot includes tokenSource and mode", async () => {
+    const snapshot = await vkPlugin.status!.buildAccountSnapshot({
       account: {
         accountId: "default",
         name: "Bot",
@@ -746,6 +746,7 @@ describe("status", () => {
       } as never,
       runtime: {} as never,
       probe: undefined as never,
+      cfg: {} as never,
     });
     expect(snapshot.tokenSource).toBe("config");
     expect(snapshot.mode).toBe("longpoll");
@@ -756,15 +757,15 @@ describe("status", () => {
 
 describe("directory", () => {
   it("self returns null", async () => {
-    expect(await vkPlugin.directory!.self()).toBeNull();
+    expect(await vkPlugin.directory!.self({} as never)).toBeNull();
   });
 
   it("listPeers returns empty array", async () => {
-    expect(await vkPlugin.directory!.listPeers()).toEqual([]);
+    expect(await vkPlugin.directory!.listPeers({} as never)).toEqual([]);
   });
 
   it("listGroups returns empty array", async () => {
-    expect(await vkPlugin.directory!.listGroups()).toEqual([]);
+    expect(await vkPlugin.directory!.listGroups({} as never)).toEqual([]);
   });
 
   it("lists configured DM peers and ignores group targets", async () => {
