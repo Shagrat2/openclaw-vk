@@ -36,6 +36,12 @@ vi.mock("openclaw/plugin-sdk/channel-status", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  // Progress label resolution: mirrors the core contract ("auto"/false plus a
+  // default label list) so the draft label can be asserted.
+  resolveChannelProgressDraftConfig: (entry: any) => ({
+    ...(entry?.streaming?.progress ?? {}),
+    labels: entry?.streaming?.progress?.labels ?? ["⏳ Работаю"],
+  }),
   createAccountStatusSink:
     ({ accountId, setStatus }: { accountId: string; setStatus: (next: unknown) => void }) =>
     (patch: Record<string, unknown>) => setStatus({ accountId, ...patch }),
@@ -334,45 +340,6 @@ describe("messaging", () => {
     expect(vkPlugin.messaging!.targetResolver!.looksLikeId(null as never)).toBe(false);
   });
 
-  describe("parseExplicitTarget", () => {
-    it("parses numeric DM target", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "123456" })).toEqual({
-        to: "123456",
-        chatType: "direct",
-      });
-    });
-
-    it("parses vk:-prefixed DM target", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:123456" })).toEqual({
-        to: "123456",
-        chatType: "direct",
-      });
-    });
-
-    it("parses vk:user: prefixed target", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:user:123456" })).toEqual({
-        to: "123456",
-        chatType: "direct",
-      });
-    });
-
-    it("parses group chat target (peerId >= 2_000_000_000)", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:chat:2000000001" })).toEqual({
-        to: "2000000001",
-        chatType: "group",
-      });
-    });
-
-    it("returns null for empty input", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "" })).toBeNull();
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "   " })).toBeNull();
-    });
-
-    it("returns null for non-numeric input", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "john" })).toBeNull();
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:abc" })).toBeNull();
-    });
-  });
 
   describe("inferTargetChatType", () => {
     it("returns 'direct' for user peer ID", () => {
@@ -397,15 +364,15 @@ describe("messaging", () => {
 
 describe("config", () => {
   it("isConfigured returns true when token is non-empty", () => {
-    expect(vkPlugin.config.isConfigured({ token: "tok" } as never)).toBe(true);
+    expect(vkPlugin.config.isConfigured({ token: "tok" } as never, {} as never)).toBe(true);
   });
 
   it("isConfigured returns false when token is empty", () => {
-    expect(vkPlugin.config.isConfigured({ token: "" } as never)).toBe(false);
+    expect(vkPlugin.config.isConfigured({ token: "" } as never, {} as never)).toBe(false);
   });
 
   it("isConfigured returns false when token is whitespace", () => {
-    expect(vkPlugin.config.isConfigured({ token: "   " } as never)).toBe(false);
+    expect(vkPlugin.config.isConfigured({ token: "   " } as never, {} as never)).toBe(false);
   });
 
   it("describeAccount returns correct shape", () => {
@@ -417,7 +384,7 @@ describe("config", () => {
       tokenSource: "config" as const,
       config: {},
     };
-    const desc = vkPlugin.config.describeAccount(account as never);
+    const desc = vkPlugin.config.describeAccount(account as never, {} as never);
     expect(desc).toEqual({
       accountId: "sales",
       name: "Sales Bot",
@@ -429,7 +396,7 @@ describe("config", () => {
 
   it("describeAccount marks unconfigured when no token", () => {
     const account = { accountId: "x", enabled: true, token: "", config: {} };
-    const desc = vkPlugin.config.describeAccount(account as never);
+    const desc = vkPlugin.config.describeAccount(account as never, {} as never);
     expect(desc.configured).toBe(false);
   });
 
@@ -774,8 +741,8 @@ describe("status", () => {
     });
   });
 
-  it("buildAccountSnapshot includes tokenSource and mode", () => {
-    const snapshot = vkPlugin.status!.buildAccountSnapshot({
+  it("buildAccountSnapshot includes tokenSource and mode", async () => {
+    const snapshot = await vkPlugin.status!.buildAccountSnapshot({
       account: {
         accountId: "default",
         name: "Bot",
@@ -785,6 +752,7 @@ describe("status", () => {
       } as never,
       runtime: {} as never,
       probe: undefined as never,
+      cfg: {} as never,
     });
     expect(snapshot.tokenSource).toBe("config");
     expect(snapshot.mode).toBe("longpoll");
@@ -795,15 +763,15 @@ describe("status", () => {
 
 describe("directory", () => {
   it("self returns null", async () => {
-    expect(await vkPlugin.directory!.self()).toBeNull();
+    expect(await vkPlugin.directory!.self({} as never)).toBeNull();
   });
 
   it("listPeers returns empty array", async () => {
-    expect(await vkPlugin.directory!.listPeers()).toEqual([]);
+    expect(await vkPlugin.directory!.listPeers({} as never)).toEqual([]);
   });
 
   it("listGroups returns empty array", async () => {
-    expect(await vkPlugin.directory!.listGroups()).toEqual([]);
+    expect(await vkPlugin.directory!.listGroups({} as never)).toEqual([]);
   });
 
   it("lists configured DM peers and ignores group targets", async () => {

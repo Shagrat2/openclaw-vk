@@ -221,17 +221,18 @@ describe("parseVkAllowFromId", () => {
 describe("vkSetupAdapter", () => {
   describe("resolveAccountId", () => {
     it("normalises account ID", () => {
-      expect(vkSetupAdapter.resolveAccountId({ accountId: "  sales  " })).toBe("sales");
+      expect(vkSetupAdapter.resolveAccountId({ cfg: {} as never, accountId: "  sales  " })).toBe("sales");
     });
 
     it("returns default for empty/undefined", () => {
-      expect(vkSetupAdapter.resolveAccountId({ accountId: undefined as never })).toBe("default");
+      expect(vkSetupAdapter.resolveAccountId({ cfg: {} as never, accountId: undefined as never })).toBe("default");
     });
   });
 
   describe("validateInput", () => {
     it("rejects useEnv for non-default account", () => {
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "sales",
         input: { useEnv: true },
       });
@@ -240,6 +241,7 @@ describe("vkSetupAdapter", () => {
 
     it("rejects empty input without useEnv", () => {
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: {},
       });
@@ -248,6 +250,7 @@ describe("vkSetupAdapter", () => {
 
     it("rejects a whitespace-only token", () => {
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { token: "   \t" },
       });
@@ -256,6 +259,7 @@ describe("vkSetupAdapter", () => {
 
     it("rejects a whitespace-only tokenFile", () => {
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { tokenFile: "  \n " },
       });
@@ -264,6 +268,7 @@ describe("vkSetupAdapter", () => {
 
     it("accepts input with token", () => {
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { token: "tok" },
       });
@@ -272,6 +277,7 @@ describe("vkSetupAdapter", () => {
 
     it("accepts input with tokenFile", () => {
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { tokenFile: "/path" },
       });
@@ -281,6 +287,7 @@ describe("vkSetupAdapter", () => {
     it("rejects useEnv when VK_TOKEN is absent", () => {
       delete process.env.VK_TOKEN;
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { useEnv: true },
       });
@@ -290,6 +297,7 @@ describe("vkSetupAdapter", () => {
     it("rejects useEnv when VK_TOKEN is empty or whitespace", () => {
       process.env.VK_TOKEN = "   \t";
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { useEnv: true },
       });
@@ -299,6 +307,7 @@ describe("vkSetupAdapter", () => {
     it("accepts useEnv for default account when VK_TOKEN is non-empty", () => {
       process.env.VK_TOKEN = "env-token";
       const err = vkSetupAdapter.validateInput({
+        cfg: {} as never,
         accountId: "default",
         input: { useEnv: true },
       });

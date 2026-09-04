@@ -8,6 +8,14 @@ vi.mock("openclaw/plugin-sdk/channel-config-schema", async () => {
   return {
     DmPolicySchema: z.enum(["pairing", "allowlist", "open", "disabled"]),
     GroupPolicySchema: z.enum(["allowlist", "open", "disabled"]),
+    // The streaming section now comes from the core schema rather than a local
+    // copy; the mock mirrors the shape the tests exercise.
+    ChannelPreviewStreamingConfigSchema: z
+      .object({
+        mode: z.enum(["off", "partial", "block", "progress"]).optional(),
+        preview: z.object({ toolProgress: z.boolean().optional() }).optional(),
+      })
+      .strict(),
   };
 });
 
@@ -162,6 +170,48 @@ describe("VkAccountSchema", () => {
       },
     });
     expect(result.success).toBe(false);
+  });
+
+  it("accepts streaming.mode=progress (step-progress opt-in)", () => {
+    const result = VkAccountSchema.safeParse({ streaming: { mode: "progress" } });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts every valid streaming mode", () => {
+    for (const mode of ["off", "partial", "block", "progress"]) {
+      expect(VkAccountSchema.safeParse({ streaming: { mode } }).success).toBe(true);
+    }
+  });
+
+  it("rejects an invalid streaming mode", () => {
+    const result = VkAccountSchema.safeParse({ streaming: { mode: "turbo" } });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts streaming.preview.toolProgress boolean", () => {
+    const result = VkAccountSchema.safeParse({
+      streaming: { mode: "progress", preview: { toolProgress: true } },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a non-boolean toolProgress", () => {
+    const result = VkAccountSchema.safeParse({
+      streaming: { preview: { toolProgress: "yes" } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("validates the streaming section against the core schema", () => {
+    // The section used to be a local `.passthrough()` copy, which accepted a
+    // typo in a streaming key silently. It is the core schema now, so a
+    // misspelled key is a config error instead of a setting that does nothing.
+    expect(
+      VkAccountSchema.safeParse({ streaming: { mode: "progress" } }).success,
+    ).toBe(true);
+    expect(
+      VkAccountSchema.safeParse({ streaming: { moed: "progress" } }).success,
+    ).toBe(false);
   });
 });
 

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": [
+      "ES2023",
+      "DOM"
+    ],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": [
+      "node"
+    ],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noImplicitAny": false
+  },
+  "include": [
+    "src/**/*.ts",
+    "index.ts",
+    "api.ts",
+    "setup-entry.ts"
+  ],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/test-helpers.ts"
+  ]
+}

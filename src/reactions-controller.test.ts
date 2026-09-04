@@ -78,7 +78,7 @@ describe("createVkStatusReactionController", () => {
     createVkStatusReactionController({ peerId: 42, cmid: 7, account });
 
     expect(mockCreateStatusReactionController).toHaveBeenCalledTimes(1);
-    const { adapter } = mockCreateStatusReactionController.mock.calls[0][0];
+    const { adapter } = (mockCreateStatusReactionController.mock.calls[0] as unknown as [Record<string, any>])[0];
 
     await adapter.setReaction("🤔");
     expect(mockSendReaction).toHaveBeenCalledWith("42", 7, "🤔", account);
@@ -89,7 +89,7 @@ describe("createVkStatusReactionController", () => {
 
   it("applies VK_DEFAULT_STATUS_REACTION_EMOJIS by default", () => {
     createVkStatusReactionController({ peerId: 1, cmid: 1, account: makeAccount() });
-    const { emojis, initialEmoji } = mockCreateStatusReactionController.mock.calls[0][0];
+    const { emojis, initialEmoji } = (mockCreateStatusReactionController.mock.calls[0] as unknown as [Record<string, any>])[0];
 
     expect(emojis.thinking).toBe(VK_DEFAULT_STATUS_REACTION_EMOJIS.thinking);
     expect(emojis.error).toBe(VK_DEFAULT_STATUS_REACTION_EMOJIS.error);
@@ -103,7 +103,7 @@ describe("createVkStatusReactionController", () => {
       account: makeAccount(),
       emojiOverrides: { thinking: "🔥", done: "🎉" },
     });
-    const { emojis } = mockCreateStatusReactionController.mock.calls[0][0];
+    const { emojis } = (mockCreateStatusReactionController.mock.calls[0] as unknown as [Record<string, any>])[0];
 
     expect(emojis.thinking).toBe("🔥");
     expect(emojis.done).toBe("🎉");
@@ -121,7 +121,7 @@ describe("createVkStatusReactionController", () => {
       onError,
     });
 
-    const args = mockCreateStatusReactionController.mock.calls[0][0];
+    const args = (mockCreateStatusReactionController.mock.calls[0] as unknown as [Record<string, any>])[0];
     expect(args.timing).toBe(timing);
     expect(args.onError).toBe(onError);
     expect(args.enabled).toBe(true);
@@ -134,6 +134,6 @@ describe("createVkStatusReactionController", () => {
       account: makeAccount(),
       initialEmoji: "🤔",
     });
-    expect(mockCreateStatusReactionController.mock.calls[0][0].initialEmoji).toBe("🤔");
+    expect((mockCreateStatusReactionController.mock.calls[0] as unknown as [Record<string, any>])[0].initialEmoji).toBe("🤔");
   });
 });

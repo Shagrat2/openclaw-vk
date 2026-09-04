@@ -1,33 +1,22 @@
-import { rmSync } from "node:fs";
+import { globSync, rmSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 import { build } from "esbuild";
 
+// Entry points are derived, not listed.
+//
+// The set used to be maintained by hand here AND in package.json "files", and
+// both restate what tsconfig already declares. A new `src/*.ts` added to one
+// list and forgotten in the other ships broken — that has happened.
 const entryPoints = [
   "index.ts",
   "setup-entry.ts",
   "api.ts",
-  "src/accounts.ts",
-  "src/channel.setup.ts",
-  "src/channel.ts",
-  "src/config-schema.ts",
-  "src/tts-parts.ts",
-  "src/audio-chunk.ts",
-  "src/vk-errors.ts",
-  "src/settings.ts",
-  "src/diagnostics.ts",
-  "src/format.ts",
-  "src/inbound.ts",
-  "src/keyboard.ts",
-  "src/media.ts",
-  "src/monitor.ts",
-  "src/probe.ts",
-  "src/reactions-controller.ts",
-  "src/runtime.ts",
-  "src/sanitize.ts",
-  "src/send-support.ts",
-  "src/send.ts",
-  "src/setup-core.ts",
-  "src/setup-surface.ts",
-  "src/types.ts",
+  ...globSync("src/*.ts", { cwd: root }).filter(
+    (file) => !file.endsWith(".test.ts") && file !== "src/test-helpers.ts",
+  ).sort(),
 ];
 
 rmSync("dist", { recursive: true, force: true });

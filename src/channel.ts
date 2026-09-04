@@ -242,20 +242,6 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       }
       return trimmed.replace(/^vk:(?:user:|chat:)?/i, "");
     },
-    parseExplicitTarget: ({ raw }) => {
-      const normalized = raw.trim().replace(/^vk:(?:user:|chat:)?/i, "");
-      if (!normalized) {
-        return null;
-      }
-      const peerId = Number(normalized);
-      if (Number.isNaN(peerId)) {
-        return null;
-      }
-      return {
-        to: normalized,
-        chatType: isVkGroupPeerId(peerId) ? ("group" as const) : ("direct" as const),
-      };
-    },
     inferTargetChatType: ({ to }) => {
       const normalized = to.trim().replace(/^vk:(?:user:|chat:)?/i, "");
       const peerId = Number(normalized);
@@ -340,6 +326,18 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       return { channel: "vk", ...result };
     },
     sendMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, replyToId, forceDocument }) => {
+      // `mediaUrl` is optional in the core contract. Without it there is nothing
+      // to upload, and passing undefined down would fail inside the uploader —
+      // so the caption goes out as a plain message instead of the reply
+      // disappearing.
+      if (!mediaUrl) {
+        const textOnly = await sendMessageVk(to, text, {
+          cfg,
+          accountId: accountId ?? undefined,
+          replyTo: replyToId ?? undefined,
+        });
+        return { channel: "vk", ...textOnly };
+      }
       const result = await sendFormattedMediaVk(to, text, mediaUrl, {
         cfg,
         accountId: accountId ?? undefined,
@@ -440,6 +438,8 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         config: ctx.cfg as CoreConfig,
         runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
+        // The gateway owns restarts and backoff; the plugin only publishes what
+        // it sees on its long poll. The sink is created above, on account entry.
         setStatus,
       });
 
