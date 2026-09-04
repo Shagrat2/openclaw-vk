@@ -36,6 +36,18 @@ import {
 } from "./send.js";
 import type { CoreConfig, VkConfig, VkProbe } from "./types.js";
 
+/**
+ * Stop signals of running accounts, keyed by account id. Outbound sends read
+ * theirs from here: the core's outbound context carries no cancellation, and
+ * without one a gateway stop left a download or an ffmpeg run to finish and
+ * upload with nobody waiting for the result.
+ */
+const vkAccountStopSignals = new Map<string, AbortSignal>();
+
+function resolveVkAccountStopSignal(accountId?: string | null): AbortSignal | undefined {
+  return vkAccountStopSignals.get(accountId?.trim() || DEFAULT_ACCOUNT_ID);
+}
+
 const meta = {
   id: "vk",
   label: "VK",
@@ -298,6 +310,10 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   },
   outbound: {
     deliveryMode: "direct",
+    // The core hands outbound sends no cancellation of their own, so the
+    // account's stop signal stands in: a gateway stop then reaches a download,
+    // a probe or an ffmpeg run that is still in flight, instead of leaving it to
+    // finish and upload afterwards.
     textChunkLimit: 4096,
     sanitizeText: ({ text }) => sanitizeVkPlainText(text),
     shouldSkipPlainTextSanitization: ({ payload }) => Boolean(payload.channelData),
@@ -305,6 +321,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       const result = await sendPayloadVk(to, payload, {
         cfg,
         accountId: accountId ?? undefined,
+        abortSignal: resolveVkAccountStopSignal(accountId),
         mediaLocalRoots,
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
@@ -325,6 +342,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       const result = await sendFormattedMediaVk(to, text, mediaUrl, {
         cfg,
         accountId: accountId ?? undefined,
+        abortSignal: resolveVkAccountStopSignal(accountId),
         mediaLocalRoots,
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
@@ -343,6 +361,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       const result = await sendFormattedMediaVk(to, text, mediaUrl, {
         cfg,
         accountId: accountId ?? undefined,
+        abortSignal: resolveVkAccountStopSignal(accountId),
         mediaLocalRoots,
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
@@ -433,6 +452,19 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       }
 
       ctx.log?.info(`[${account.accountId}] starting VK provider${vkBotLabel}`);
+
+      if (ctx.abortSignal) {
+        vkAccountStopSignals.set(account.accountId, ctx.abortSignal);
+        ctx.abortSignal.addEventListener(
+          "abort",
+          () => {
+            if (vkAccountStopSignals.get(account.accountId) === ctx.abortSignal) {
+              vkAccountStopSignals.delete(account.accountId);
+            }
+          },
+          { once: true },
+        );
+      }
 
       const monitor = await monitorVkProvider({
         token,

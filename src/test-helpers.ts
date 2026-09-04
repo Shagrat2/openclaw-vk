@@ -30,7 +30,14 @@ export function makeVkRuntime(opts: {
     },
     logging: {
       shouldLogVerbose: vi.fn().mockReturnValue(false),
-      getChildLogger: vi.fn(),
+      // The runtime contract promises a logger, not undefined: a mock that
+      // returns undefined hides a crash in the caller until production.
+      getChildLogger: vi.fn().mockReturnValue({
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      }),
     },
     channel: {
       pairing: {
