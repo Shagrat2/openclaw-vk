@@ -37,7 +37,7 @@ jobs:
       # way check:runtime documents it.
       - name: Typecheck against the host SDK
         run: |
-          npm install --no-save --package-lock=false "openclaw@${{ matrix.openclaw || '2026.9.2' }}"
+          npm install --no-save --package-lock=false openclaw@latest
           npm run check:types
 
   runtime-compatibility:
