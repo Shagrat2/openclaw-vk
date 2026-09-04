@@ -23,6 +23,11 @@ vi.mock("./diagnostics.js", () => ({
   resolveVkDiagLevel: () => mockDiagLevel.value,
 }));
 
+vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
+  // The debounce window comes from the core resolver now.
+  resolveInboundDebounceMs: () => 0,
+}));
+
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   normalizeAccountId: (id?: string) => id?.trim() || "default",
 }));

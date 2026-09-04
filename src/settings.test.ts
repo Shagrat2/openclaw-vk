@@ -1,5 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// The `openclaw` peer is optional and absent in CI's unit-test job, so every SDK
+// subpath a module under test imports has to be mocked — including the ones it
+// reaches transitively, here through `settings.ts`.
+vi.mock("openclaw/plugin-sdk/core", () => ({
+  parseStrictPositiveInteger: (value: unknown) => {
+    const raw = typeof value === "number" ? String(value) : typeof value === "string" ? value : "";
+    if (!/^\d+$/.test(raw.trim())) return undefined;
+    const parsed = Number.parseInt(raw.trim(), 10);
+    return parsed > 0 ? parsed : undefined;
+  },
+}));
+
 const runtimeConfig = vi.hoisted(() => ({ value: undefined as unknown }));
 vi.mock("./runtime.js", () => ({
   tryGetVkRuntime: () => ({}),

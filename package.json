@@ -45,7 +45,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "npm run check:sdk-imports && npm run test:coverage && npm run build && npm run check:pack",
+    "check": "npm run check:sdk-imports && npm run test:coverage && npm run check:test-isolation && npm run build && npm run check:pack",
     "check:pack": "npm pack --dry-run",
     "check:runtime": "node scripts/smoke-runtime.mjs",
     "check:sdk-imports": "node scripts/check-sdk-imports.mjs",
@@ -53,7 +53,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "check:types": "node scripts/check-types.mjs"
+    "check:types": "node scripts/check-types.mjs",
+    "check:test-isolation": "node scripts/check-test-isolation.mjs"
   },
   "dependencies": {
     "markdown-to-vk": "^0.3.2",
