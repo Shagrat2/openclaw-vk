@@ -770,10 +770,81 @@ describe("loadVkOutboundMedia", () => {
       expect(result.kind).toBe("image");
     });
 
+    it("refuses a relative path that escapes into a real file outside the root", async () => {
+      // A relative MEDIA path resolves against an allowed root, not the gateway
+      // cwd — and `..` must not be a way back out of it. The target has to exist,
+      // otherwise the failure would be a plain ENOENT and prove nothing.
+      const outsideDir = await mkdtemp(join(tmpdir(), "vk-media-outside-"));
+      try {
+        await writeFile(join(outsideDir, "escape.png"), "x");
+        const relative = join("..", outsideDir.split("/").pop() as string, "escape.png");
+
+        await expect(
+          loadVkOutboundMedia({ mediaUrl: relative, mediaLocalRoots: [tempDir] }),
+        ).rejects.toThrow("outside allowed roots");
+      } finally {
+        await rm(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a relative path when no allowed root could be resolved", async () => {
+      // Every configured root was unusable, so there is nothing to resolve
+      // against; falling back to cwd here would defeat the restriction.
+      await expect(
+        loadVkOutboundMedia({
+          mediaUrl: "test.png",
+          mediaLocalRoots: ["/definitely/missing/root"],
+        }),
+      ).rejects.toThrow("outside allowed roots");
+    });
+
     it("throws for non-existent file", async () => {
       await expect(
         loadVkOutboundMedia({ mediaUrl: join(tempDir, "missing.png") }),
       ).rejects.toThrow();
     });
+  });
+});
+
+describe("extractVkInboundAttachments — document previews", () => {
+  it("takes the audio link from a doc that carries an audio_message preview", () => {
+    // VK delivers some voice notes as documents with the playable link hidden in
+    // `preview.audio_message`; without this the attachment would have no URL and
+    // transcription would silently get nothing.
+    const [attachment] = extractVkInboundAttachments([
+      {
+        type: "doc",
+        title: "voice.ogg",
+        preview: {
+          audio_message: {
+            link_ogg: "https://vk.example/voice.ogg",
+            link_mp3: "https://vk.example/voice.mp3",
+          },
+        },
+      },
+    ]);
+
+    // link_mp3 comes first in the preference list.
+    expect(attachment?.url).toBe("https://vk.example/voice.mp3");
+  });
+
+  it("falls back to link_ogg when no mp3 link is offered", () => {
+    const [attachment] = extractVkInboundAttachments([
+      {
+        type: "doc",
+        title: "voice.ogg",
+        preview: { audio_message: { link_ogg: "https://vk.example/voice.ogg" } },
+      },
+    ]);
+
+    expect(attachment?.url).toBe("https://vk.example/voice.ogg");
+  });
+
+  it("ignores a malformed audio_message preview instead of throwing", () => {
+    const [attachment] = extractVkInboundAttachments([
+      { type: "doc", title: "voice.ogg", preview: { audio_message: [] } },
+    ]);
+
+    expect(attachment?.url).toBeUndefined();
   });
 });

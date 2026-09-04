@@ -6,10 +6,12 @@ vi.mock("node:child_process", () => ({
   execFile: mockExecFile,
 }));
 
-import { readdir } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
+  cleanupAudioSegments,
   getVkAudioMessageMaxMs,
   parseSilenceWindows,
   probeAudioDurationMs,
@@ -40,6 +42,7 @@ beforeEach(() => {
   delete process.env.VK_AUDIO_MESSAGE_MAX_MS;
   delete process.env.FFPROBE_BIN;
   delete process.env.FFMPEG_BIN;
+  delete process.env.VK_AUDIO_SPLIT_MAX_INPUT_BYTES;
 });
 
 describe("getVkAudioMessageMaxMs", () => {
@@ -188,3 +191,187 @@ describe("предохранители нарезки", () => {
   });
 });
 
+
+describe("splitAudioAtSilence — full extraction path", () => {
+  /**
+   * ffmpeg/ffprobe are mocked, so nothing is written to disk; the function only
+   * builds paths. `respond` picks an answer per invocation kind, because a
+   * single split calls three different tools in turn.
+   */
+  function stubTools(opts: {
+    durationSec?: string;
+    silence?: string;
+    extractFails?: boolean;
+    segmentDurationSec?: string | ((path: string) => string | Error);
+  }): void {
+    mockExecFile.mockImplementation(
+      (
+        _bin: string,
+        args: string[],
+        _opts: unknown,
+        cb: (e: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const line = args.join(" ");
+        if (line.includes("format=duration")) {
+          const target = args[args.length - 1] as string;
+          if (target.includes("part-") && opts.segmentDurationSec !== undefined) {
+            const answer =
+              typeof opts.segmentDurationSec === "function"
+                ? opts.segmentDurationSec(target)
+                : opts.segmentDurationSec;
+            if (answer instanceof Error) {
+              cb(answer, "", "");
+              return;
+            }
+            cb(null, `${answer}\n`, "");
+            return;
+          }
+          cb(null, `${opts.durationSec ?? "100.0"}\n`, "");
+          return;
+        }
+        if (line.includes("silencedetect")) {
+          cb(null, "", opts.silence ?? "");
+          return;
+        }
+        if (opts.extractFails) {
+          cb(Object.assign(new Error("ffmpeg boom"), { stderr: "boom" }), "", "boom");
+          return;
+        }
+        cb(null, "", "");
+      },
+    );
+  }
+
+  it("returns one file per range when every segment fits the limit", async () => {
+    stubTools({ durationSec: "100.0", segmentDurationSec: "20.0" });
+
+    const parts = await splitAudioAtSilence("/tmp/voice.ogg", 30_000);
+
+    // 100s at a 30s limit: four ranges, so four files.
+    expect(parts).toHaveLength(4);
+    expect(parts.every((p) => p.includes("vk-voice-"))).toBe(true);
+    // The extension follows the source: `-c copy` keeps the container.
+    expect(parts.every((p) => p.endsWith(".ogg"))).toBe(true);
+    await cleanupAudioSegments(parts);
+  });
+
+  it("discards the whole split when a segment came out longer than the limit", async () => {
+    // The point of the post-check: VK rejects an over-long segment exactly as it
+    // rejected the original, so half a split is worse than none — the caller
+    // falls back to sending a document.
+    stubTools({
+      durationSec: "100.0",
+      segmentDurationSec: (path) => (path.endsWith("002.ogg") ? "45.0" : "20.0"),
+    });
+
+    expect(await splitAudioAtSilence("/tmp/voice.ogg", 30_000)).toEqual([]);
+  });
+
+  it("keeps the split when a segment duration cannot be probed", async () => {
+    // An unreadable segment is not proof of a bad split; refusing here would
+    // throw away a usable result.
+    stubTools({
+      durationSec: "100.0",
+      segmentDurationSec: () => new Error("ffprobe unavailable"),
+    });
+
+    expect(await splitAudioAtSilence("/tmp/voice.ogg", 30_000)).toHaveLength(4);
+  });
+
+  it("gives up when the source is longer than the segment ceiling allows", async () => {
+    // Two hours at a 30s limit would mean 240 voice messages; the guard stops
+    // before the expensive silence search.
+    stubTools({ durationSec: "7200.0" });
+
+    expect(await splitAudioAtSilence("/tmp/voice.ogg", 30_000)).toEqual([]);
+  });
+
+  it("does nothing for an empty path or a non-positive limit", async () => {
+    expect(await splitAudioAtSilence("", 30_000)).toEqual([]);
+    expect(await splitAudioAtSilence("/tmp/voice.ogg", 0)).toEqual([]);
+    expect(mockExecFile).not.toHaveBeenCalled();
+  });
+
+  it("returns nothing when the source is shorter than the limit", async () => {
+    stubTools({ durationSec: "10.0" });
+    expect(await splitAudioAtSilence("/tmp/voice.ogg", 30_000)).toEqual([]);
+  });
+
+  it("gives up when the duration cannot be measured at all", async () => {
+    stubExecFileError("ffprobe missing");
+    expect(await splitAudioAtSilence("/tmp/voice.ogg", 30_000)).toEqual([]);
+  });
+});
+
+describe("cleanupAudioSegments", () => {
+  it("removes both the files and the directory holding them", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "vk-voice-test-"));
+    const file = join(dir, "part-000.ogg");
+    await writeFile(file, "x");
+
+    await cleanupAudioSegments([file]);
+
+    await expect(stat(dir)).rejects.toThrow();
+  });
+
+  it("ignores empty entries and missing files instead of throwing", async () => {
+    await expect(
+      cleanupAudioSegments(["", "/tmp/vk-voice-does-not-exist/part-000.ogg"]),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("selectCutPointsMs — degenerate silence layouts", () => {
+  it("advances by the limit when the only candidate would make a zero-length segment", () => {
+    // A silence window sitting exactly at the previous cut would otherwise pick
+    // the same boundary again and loop forever, producing empty segments.
+    const windows = [{ start: 0, end: 0.2 }];
+    const cuts = selectCutPointsMs(windows, 60_000, 20_000);
+
+    let prev = 0;
+    for (const cut of cuts) {
+      expect(cut).toBeGreaterThan(prev);
+      expect(cut - prev).toBeLessThanOrEqual(20_000);
+      prev = cut;
+    }
+    expect(cuts.length).toBeGreaterThan(0);
+  });
+
+  it("falls back to even cuts when there is no silence at all", () => {
+    const cuts = selectCutPointsMs([], 60_000, 20_000);
+    // 60s at a 20s limit needs cuts, and the planning margin keeps each segment
+    // just under the limit rather than exactly on it.
+    expect(cuts.length).toBeGreaterThanOrEqual(2);
+    let prev = 0;
+    for (const cut of cuts) {
+      expect(cut - prev).toBeLessThanOrEqual(20_000);
+      prev = cut;
+    }
+  });
+
+  it("ignores silence found beyond the source duration", () => {
+    const cuts = selectCutPointsMs([{ start: 500, end: 501 }], 60_000, 20_000);
+    for (const cut of cuts) {
+      expect(cut).toBeLessThan(60_000);
+    }
+  });
+});
+
+describe("splitAudioAtSilence — input size ceiling", () => {
+  it("refuses a file larger than the configured ceiling", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "vk-voice-size-"));
+    const file = join(dir, "huge.ogg");
+    await writeFile(file, "0123456789");
+    process.env.VK_AUDIO_SPLIT_MAX_INPUT_BYTES = "5";
+
+    try {
+      // A gigabyte recording is not worth opening; the caller falls back to
+      // sending the original as a document.
+      expect(await splitAudioAtSilence(file, 30_000)).toEqual([]);
+      expect(mockExecFile).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.VK_AUDIO_SPLIT_MAX_INPUT_BYTES;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -42,6 +42,7 @@ afterEach(async () => {
   delete process.env.VK_TTS_PARTS;
   delete process.env.VK_TTS_PARTS_MATCH_MS;
   delete process.env.VK_TTS_PARTS_MAX_AGE_MS;
+  delete process.env.VK_TTS_PARTS_WAIT_MS;
   await rm(root, { recursive: true, force: true });
 });
 
@@ -193,5 +194,66 @@ describe("claim marker", () => {
 
     const claim: unknown = JSON.parse(await readFile(join(dir, "claimed.json"), "utf8"));
     expect(claim).toMatchObject({ headDurationMs: 30_000 });
+  });
+});
+
+describe("tunables and guards", () => {
+  it("expands a ~/ prefixed parts directory to the home directory", async () => {
+    const { getTtsPartsDir } = await import("./tts-parts.js");
+    process.env.TTS_PARTS_DIR = "~/custom-tts-parts";
+    const { homedir } = await import("node:os");
+
+    expect(getTtsPartsDir()).toBe(join(homedir(), "custom-tts-parts"));
+  });
+
+  it("falls back to ~/.openclaw/tts-parts when nothing is configured", async () => {
+    const { getTtsPartsDir } = await import("./tts-parts.js");
+    delete process.env.TTS_PARTS_DIR;
+    const { homedir } = await import("node:os");
+
+    expect(getTtsPartsDir()).toBe(join(homedir(), ".openclaw", "tts-parts"));
+  });
+
+  it("treats continuation as enabled unless explicitly switched off", async () => {
+    const { isTtsPartsEnabled } = await import("./tts-parts.js");
+
+    expect(isTtsPartsEnabled()).toBe(true);
+    process.env.VK_TTS_PARTS = "0";
+    expect(isTtsPartsEnabled()).toBe(false);
+  });
+
+  it("reads the per-part wait from the environment, ignoring nonsense", async () => {
+    const { getTtsPartWaitMs } = await import("./tts-parts.js");
+
+    expect(getTtsPartWaitMs()).toBe(300_000);
+    process.env.VK_TTS_PARTS_WAIT_MS = "1000";
+    expect(getTtsPartWaitMs()).toBe(1_000);
+    process.env.VK_TTS_PARTS_WAIT_MS = "not-a-number";
+    expect(getTtsPartWaitMs()).toBe(300_000);
+    delete process.env.VK_TTS_PARTS_WAIT_MS;
+  });
+
+  it("rejects a manifest that is not shaped like one", async () => {
+    // A half-written manifest must not be treated as a claimable directory.
+    const dir = join(root, "broken");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "manifest.json"), JSON.stringify({ id: "broken" }), "utf8");
+
+    expect(await readTtsPartsManifest(dir)).toBeNull();
+  });
+
+  it("returns null for unreadable or absent manifests", async () => {
+    expect(await readTtsPartsManifest(join(root, "does-not-exist"))).toBeNull();
+  });
+
+  it("claims nothing when the head duration is unknown", async () => {
+    // Without a head duration there is nothing to match parts against.
+    expect(await claimTtsParts(null)).toBeNull();
+    expect(await claimTtsParts(Number.NaN)).toBeNull();
+  });
+
+  it("claims nothing when the parts root does not exist", async () => {
+    process.env.TTS_PARTS_DIR = join(root, "missing-root");
+    expect(await claimTtsParts(60_000)).toBeNull();
   });
 });

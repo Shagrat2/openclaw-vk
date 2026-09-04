@@ -153,6 +153,20 @@ vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
 
 // ── audio-chunk mocks (ffmpeg/ffprobe split) ────────────────────────────────
 const mockProbeAudioDurationMs = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+// Continuation parts of a long spoken reply. Real implementations read
+// ~/.openclaw/tts-parts, so they are mocked; `claimTtsParts` returns null by
+// default, which is the "no continuation" case every other test relies on.
+const mockClaimTtsParts = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockReadTtsPartsManifest = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockWaitForTtsPart = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockDiscardTtsParts = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("./tts-parts.js", () => ({
+  claimTtsParts: mockClaimTtsParts,
+  readTtsPartsManifest: mockReadTtsPartsManifest,
+  waitForTtsPart: mockWaitForTtsPart,
+  discardTtsParts: mockDiscardTtsParts,
+}));
+
 const mockSplitAudioAtSilence = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 const mockCleanupAudioSegments = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
@@ -2620,5 +2634,130 @@ describe("retry logic", () => {
 
     await expect(sendMessageVk("123", "hello", { cfg })).rejects.toThrow("rate limit");
     expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("long spoken reply continuation", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesSend.mockReset().mockResolvedValue(1);
+    mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
+    mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
+    mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
+    mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
+    mockClaimTtsParts.mockReset().mockResolvedValue(null);
+    mockReadTtsPartsManifest.mockReset().mockResolvedValue(null);
+    mockWaitForTtsPart.mockReset().mockResolvedValue(null);
+    mockDiscardTtsParts.mockReset().mockResolvedValue(undefined);
+    vi.mocked(VK).mockClear();
+  });
+
+  /**
+   * The continuation runs detached from the reply, so tests wait for the work
+   * rather than awaiting the send call itself.
+   */
+  async function settleContinuation(): Promise<void> {
+    for (let i = 0; i < 50; i += 1) {
+      await Promise.resolve();
+    }
+  }
+
+  it("sends every ready part as its own follow-up voice message", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({
+      parts: [{ index: 1 }, { index: 2 }],
+    });
+    mockWaitForTtsPart.mockImplementation(async (_dir: string, index: number) => ({
+      index,
+      file: `part${index}.opus`,
+      durationMs: 1_000,
+    }));
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    // Head plus two continuation parts.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(3);
+    expect(mockDiscardTtsParts).toHaveBeenCalledWith("/tmp/tts-parts/abc");
+    // Continuation parts carry no text: it is already in the head message.
+    const lastSend = mockMessagesSend.mock.calls.at(-1)?.[0];
+    expect(lastSend.message).toBeFalsy();
+    expect(lastSend.reply_to).toBeUndefined();
+  });
+
+  it("skips a part that never became ready and still delivers the rest", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({
+      parts: [{ index: 1 }, { index: 2 }],
+    });
+    mockWaitForTtsPart.mockImplementation(async (_dir: string, index: number) =>
+      index === 1 ? null : { index, file: "part2.opus", durationMs: 1_000 },
+    );
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    // Head plus the one part that made it.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("splits an over-long part and cleans the segments up afterwards", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({ parts: [{ index: 1 }] });
+    mockWaitForTtsPart.mockResolvedValue({
+      index: 1,
+      file: "part1.opus",
+      // Longer than the VK ceiling, so it has to be split.
+      durationMs: 10 * 60 * 1000,
+    });
+    mockSplitAudioAtSilence.mockResolvedValue(["/tmp/seg-1.opus", "/tmp/seg-2.opus"]);
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    // Head plus two segments of the single part.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(3);
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith([
+      "/tmp/seg-1.opus",
+      "/tmp/seg-2.opus",
+    ]);
+  });
+
+  it("keeps going when one part fails to send", async () => {
+    // One lost part must not swallow the rest of the reply.
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({
+      parts: [{ index: 1 }, { index: 2 }],
+    });
+    mockWaitForTtsPart.mockImplementation(async (_dir: string, index: number) => ({
+      index,
+      file: `part${index}.opus`,
+      durationMs: 1_000,
+    }));
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_message123_head")
+      .mockRejectedValueOnce(new Error("upload exploded"))
+      .mockResolvedValueOnce("audio_message123_part2");
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(3);
+    // The directory is still released, so nothing is left claimed forever.
+    expect(mockDiscardTtsParts).toHaveBeenCalledWith("/tmp/tts-parts/abc");
+  });
+
+  it("does nothing when the manifest disappeared between claim and read", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue(null);
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledOnce();
+    expect(mockDiscardTtsParts).not.toHaveBeenCalled();
   });
 });

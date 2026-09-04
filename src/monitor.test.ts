@@ -13,11 +13,14 @@ vi.mock("openclaw/plugin-sdk/core", () => ({
 }));
 
 // Diagnostics pull in logging-core; the monitor only needs them to be silent.
+// The level is mutable so both branches (middleware installed or not) are testable.
+const mockDiagLevel = vi.hoisted(() => ({ value: "off" as string }));
+const mockVkDiag = vi.hoisted(() => vi.fn());
 vi.mock("./diagnostics.js", () => ({
-  vkDiag: vi.fn(),
+  vkDiag: mockVkDiag,
   vkDiagFailure: vi.fn(),
   redactVkId: (value: unknown) => String(value),
-  resolveVkDiagLevel: () => "off",
+  resolveVkDiagLevel: () => mockDiagLevel.value,
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
@@ -150,6 +153,7 @@ vi.mock("vk-io", () => {
         },
         updates: {
           on: mockUpdatesOn,
+          use: mockUpdatesUse,
           handleWebhookUpdate: mockHandleWebhookUpdate,
           handlePollingUpdate: mockHandlePollingUpdate,
         },
@@ -163,6 +167,7 @@ const mockHandleVkInbound = vi.hoisted(() =>
 );
 vi.mock("./inbound.js", () => ({ handleVkInbound: mockHandleVkInbound }));
 
+const mockUpdatesUse = vi.hoisted(() => vi.fn());
 const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
 vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
 
@@ -246,6 +251,11 @@ beforeEach(() => {
     .mockResolvedValue({ server: "lp.vk.com", key: "abc", ts: 1 });
   mockHandleVkInbound.mockReset().mockResolvedValue(undefined);
   mockPrimeVkGroupId.mockReset();
+  mockUpdatesUse.mockReset();
+  mockVkDiag.mockReset();
+  mockDiagLevel.value = "off";
+  delete process.env.VK_SELFTEST;
+  delete process.env.VK_SELFTEST_TEXT;
   setVkRuntime(makeVkRuntime());
 });
 
@@ -799,5 +809,199 @@ describe("combineVkInboundMessages", () => {
       { ...base, messageId: "2", text: "" },
     ]);
     expect(combined?.text).toBe("text");
+  });
+});
+
+describe("stall watchdog", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports a disconnect and ends the account task when polls stop coming", async () => {
+    // The gateway watches transport activity too, but with a half-hour default.
+    // A long poll returns within ~25s, so minutes of silence is an anomaly, and
+    // ending the task here lets the gateway restart the channel much sooner.
+    vi.useFakeTimers();
+    const setStatus = vi.fn();
+    const monitor = startMonitor({ setStatus });
+    await flush();
+    setStatus.mockClear();
+
+    await vi.advanceTimersByTimeAsync(160_000);
+    await monitor.promise;
+
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        running: false,
+        connected: false,
+        lifecycle: "stopped",
+        lastError: expect.stringContaining("no completed long-poll request"),
+      }),
+    );
+  });
+
+  it("stays quiet while polls keep completing", async () => {
+    vi.useFakeTimers();
+    const setStatus = vi.fn();
+    activeMonitor = startMonitor({ setStatus });
+    await flush();
+    setStatus.mockClear();
+
+    for (let i = 0; i < 8; i += 1) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await mockPollingTransportInstances[0].fetchUpdates();
+    }
+
+    expect(setStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: "stopped" }),
+    );
+  });
+});
+
+describe("diagnostics wiring", () => {
+  it("installs the update probe only when diagnostics are on", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+    // At `off` the middleware would be dead weight on every update.
+    expect(mockUpdatesUse).not.toHaveBeenCalled();
+
+    activeMonitor.controller.abort();
+    await activeMonitor.promise.catch(() => {});
+    mockDiagLevel.value = "redacted";
+
+    activeMonitor = startMonitor();
+    await flush();
+    expect(mockUpdatesUse).toHaveBeenCalledOnce();
+
+    // The probe reports the update type and passes control on.
+    const middleware = mockUpdatesUse.mock.calls[0][0] as (
+      ctx: unknown,
+      next: () => Promise<void>,
+    ) => Promise<void>;
+    const next = vi.fn().mockResolvedValue(undefined);
+    await middleware({ type: "message_new", subTypes: ["message_new"] }, next);
+    expect(mockVkDiag).toHaveBeenCalledWith("update", {
+      type: "message_new",
+      sub: "message_new",
+    });
+    expect(next).toHaveBeenCalledOnce();
+  });
+});
+
+describe("ingestion self-test (VK_SELFTEST)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("pushes a synthetic message through the same debouncer live messages use", async () => {
+    // A broken receive path cannot be reproduced from outside: only a human can
+    // send the bot a message, and "channel running" proves nothing.
+    vi.useFakeTimers();
+    process.env.VK_SELFTEST = "555";
+    process.env.VK_SELFTEST_TEXT = "probe text";
+
+    activeMonitor = startMonitor();
+    await flush();
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(mockHandleVkInbound).toHaveBeenCalledOnce();
+    expect(mockHandleVkInbound.mock.calls[0][0].message).toMatchObject({
+      peerId: 555,
+      senderId: 555,
+      text: "probe text",
+    });
+  });
+
+  it("does nothing without the env knob", async () => {
+    vi.useFakeTimers();
+    activeMonitor = startMonitor();
+    await flush();
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(mockHandleVkInbound).not.toHaveBeenCalled();
+  });
+});
+
+describe("inbound enqueue failures", () => {
+  it("logs the failure instead of letting it escape into vk-io", async () => {
+    // A throw here would travel back into the vk-io event handler and could
+    // wedge ingestion; the message is lost either way, so it must be logged.
+    const core = makeVkRuntime();
+    vi.mocked(core.channel.debounce.createInboundDebouncer).mockImplementation(
+      (() => ({
+        enqueue: vi.fn().mockRejectedValue(new Error("queue is full")),
+        flushKey: vi.fn(),
+        cancelKey: vi.fn(),
+      })) as never,
+    );
+    setVkRuntime(core);
+
+    const runtime = createVkRuntimeEnv();
+    const errorSpy = vi.spyOn(runtime, "error").mockImplementation(() => {});
+    activeMonitor = startMonitor({ runtime });
+    await flush();
+    await getMessageHandler()(makeCtx());
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("inbound enqueue error"),
+    );
+  });
+});
+
+describe("dispatch guards", () => {
+  /** Captures the debouncer's onFlush so a test can invoke it directly. */
+  function captureFlush(): { flush: () => Promise<void> | undefined } {
+    const captured: { flush?: (items: unknown[], createFlush: unknown) => unknown } = {};
+    const core = makeVkRuntime();
+    vi.mocked(core.channel.debounce.createInboundDebouncer).mockImplementation(
+      ((params: { onFlush: (items: unknown[], createFlush: unknown) => unknown }) => {
+        captured.flush = params.onFlush;
+        return { enqueue: vi.fn(), flushKey: vi.fn(), cancelKey: vi.fn() };
+      }) as never,
+    );
+    setVkRuntime(core);
+    return {
+      flush: () => {
+        const result = captured.flush?.([], ({ dispatch }: { dispatch: () => Promise<void> }) => ({
+          admission: dispatch(),
+          completion: Promise.resolve(),
+        })) as { admission?: Promise<void> } | undefined;
+        return result?.admission;
+      },
+    };
+  }
+
+  it("says out loud when a flush arrives with nothing to combine", async () => {
+    // Returning quietly here used to read as "the message vanished".
+    const captured = captureFlush();
+    const runtime = createVkRuntimeEnv();
+    const logSpy = vi.spyOn(runtime, "log").mockImplementation(() => {});
+    activeMonitor = startMonitor({ runtime });
+    await flush();
+
+    await captured.flush();
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no message after combine"),
+    );
+  });
+
+  it("says out loud when a flush arrives after the monitor stopped", async () => {
+    const captured = captureFlush();
+    const runtime = createVkRuntimeEnv();
+    const logSpy = vi.spyOn(runtime, "log").mockImplementation(() => {});
+    const monitor = startMonitor({ runtime });
+    await flush();
+
+    monitor.controller.abort();
+    await monitor.promise.catch(() => {});
+    logSpy.mockClear();
+
+    await captured.flush();
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("dispatch skipped (monitor stopped)"),
+    );
+    expect(mockHandleVkInbound).not.toHaveBeenCalled();
   });
 });
