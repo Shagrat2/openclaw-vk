@@ -1,8 +1,15 @@
 import type { ChannelProgressDraftMode, StreamingCompatEntry } from "./sdk-compat.js";
-import {
-  createChannelProgressDraftCompositor,
-  type ChannelProgressDraftCompositor,
-} from "openclaw/plugin-sdk/channel-message";
+import { createChannelProgressDraftCompositor } from "openclaw/plugin-sdk/channel-outbound";
+
+/**
+ * The compositor type is derived from the factory rather than imported.
+ *
+ * `ChannelProgressDraftCompositor` was only declared in the 2026.7 SDK; 2026.8
+ * has no such type, so the import was broken and survived merely because the
+ * build runs esbuild without typechecking. `ReturnType` gives the same type and
+ * does not depend on the core version.
+ */
+type ChannelProgressDraftCompositor = ReturnType<typeof createChannelProgressDraftCompositor>;
 import { deleteMessageVk, editMessageVk, sendMessageVk } from "./send.js";
 import type { CoreConfig, ResolvedVkAccount } from "./types.js";
 

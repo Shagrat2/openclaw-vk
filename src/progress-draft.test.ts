@@ -13,7 +13,7 @@ const mockSendMessage = vi.hoisted(() =>
 const mockEditMessage = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const mockDeleteMessage = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
-vi.mock("openclaw/plugin-sdk/channel-message", () => ({
+vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createChannelProgressDraftCompositor: mockCreateCompositor,
 }));
 

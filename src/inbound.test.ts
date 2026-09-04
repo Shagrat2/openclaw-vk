@@ -1894,7 +1894,7 @@ describe("status reaction lifecycle", () => {
       isDirect: true,
       isGroup: false,
       isMentionableGroup: false,
-      requireMention: false,
+      shouldBypassMention: true,
       canDetectMention: true,
       effectiveWasMentioned: false,
     });
@@ -1967,8 +1967,9 @@ describe("status reaction lifecycle", () => {
     const runtimeEnv = createVkRuntimeEnv();
     const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
     vi.mocked(runtime.channel.session.recordInboundSession).mockImplementation(
-      async ({ onRecordError }: any) => {
-        onRecordError(new Error("session store unavailable"));
+      async () => {
+        // The core takes no error callback: a failure surfaces as a rejection.
+        throw new Error("session store unavailable");
       },
     );
 

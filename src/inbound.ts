@@ -1,5 +1,6 @@
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { StreamingCompatEntry } from "./sdk-compat.js";
 import {
   DEFAULT_TIMING,
   type StatusReactionController,
@@ -445,14 +446,18 @@ export async function handleVkInbound(params: {
     accountId: account.accountId,
   });
 
-  await recordSessionMetaFromInbound({
-    storePath,
-    ctx: ctxPayload,
-    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
-    onRecordError: (err) => {
-      runtime.error?.(`vk: failed updating session meta: ${String(err)}`);
-    },
-  });
+  // The core takes no error callback here (it never did on 2026.8: the option we
+  // used to pass was silently ignored), so failures are caught around the call.
+  // They must not break ingestion — session meta is bookkeeping, not the reply.
+  try {
+    await recordSessionMetaFromInbound({
+      storePath,
+      ctx: ctxPayload,
+      sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    });
+  } catch (err) {
+    runtime.error?.(`vk: failed updating session meta: ${String(err)}`);
+  }
 
   try {
     await markMessageReadVk(String(message.peerId), message.messageId, account);
@@ -483,7 +488,10 @@ export async function handleVkInbound(params: {
       isDirect: !isGroup,
       isGroup,
       isMentionableGroup: isGroup,
-      requireMention: Boolean(requireMention),
+      // The gate has no `requireMention`; it asks the inverse question. Passing
+      // the old name meant the option was ignored and a group that does not
+      // require a mention never got an ack reaction.
+      shouldBypassMention: !requireMention,
       canDetectMention: true,
       effectiveWasMentioned: isGroup ? wasMentioned : false,
     });

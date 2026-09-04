@@ -321,8 +321,14 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   // batching while keeping per-peer serialization — sequential, no added latency.
   const inboundDebouncer = core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
     debounceMs: envInt("VK_INBOUND_DEBOUNCE_MS", 0),
-    keyOf: (item) => `vk:${opts.accountId}:${item.peerId}`,
     serializeImmediate: true,
+    buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
+    // Only merge plain-text messages; ones carrying attachments or a payload
+    // flush on their own (immediately) but are still serialized per peer.
+    shouldDebounce: (msg) =>
+      msg.text.length > 0 &&
+      (msg.attachments?.length ?? 0) === 0 &&
+      msg.messagePayload === undefined,
     // The core hands a flush factory and expects `{ admission, completion }`
     // back: the lane frees on admission while completion is still running.
     // Returning a bare promise makes it fail on `flush.admission`, and the
