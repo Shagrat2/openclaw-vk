@@ -1,4 +1,5 @@
 import { DmPolicySchema, GroupPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
+import { VK_DIAG_LEVELS } from "./types.js";
 import { z } from "zod";
 
 function requireOpenAllowFrom(params: {
@@ -40,6 +41,19 @@ const VkGroupConfigSchema = z
   .strict()
   .optional();
 
+// Channel diagnostics (`channels.vk.diagnostics`). A level rather than a
+// toggle: "off" is silent, "redacted" logs progress without file names or URLs,
+// "full" logs everything. Details and the table live in src/diagnostics.ts.
+const VkDiagnosticsSchema = z
+  .object({
+    // The set of levels is declared once, in diagnostics.ts, where it is parsed.
+    level: z.enum(VK_DIAG_LEVELS).optional(),
+    /** Optional extra file sink, for when the gateway feed is too noisy. */
+    file: z.string().optional(),
+  })
+  .strict()
+  .optional();
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
@@ -47,6 +61,7 @@ const VkAccountSchemaBase = z
     token: z.string().optional(),
     tokenFile: z.string().optional(),
     dmPolicy: DmPolicySchema.optional(),
+    diagnostics: VkDiagnosticsSchema,
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     defaultTo: z.string().optional(),
     groupPolicy: GroupPolicySchema.optional(),
