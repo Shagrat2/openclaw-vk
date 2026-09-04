@@ -51,6 +51,41 @@ if (!version) {
   process.exit(1);
 }
 
+// Одна копия zod, а не две.
+//
+// Ядро тянет свою zod, плагин — свою. Если версии разошлись, npm держит два
+// дерева, и типы из разных копий структурно несовместимы: проверка сыпет
+// ошибками вида «$ZodCheck из node_modules/zod не присваивается $ZodCheck из
+// node_modules/openclaw/node_modules/zod». Это артефакт раскладки, а не дефект
+// кода — в обычной установке пакетный менеджер сводит их в одну копию.
+// Поэтому перед проверкой подтягиваем ровно ту zod, против которой собрано ядро.
+const hostZod = (() => {
+  try {
+    return JSON.parse(readFileSync(resolve(root, "node_modules/openclaw/package.json"), "utf8"))
+      .dependencies?.zod;
+  } catch {
+    return undefined;
+  }
+})();
+const localZod = (() => {
+  try {
+    return JSON.parse(readFileSync(resolve(root, "node_modules/zod/package.json"), "utf8")).version;
+  } catch {
+    return undefined;
+  }
+})();
+if (hostZod && localZod && hostZod !== localZod) {
+  console.log(`Aligning zod with the host: ${localZod} → ${hostZod}`);
+  // `openclaw` is installed without --save, so npm treats it as extraneous and
+  // prunes it on any other install — taking the whole SDK contract with it.
+  // Both go in one command for that reason.
+  execFileSync(
+    "npm",
+    ["install", "--no-save", "--package-lock=false", "--silent", `zod@${hostZod}`, `openclaw@${version}`],
+    { cwd: root, stdio: "inherit" },
+  );
+}
+
 let output = "";
 try {
   execFileSync("npx", ["tsc", "--noEmit"], { cwd: root, encoding: "utf8" });
