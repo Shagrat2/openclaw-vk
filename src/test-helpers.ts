@@ -24,13 +24,22 @@ export function makeVkRuntime(opts: {
   return {
     version: "0.0.0",
     config: {
+      // The config snapshot is a normal PluginRuntimeCore surface; a mock
+      // without it would hide a caller crash all the way to production.
       current: vi.fn().mockReturnValue({}),
       mutateConfigFile: vi.fn(),
       replaceConfigFile: vi.fn(),
     },
     logging: {
       shouldLogVerbose: vi.fn().mockReturnValue(false),
-      getChildLogger: vi.fn(),
+      // The runtime contract promises a logger, not undefined: a mock that
+      // returns undefined hides a crash in the caller until production.
+      getChildLogger: vi.fn().mockReturnValue({
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      }),
     },
     channel: {
       pairing: {
@@ -114,7 +123,30 @@ export function makeVkRuntime(opts: {
         removeAckReactionAfterReply: vi.fn(),
       },
       debounce: {
-        createInboundDebouncer: vi.fn(),
+        // Immediate-flush stub: each enqueued item flushes on its own via
+        // onFlush([item]). Enough to exercise the plugin's wiring
+        // (enqueue → onFlush → handleVkInbound) without timers. The real
+        // debouncer's batching/serialization is covered by core's own tests.
+        createInboundDebouncer: vi.fn(
+          (params: {
+            onFlush: (
+              items: unknown[],
+              createFlush: (flush: { dispatch: () => Promise<void> }) => unknown,
+            ) => unknown;
+          }) => ({
+            enqueue: vi.fn(async (item: unknown) => {
+              // Mirrors the core contract: the flush factory returns
+              // `{ admission, completion }`, and the lane frees on admission.
+              const flush = params.onFlush([item], ({ dispatch }) => {
+                const admission = dispatch();
+                return { admission, completion: admission };
+              }) as { admission?: Promise<void> } | undefined;
+              await flush?.admission;
+            }),
+            flushKey: vi.fn(),
+            cancelKey: vi.fn(),
+          }),
+        ),
         resolveInboundDebounceMs: vi.fn(),
       },
       discord: {} as never,

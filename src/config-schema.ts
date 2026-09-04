@@ -54,6 +54,45 @@ const VkDiagnosticsSchema = z
   .strict()
   .optional();
 
+// Voice and media limits (`channels.vk.audio`). These were environment-only,
+// which put a dozen user-facing settings outside schema validation, `doctor` and
+// live reload. The environment still overrides, as an escape hatch on a running
+// gateway.
+const VkAudioSchema = z
+  .object({
+    /** Hard cap for one voice message; VK rejects longer ones. */
+    maxVoiceMs: z.number().int().positive().optional(),
+    /** Deadline for the whole split operation. */
+    splitDeadlineMs: z.number().int().positive().optional(),
+    /** Timeout for a single ffmpeg/ffprobe run. */
+    splitTimeoutMs: z.number().int().positive().optional(),
+    /** Input files larger than this are not split at all. */
+    maxInputBytes: z.number().int().positive().optional(),
+    /** Ceiling on segments: nobody listens to more voice messages than this. */
+    maxSegments: z.number().int().positive().optional(),
+    /** Download ceiling for remote media; the URL comes from a model reply. */
+    remoteMaxBytes: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
+// Long-reply voice continuation (`channels.vk.voiceContinuation`).
+const VkVoiceContinuationSchema = z
+  .object({
+    /** Off disables tail delivery entirely. */
+    enabled: z.boolean().optional(),
+    /** Directory the TTS command writes continuation parts into. */
+    dir: z.string().optional(),
+    /** How far head duration may drift from the manifest when claiming it. */
+    matchToleranceMs: z.number().int().positive().optional(),
+    /** Manifests older than this are ignored. */
+    maxAgeMs: z.number().int().positive().optional(),
+    /** How long to wait for one part to finish synthesizing. */
+    partWaitMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
@@ -62,6 +101,8 @@ const VkAccountSchemaBase = z
     tokenFile: z.string().optional(),
     dmPolicy: DmPolicySchema.optional(),
     diagnostics: VkDiagnosticsSchema,
+    audio: VkAudioSchema,
+    voiceContinuation: VkVoiceContinuationSchema,
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     defaultTo: z.string().optional(),
     groupPolicy: GroupPolicySchema.optional(),

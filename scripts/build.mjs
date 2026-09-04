@@ -9,6 +9,8 @@ const entryPoints = [
   "src/channel.setup.ts",
   "src/channel.ts",
   "src/config-schema.ts",
+  "src/tts-parts.ts",
+  "src/audio-chunk.ts",
   "src/vk-errors.ts",
   "src/settings.ts",
   "src/diagnostics.ts",

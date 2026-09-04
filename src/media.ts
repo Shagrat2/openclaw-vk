@@ -411,7 +411,7 @@ export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundA
   }
 
   return rawAttachments
-    .map((attachment) => {
+    .map((attachment): VkInboundAttachment | undefined => {
       if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
         return undefined;
       }
@@ -424,7 +424,7 @@ export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundA
         url,
         title: normalizeVkAttachmentTitle(type, record),
         mimeType: inferVkAttachmentMimeType(type, record, url),
-      } satisfies VkInboundAttachment;
+      };
     })
     .filter((attachment): attachment is VkInboundAttachment => Boolean(attachment));
 }

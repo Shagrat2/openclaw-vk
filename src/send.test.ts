@@ -26,6 +26,8 @@ import {
   sendPhotoVk,
   sendReactionVk,
   deleteReactionVk,
+  editMessageVk,
+  deleteMessageVk,
   sendTypingVk,
 } from "./send.js";
 import { makeAccount } from "./test-helpers.js";
@@ -35,11 +37,49 @@ import { makeAccount } from "./test-helpers.js";
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  // The core serializes tasks by key; this is the same semantics in three lines,
+  // so the tests observe real ordering instead of a pass-through stub.
+  enqueueKeyedTask: async <T,>({
+    tails,
+    key,
+    task,
+  }: {
+    tails: Map<string, Promise<void>>;
+    key: string;
+    task: () => Promise<T>;
+  }): Promise<T> => {
+    const previous = tails.get(key) ?? Promise.resolve();
+    const next = previous.then(task, task);
+    tails.set(
+      key,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return await next;
+  },
+  parseStrictPositiveInteger: (v: unknown) => {
+    const n = Number.parseInt(String(v ?? ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  },
+}));
+
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   normalizeAccountId: (id?: string) => id?.trim() || "default",
+}));
+
+const mockUploadLogger = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
 }));
 
 const mockGetVkRuntime = vi.hoisted(() =>
@@ -48,18 +88,28 @@ const mockGetVkRuntime = vi.hoisted(() =>
       activity: { record: vi.fn() },
     },
     config: { current: vi.fn().mockReturnValue({}) },
+    logging: {
+      shouldLogVerbose: vi.fn().mockReturnValue(false),
+      getChildLogger: vi.fn().mockReturnValue(mockUploadLogger),
+    },
   }),
 );
 
 vi.mock("./runtime.js", () => ({
   getVkRuntime: mockGetVkRuntime,
+  tryGetVkRuntime: mockGetVkRuntime,
 }));
 
 const mockMessagesSend = vi.hoisted(() => vi.fn());
+const mockGetMessagesUploadServer = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ upload_url: "https://upload.vk.example/audio" }),
+);
 const mockMessagesMarkAsRead = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSetActivity = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSendReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockDeleteReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
+const mockMessagesEdit = vi.hoisted(() => vi.fn().mockResolvedValue(1));
+const mockMessagesDelete = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockUploadPhoto = vi.hoisted(() => vi.fn().mockResolvedValue("photo123_456"));
 const mockUploadDocument = vi.hoisted(() => vi.fn().mockResolvedValue("doc123_789"));
 const mockUploadAudioMessage = vi.hoisted(() => vi.fn().mockResolvedValue("audio_message123_789"));
@@ -74,6 +124,9 @@ vi.mock("vk-io", () => ({
   VK: vi.fn().mockImplementation(function () {
     return {
       api: {
+        docs: {
+          getMessagesUploadServer: mockGetMessagesUploadServer,
+        },
         groups: {
           getById: mockGroupsGetById,
         },
@@ -83,6 +136,8 @@ vi.mock("vk-io", () => ({
           setActivity: mockSetActivity,
           sendReaction: mockSendReaction,
           deleteReaction: mockDeleteReaction,
+          edit: mockMessagesEdit,
+          delete: mockMessagesDelete,
         },
       },
       upload: {
@@ -95,6 +150,35 @@ vi.mock("vk-io", () => ({
   getRandomId: mockGetRandomId,
 }));
 vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
+
+// ── audio-chunk mocks (ffmpeg/ffprobe split) ────────────────────────────────
+const mockProbeAudioDurationMs = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+// Continuation parts of a long spoken reply. Real implementations read
+// ~/.openclaw/tts-parts, so they are mocked; `claimTtsParts` returns null by
+// default, which is the "no continuation" case every other test relies on.
+const mockClaimTtsParts = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockReadTtsPartsManifest = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockWaitForTtsPart = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockDiscardTtsParts = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("./tts-parts.js", () => ({
+  claimTtsParts: mockClaimTtsParts,
+  readTtsPartsManifest: mockReadTtsPartsManifest,
+  waitForTtsPart: mockWaitForTtsPart,
+  discardTtsParts: mockDiscardTtsParts,
+}));
+
+const mockSplitAudioAtSilence = vi.hoisted(() => vi.fn().mockResolvedValue([]));
+const mockCleanupAudioSegments = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock("./audio-chunk.js", () => ({
+  getVkAudioMessageMaxMs: () => 270_000,
+  probeAudioDurationMs: mockProbeAudioDurationMs,
+  splitAudioAtSilence: mockSplitAudioAtSilence,
+  cleanupAudioSegments: mockCleanupAudioSegments,
+  // Real implementation: the send path asks it for a segment's extension, and
+  // the answer has to match what splitting actually produced.
+  audioFileExtension: (file: string) => file.slice(file.lastIndexOf(".")) || ".ogg",
+}));
 
 const TOKEN = "test-token";
 const cfg = { channels: { vk: { token: TOKEN } } } as never;
@@ -138,9 +222,14 @@ beforeEach(() => {
   mockSetActivity.mockReset().mockResolvedValue(1);
   mockSendReaction.mockReset().mockResolvedValue(1);
   mockDeleteReaction.mockReset().mockResolvedValue(1);
+  mockMessagesEdit.mockReset().mockResolvedValue(1);
+  mockMessagesDelete.mockReset().mockResolvedValue(1);
   mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
   mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
   mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGetMessagesUploadServer
+    .mockReset()
+    .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
   mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
   mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
   // Reset constructor counters between tests.
@@ -450,6 +539,83 @@ describe("sendPhotoVk", () => {
     expect(result).toEqual({ messageId: "99", chatId: "123" });
   });
 
+  it("serializes concurrent uploads for one account so transfers never overlap", async () => {
+    const gates: Array<() => void> = [];
+    let inFlight = 0;
+    let peak = 0;
+    mockUploadPhoto.mockReset().mockImplementation(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      inFlight -= 1;
+      return "photo123_456";
+    });
+    mockMessagesSend.mockResolvedValue(1);
+
+    const sends = [
+      sendPhotoVk("123", Buffer.from("a"), undefined, { cfg }),
+      sendPhotoVk("456", Buffer.from("b"), undefined, { cfg }),
+    ];
+
+    // Both sends have started, but exactly one reached the upload server: the
+    // second is queued. Without the queue there would be two at once.
+    await vi.waitFor(() => expect(gates.length).toBe(1));
+    gates[0]?.();
+    await vi.waitFor(() => expect(gates.length).toBe(2));
+    gates[1]?.();
+    await Promise.all(sends);
+
+    expect(peak).toBe(1);
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a local photo on transient «photo is undefined» instead of falling back to a document", async () => {
+    // A real case: a 177 KB frame failed on attempt 1 and the recipient got a
+    // grey "JPG · 173 KB" card instead of the picture — the document fallback
+    // fired on a failure that a retry gets through.
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-photo-"));
+    const filePath = join(tempDir, "frame.jpg");
+    await writeFile(filePath, "jpeg-bytes");
+    const transient = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto
+      .mockReset()
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValueOnce("photo123_456");
+    mockUploadDocument.mockReset();
+    mockMessagesSend.mockResolvedValueOnce(77);
+
+    const result = await sendPayloadVk(
+      "123",
+      { text: "кадр", mediaUrl: pathToFileURL(filePath).toString() },
+      { cfg, mediaLocalRoots: [tempDir] },
+    );
+
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(result).toEqual({ messageId: "77", chatId: "123" });
+  });
+
+  it("logs a failed upload with the VK error code and no payload details", async () => {
+    const failure = Object.assign(new Error("boom"), { code: 100 });
+    mockUploadPhoto.mockReset().mockRejectedValue(failure);
+    mockMessagesSend.mockResolvedValue(1);
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ kind: "photo", code: 100, bytes: 3 }),
+    );
+    // Attachment content is never logged — a Buffer becomes the source kind.
+    const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect((meta as { source?: unknown })?.source).toBe("buffer");
+  });
+
   it("sends empty message text when no caption", async () => {
     mockMessagesSend.mockResolvedValueOnce(1);
 
@@ -544,6 +710,12 @@ describe("sendAudioMessageVk", () => {
     clearVkInstances();
     mockMessagesSend.mockReset();
     mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGetMessagesUploadServer
+    .mockReset()
+    .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
+    mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
+    mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
+    mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
     vi.mocked(VK).mockClear();
   });
 
@@ -554,11 +726,23 @@ describe("sendAudioMessageVk", () => {
       cfg,
     });
 
+    // The upload server is fetched by a separate request (with its own narrow
+    // retry) and the transfer uses the ready uploadUrl — vk-io no longer goes
+    // for the server itself.
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledWith({
+      type: "audio_message",
+      peer_id: 456,
+    });
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 456,
       source: {
-        value: "https://example.com/voice.mp3",
-        filename: "voice.mp3",
+        uploadUrl: "https://upload.vk.example/audio",
+        values: [
+          {
+            value: "https://example.com/voice.mp3",
+            filename: "voice.mp3",
+          },
+        ],
       },
       title: "voice.mp3",
     });
@@ -569,6 +753,268 @@ describe("sendAudioMessageVk", () => {
         attachment: "audio_message123_789",
       }),
     );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+    // A URL is downloaded so it can be measured and split. Here fetch returned
+    // no body, so materialization failed and no split ran — the send went as a
+    // single piece, as before.
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+  });
+
+  it("скачивает удалённое аудио, чтобы длинную запись можно было порезать", async () => {
+    // A URL used not to be split at all: materialization returned null for
+    // http, and a long recording went as one piece, which VK rejected.
+    const audio = Buffer.alloc(2048, 7);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: (k: string) => (k === "content-length" ? String(audio.length) : null) },
+      body: (async function* () {
+        yield new Uint8Array(audio);
+      })(),
+    } as unknown as Response);
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockMessagesSend.mockResolvedValue(91);
+
+    await sendAudioMessageVk("456", "https://example.com/long.ogg", "voice.ogg", "caption", {
+      cfg,
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith("https://example.com/long.ogg", expect.anything());
+    expect(mockSplitAudioAtSilence).toHaveBeenCalled();
+    // Two segments mean two voice messages.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("не тянет в память удалённое аудио сверх потолка", async () => {
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "1024";
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: (k: string) => (k === "content-length" ? "999999999" : null) },
+      body: (async function* () {
+        yield new Uint8Array(10);
+      })(),
+    } as unknown as Response);
+    mockSplitAudioAtSilence.mockClear();
+
+    await sendAudioMessageVk("456", "https://example.com/huge.ogg", "voice.ogg", undefined, {
+      cfg,
+    });
+
+    // The download was rejected by its declared size — no split happened.
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+  });
+
+  it("retries only the upload-server request on a transient code=15", async () => {
+    // Review asked for a narrower retry: code 15 used to replay the whole
+    // pipeline (get server → upload → save), and a retry after a successful
+    // upload could create the document twice.
+    const batchedError = Object.assign(new Error("Access denied"), { code: 15 });
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockRejectedValueOnce(batchedError)
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/audio" });
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk(
+      "456",
+      "https://example.com/voice.mp3",
+      "voice.mp3",
+      "caption",
+      { cfg },
+    );
+
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
+    // The file is uploaded exactly once — no duplicate document is possible.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("берёт свежий upload_url на каждую попытку заливки", async () => {
+    // VK's upload_url is single-use: replaying multipart against a spent address
+    // would always fail, making the "file is undefined" retry pointless.
+    const fileUndefined = Object.assign(new Error("file is undefined"), { code: 100 });
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/first" })
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/second" });
+    mockUploadAudioMessage
+      .mockReset()
+      .mockRejectedValueOnce(fileUndefined)
+      .mockResolvedValueOnce("audio_message123_789");
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    await sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", undefined, {
+      cfg,
+    });
+
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]?.source?.uploadUrl).toBe(
+      "https://upload.vk.example/first",
+    );
+    expect(mockUploadAudioMessage.mock.calls[1]?.[0]?.source?.uploadUrl).toBe(
+      "https://upload.vk.example/second",
+    );
+  });
+
+  it("does not replay the upload when code=15 comes from a later stage", async () => {
+    // A permanent permission failure on the upload itself: nothing to retry, and
+    // extra attempts only delay the normal switch to sending a document.
+    const scopeError = Object.assign(
+      new Error("Access denied: no access to call this method with current scopes"),
+      { code: 15 },
+    );
+    mockUploadAudioMessage.mockReset().mockRejectedValue(scopeError);
+
+    await expect(
+      sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries audio upload on transient code=100 \"file is undefined\"", async () => {
+    const fileUndefinedError = Object.assign(
+      new Error("One of the parameters specified was missing or invalid: file is undefined"),
+      { code: 100 },
+    );
+    mockUploadAudioMessage
+      .mockRejectedValueOnce(fileUndefinedError)
+      .mockResolvedValueOnce("audio_message123_789");
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", {
+      cfg,
+    });
+
+    // Two upload attempts: transient failure then success — the voice is delivered.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 456, attachment: "audio_message123_789" }),
+    );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("does not retry audio upload on a genuine (non-file) code=100", async () => {
+    const paramError = Object.assign(
+      new Error("One of the parameters specified was missing or invalid: peer_id is invalid"),
+      { code: 100 },
+    );
+    mockUploadAudioMessage.mockRejectedValue(paramError);
+
+    await expect(
+      sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+    // Only one attempt — an arbitrary code=100 must not be masked as transient.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the single-message path for a short local file", async () => {
+    mockMessagesSend.mockResolvedValueOnce(88);
+    mockProbeAudioDurationMs.mockResolvedValueOnce(60_000); // 1 min ≤ limit
+
+    const result = await sendAudioMessageVk("456", "/tmp/voice.ogg", "voice.ogg", "caption", {
+      cfg,
+    });
+
+    expect(mockProbeAudioDurationMs).toHaveBeenCalledWith("/tmp/voice.ogg");
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("splits an over-limit local file into multiple voice messages", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000); // 10 min > limit
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_part1")
+      .mockResolvedValueOnce("audio_part2");
+    mockMessagesSend.mockResolvedValueOnce(101).mockResolvedValueOnce(102);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+      cfg,
+      replyTo: "777",
+    });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000, {
+      // The duration was already measured by the caller — no second ffprobe run.
+      knownDurationMs: 600_000,
+    });
+    // Two voice uploads, one per segment.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
+      source: expect.objectContaining({
+        values: [expect.objectContaining({ value: "/tmp/part-0.ogg" })],
+      }),
+    });
+    // Two voice messages sent in order; caption + replyTo on first only.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(getSendCall(0)).toMatchObject({
+      message: "caption",
+      attachment: "audio_part1",
+      reply_to: 777,
+    });
+    expect(getSendCall(1)).toMatchObject({ attachment: "audio_part2" });
+    expect(getSendCall(1)).not.toHaveProperty("reply_to");
+    // Segment temp files cleaned up.
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    expect(result).toEqual({ messageId: "102", chatId: "456" });
+  });
+
+  it("sends tail text chunks after all voice segments", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_part1")
+      .mockResolvedValueOnce("audio_part2");
+    // 2 voice sends + 1 tail text-chunk send (5000 chars → 4096 + 904; the
+    // first 4096 chunk rides voice #1, the 904 remainder is the single tail).
+    mockMessagesSend
+      .mockResolvedValueOnce(101)
+      .mockResolvedValueOnce(102)
+      .mockResolvedValueOnce(103);
+
+    const longTail = "a".repeat(5000);
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", longTail, { cfg });
+
+    // First voice carries chunk 0; remaining text chunk comes after both voices.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+    expect(getSendCall(0).attachment).toBe("audio_part1");
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(1).attachment).toBe("audio_part2");
+    expect(getSendCall(2)).not.toHaveProperty("attachment");
+    expect(getSendCall(2).message).toBe("a".repeat(904));
+    expect(result).toEqual({ messageId: "103", chatId: "456" });
+  });
+
+  it("falls back to single upload when split fails (ffmpeg error)", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce([]); // split could not produce ≥2 parts
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledTimes(1);
+    // Falls back to the single upload of the original source.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
+      source: expect.objectContaining({
+        values: [expect.objectContaining({ value: "/tmp/long.ogg" })],
+      }),
+    });
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("does not crash and falls back when probe throws", async () => {
+    mockProbeAudioDurationMs.mockRejectedValueOnce(new Error("ffprobe missing"));
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ messageId: "88", chatId: "456" });
   });
 });
@@ -768,6 +1214,96 @@ describe("deleteReactionVk", () => {
   });
 });
 
+describe("editMessageVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesEdit.mockReset().mockResolvedValue(1);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("edits the message in place by message_id", async () => {
+    const ok = await editMessageVk("123", 42, "🛠️ Bash", makeAccount());
+
+    expect(ok).toBe(true);
+    expect(mockMessagesEdit).toHaveBeenCalledWith({
+      peer_id: 123,
+      message_id: 42,
+      message: "🛠️ Bash",
+      keep_forward_messages: 1,
+      keep_snippets: 1,
+    });
+  });
+
+  it("normalizes vk-prefixed peer IDs", async () => {
+    await editMessageVk("vk:chat:9", 7, "🔎 Web Search", makeAccount());
+
+    expect(mockMessagesEdit).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 9, message_id: 7 }),
+    );
+  });
+
+  it("returns false without calling VK when token is empty", async () => {
+    const ok = await editMessageVk("123", 42, "x", makeAccount({ token: "" }));
+
+    expect(ok).toBe(false);
+    expect(mockMessagesEdit).not.toHaveBeenCalled();
+  });
+
+  it("returns false when peer or message_id is invalid", async () => {
+    expect(await editMessageVk("abc", 42, "x", makeAccount())).toBe(false);
+    expect(await editMessageVk("123", 0, "x", makeAccount())).toBe(false);
+    expect(await editMessageVk("123", Number.NaN, "x", makeAccount())).toBe(false);
+    expect(mockMessagesEdit).not.toHaveBeenCalled();
+  });
+
+  it("passes format_data (serialized) when rich-text runs are provided", async () => {
+    await editMessageVk("123", 42, "bold", makeAccount(), {
+      formatData: { version: 1, items: [{ type: "bold", offset: 0, length: 4 }] },
+    });
+    const call = mockMessagesEdit.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call.peer_id).toBe(123);
+    expect(call.message_id).toBe(42);
+    expect(typeof call.format_data).toBe("string");
+    expect(JSON.parse(call.format_data as string)).toEqual({
+      version: 1,
+      items: [{ type: "bold", offset: 0, length: 4 }],
+    });
+  });
+
+  it("omits format_data when there are no rich-text runs", async () => {
+    await editMessageVk("123", 42, "plain", makeAccount(), {
+      formatData: { version: 1, items: [] },
+    });
+    const call = mockMessagesEdit.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call.format_data).toBeUndefined();
+  });
+});
+
+describe("deleteMessageVk", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesDelete.mockReset().mockResolvedValue(1);
+    vi.mocked(VK).mockClear();
+  });
+
+  it("deletes the message for everyone by id", async () => {
+    await deleteMessageVk("123", 42, makeAccount());
+
+    expect(mockMessagesDelete).toHaveBeenCalledWith({
+      peer_id: 123,
+      message_ids: [42],
+      delete_for_all: 1,
+    });
+  });
+
+  it("no-ops on empty token or invalid id", async () => {
+    await deleteMessageVk("123", 42, makeAccount({ token: "" }));
+    await deleteMessageVk("123", 0, makeAccount());
+
+    expect(mockMessagesDelete).not.toHaveBeenCalled();
+  });
+});
+
 describe("sendPayloadVk", () => {
   beforeEach(() => {
     clearVkInstances();
@@ -902,6 +1438,38 @@ describe("sendPayloadVk", () => {
     );
   });
 
+  it("refuses a remote photo that exceeds the media ceiling", async () => {
+    // The photo path used to read `arrayBuffer()` with no limit at all, on the
+    // same untrusted model-supplied URL the audio path already capped.
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "4";
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: () => "image/png" },
+      body: (async function* () {
+        yield new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      })(),
+    } as unknown as Response);
+    mockMessagesSend.mockResolvedValue(77);
+
+    try {
+      await sendPayloadVk(
+        "123",
+        { text: "caption", mediaUrl: "https://example.com/big.png" },
+        { cfg },
+      );
+      // The oversized body is dropped, so no second upload attempt is made
+      // from it; delivery falls through to the document path instead.
+      expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+    }
+  });
+
   it("retries image upload with downloaded buffer when VK rejects URL source", async () => {
     const invalidPhotoError = Object.assign(
       new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
@@ -913,8 +1481,12 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "image/png",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Uint8Array.from([1, 2, 3, 4]));
+      })(),
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(34);
 
     const result = await sendPayloadVk(
@@ -963,8 +1535,12 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "image/png",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Uint8Array.from([1, 2, 3, 4]));
+      })(),
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(38);
 
     const result = await sendPayloadVk(
@@ -1045,8 +1621,12 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "text/html; charset=utf-8",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Buffer.from("<html>not image</html>"));
+      })(),
       arrayBuffer: async () => Buffer.from("<html>not image</html>").buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(36);
 
     const result = await sendPayloadVk(
@@ -1213,7 +1793,7 @@ describe("sendPayloadVk", () => {
     const fallbackCall = getSendCall(mockMessagesSend.mock.calls.length - 1);
     expect(fallbackCall.message).toContain("caption");
     expect(fallbackCall.message).toContain(
-      "Attachment generated, but VK token lacks media upload scopes (photos/docs).",
+      "Attachment could not be delivered; sent as text instead.",
     );
     expect(fallbackCall).not.toHaveProperty("attachment");
   });
@@ -1233,9 +1813,14 @@ describe("sendPayloadVk", () => {
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/voice.mp3",
-        filename: "voice.mp3",
-        contentType: "audio/mpeg",
+        uploadUrl: "https://upload.vk.example/audio",
+        values: [
+          {
+            value: "https://example.com/voice.mp3",
+            filename: "voice.mp3",
+            contentType: "audio/mpeg",
+          },
+        ],
       },
       title: "voice.mp3",
     });
@@ -1252,7 +1837,9 @@ describe("sendPayloadVk", () => {
       new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
       { code: 15 },
     );
-    mockUploadAudioMessage.mockRejectedValueOnce(scopeError);
+    // Error 15 is retried (transient under batching); reject every attempt so
+    // the retries are exhausted and the URL-text fallback is exercised.
+    mockUploadAudioMessage.mockRejectedValue(scopeError);
     mockMessagesSend.mockResolvedValueOnce(37);
 
     const result = await sendPayloadVk(
@@ -1272,20 +1859,26 @@ describe("sendPayloadVk", () => {
     );
   });
 
-  it("rethrows non-scope audio_message upload errors", async () => {
+  it("falls back to text when audio_message upload fails (voice is best-effort)", async () => {
     const audioError = new Error("audio upload exploded");
-    mockUploadAudioMessage.mockRejectedValueOnce(audioError);
+    mockUploadAudioMessage.mockRejectedValue(audioError);
+    mockMessagesSend.mockResolvedValueOnce(41);
 
-    await expect(
-      sendPayloadVk(
-        "123",
-        {
-          text: "voice caption",
-          mediaUrl: "https://example.com/voice.mp3",
-        },
-        { cfg },
-      ),
-    ).rejects.toThrow("audio upload exploded");
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "voice caption",
+        mediaUrl: "https://example.com/voice.mp3",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "41", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "voice caption\nhttps://example.com/voice.mp3",
+      }),
+    );
   });
 
   it("sends remaining text chunks after media as plain messages", async () => {
@@ -1358,7 +1951,7 @@ describe("sendPayloadVk", () => {
               : null,
       },
       body: { cancel },
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(47);
 
     const result = await sendPayloadVk(
@@ -2088,5 +2681,130 @@ describe("retry logic", () => {
 
     await expect(sendMessageVk("123", "hello", { cfg })).rejects.toThrow("rate limit");
     expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("long spoken reply continuation", () => {
+  beforeEach(() => {
+    clearVkInstances();
+    mockMessagesSend.mockReset().mockResolvedValue(1);
+    mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
+    mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
+    mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
+    mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
+    mockClaimTtsParts.mockReset().mockResolvedValue(null);
+    mockReadTtsPartsManifest.mockReset().mockResolvedValue(null);
+    mockWaitForTtsPart.mockReset().mockResolvedValue(null);
+    mockDiscardTtsParts.mockReset().mockResolvedValue(undefined);
+    vi.mocked(VK).mockClear();
+  });
+
+  /**
+   * The continuation runs detached from the reply, so tests wait for the work
+   * rather than awaiting the send call itself.
+   */
+  async function settleContinuation(): Promise<void> {
+    for (let i = 0; i < 50; i += 1) {
+      await Promise.resolve();
+    }
+  }
+
+  it("sends every ready part as its own follow-up voice message", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({
+      parts: [{ index: 1 }, { index: 2 }],
+    });
+    mockWaitForTtsPart.mockImplementation(async (_dir: string, index: number) => ({
+      index,
+      file: `part${index}.opus`,
+      durationMs: 1_000,
+    }));
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    // Head plus two continuation parts.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(3);
+    expect(mockDiscardTtsParts).toHaveBeenCalledWith("/tmp/tts-parts/abc");
+    // Continuation parts carry no text: it is already in the head message.
+    const lastSend = mockMessagesSend.mock.calls.at(-1)?.[0];
+    expect(lastSend.message).toBeFalsy();
+    expect(lastSend.reply_to).toBeUndefined();
+  });
+
+  it("skips a part that never became ready and still delivers the rest", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({
+      parts: [{ index: 1 }, { index: 2 }],
+    });
+    mockWaitForTtsPart.mockImplementation(async (_dir: string, index: number) =>
+      index === 1 ? null : { index, file: "part2.opus", durationMs: 1_000 },
+    );
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    // Head plus the one part that made it.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("splits an over-long part and cleans the segments up afterwards", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({ parts: [{ index: 1 }] });
+    mockWaitForTtsPart.mockResolvedValue({
+      index: 1,
+      file: "part1.opus",
+      // Longer than the VK ceiling, so it has to be split.
+      durationMs: 10 * 60 * 1000,
+    });
+    mockSplitAudioAtSilence.mockResolvedValue(["/tmp/seg-1.opus", "/tmp/seg-2.opus"]);
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    // Head plus two segments of the single part.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(3);
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith([
+      "/tmp/seg-1.opus",
+      "/tmp/seg-2.opus",
+    ]);
+  });
+
+  it("keeps going when one part fails to send", async () => {
+    // One lost part must not swallow the rest of the reply.
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue({
+      parts: [{ index: 1 }, { index: 2 }],
+    });
+    mockWaitForTtsPart.mockImplementation(async (_dir: string, index: number) => ({
+      index,
+      file: `part${index}.opus`,
+      durationMs: 1_000,
+    }));
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_message123_head")
+      .mockRejectedValueOnce(new Error("upload exploded"))
+      .mockResolvedValueOnce("audio_message123_part2");
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(3);
+    // The directory is still released, so nothing is left claimed forever.
+    expect(mockDiscardTtsParts).toHaveBeenCalledWith("/tmp/tts-parts/abc");
+  });
+
+  it("does nothing when the manifest disappeared between claim and read", async () => {
+    mockClaimTtsParts.mockResolvedValue("/tmp/tts-parts/abc");
+    mockReadTtsPartsManifest.mockResolvedValue(null);
+
+    await sendAudioMessageVk("456", "/tmp/head.opus", "voice.opus", undefined, { cfg });
+    await settleContinuation();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledOnce();
+    expect(mockDiscardTtsParts).not.toHaveBeenCalled();
   });
 });
