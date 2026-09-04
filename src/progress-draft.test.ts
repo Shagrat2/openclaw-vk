@@ -14,6 +14,12 @@ const mockEditMessage = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const mockDeleteMessage = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  // Progress label resolution: mirrors the core contract ("auto"/false plus a
+  // default label list) so the draft label can be asserted.
+  resolveChannelProgressDraftConfig: (entry: any) => ({
+    ...(entry?.streaming?.progress ?? {}),
+    labels: entry?.streaming?.progress?.labels ?? ["⏳ Работаю"],
+  }),
   createChannelProgressDraftCompositor: mockCreateCompositor,
 }));
 
@@ -23,7 +29,10 @@ vi.mock("./send.js", () => ({
   deleteMessageVk: mockDeleteMessage,
 }));
 
-import { createVkProgressDraftCompositor } from "./progress-draft.js";
+import {
+  createVkProgressDraftCompositor,
+  resolveVkProgressLabel,
+} from "./progress-draft.js";
 import { makeAccount } from "./test-helpers.js";
 
 function make(overrides: Record<string, unknown> = {}) {
@@ -129,5 +138,30 @@ describe("createVkProgressDraftCompositor", () => {
     await handle.overwrite("b"); // sealed: neither edit nor send
     expect(mockEditMessage).not.toHaveBeenCalled();
     expect(mockSendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("resolveVkProgressLabel", () => {
+  it("prefixes an explicit label", () => {
+    expect(resolveVkProgressLabel({ streaming: { progress: { label: "⏳ Работаю" } } })).toBe(
+      "⏳ Работаю",
+    );
+  });
+
+  it("does not print `auto` as a header", () => {
+    // "auto" tells the core to pick a label; reading the raw value used to put
+    // the literal string at the top of every draft.
+    expect(resolveVkProgressLabel({ streaming: { progress: { label: "auto" } } })).toBeUndefined();
+  });
+
+  it("honours `label: false`", () => {
+    // `false` means "hide the title" in the core contract; the raw reader had no
+    // way to express it.
+    expect(resolveVkProgressLabel({ streaming: { progress: { label: false } } })).toBeUndefined();
+  });
+
+  it("adds nothing when no label is configured", () => {
+    expect(resolveVkProgressLabel(undefined)).toBeUndefined();
+    expect(resolveVkProgressLabel({ streaming: {} })).toBeUndefined();
   });
 });

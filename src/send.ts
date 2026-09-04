@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,8 +45,8 @@ const VK_MESSAGE_TEXT_LIMIT = 4096;
 const VK_TRANSIENT_RETRY_ATTEMPTS = 3;
 const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 
-/** Download ceiling for remote audio: the source is untrusted. */
-function getVkRemoteAudioMaxBytes(): number {
+/** Download ceiling for remote media: the URL comes from a model reply. */
+function getVkRemoteMediaMaxBytes(): number {
   return envPositiveInt("VK_REMOTE_AUDIO_MAX_BYTES", 128 * 1024 * 1024);
 }
 const DEFAULT_ACCOUNT_ID = "default";
@@ -182,28 +182,18 @@ function isHttpUrl(value: string): boolean {
 }
 
 async function materializeRemoteVkPhotoSource(sourceUrl: string): Promise<Buffer | null> {
-  if (typeof fetch !== "function" || !isHttpUrl(sourceUrl)) {
+  if (!isHttpUrl(sourceUrl)) {
     return null;
   }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(sourceUrl, { signal: controller.signal });
-    if (!response.ok) {
-      return null;
-    }
-    const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
-    if (contentType && !contentType.startsWith("image/")) {
-      return null;
-    }
-    const body = Buffer.from(await response.arrayBuffer());
-    return body.length > 0 ? body : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  const chunks: Buffer[] = [];
+  const total = await streamBoundedRemoteMedia(
+    sourceUrl,
+    { maxBytes: getVkRemoteMediaMaxBytes(), contentTypePrefix: "image/" },
+    (chunk) => {
+      chunks.push(chunk);
+    },
+  );
+  return total === null ? null : Buffer.concat(chunks, total);
 }
 
 function isRetryableVkError(error: unknown): boolean {
@@ -819,11 +809,26 @@ export async function sendDocumentVk(
  * untrusted, and without a limit an unbounded body could be pulled into memory.
  * We read as a stream and abort as soon as the limit is exceeded.
  */
-async function fetchBoundedRemoteAudio(url: string): Promise<Buffer | null> {
+/**
+ * Streams a remote media body with a byte ceiling, handing chunks to `sink`.
+ *
+ * One reader for both media paths. They used to be two: audio counted bytes and
+ * enforced a ceiling, photos read `arrayBuffer()` with no limit at all — the
+ * same untrusted URL from a model reply, one of them unbounded. Streaming also
+ * lets the audio path write straight to disk instead of holding the whole file
+ * in memory and then writing it, which peaked at twice the file size.
+ *
+ * Returns the number of bytes read, or null when the fetch failed, the ceiling
+ * was exceeded, or the content type did not match.
+ */
+async function streamBoundedRemoteMedia(
+  url: string,
+  opts: { maxBytes: number; contentTypePrefix?: string },
+  sink: (chunk: Buffer) => Promise<void> | void,
+): Promise<number | null> {
   if (typeof fetch !== "function") {
     return null;
   }
-  const maxBytes = getVkRemoteAudioMaxBytes();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
   try {
@@ -831,20 +836,27 @@ async function fetchBoundedRemoteAudio(url: string): Promise<Buffer | null> {
     if (!response.ok || !response.body) {
       return null;
     }
+    if (opts.contentTypePrefix) {
+      const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+      if (contentType && !contentType.startsWith(opts.contentTypePrefix)) {
+        return null;
+      }
+    }
+    // The declared size is a cheap early exit; the counter below is what
+    // actually enforces the ceiling, since the header can lie or be absent.
     const declared = Number(response.headers.get("content-length") ?? "");
-    if (Number.isFinite(declared) && declared > maxBytes) {
+    if (Number.isFinite(declared) && declared > opts.maxBytes) {
       return null;
     }
-    const chunks: Buffer[] = [];
     let total = 0;
     for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
       total += chunk.byteLength;
-      if (total > maxBytes) {
+      if (total > opts.maxBytes) {
         return null;
       }
-      chunks.push(Buffer.from(chunk));
+      await sink(Buffer.from(chunk));
     }
-    return total > 0 ? Buffer.concat(chunks, total) : null;
+    return total > 0 ? total : null;
   } catch {
     return null;
   } finally {
@@ -884,13 +896,45 @@ async function materializeLocalAudioFile(
 
   // Materialize remote audio into a temporary file: otherwise a long recording
   // behind a URL was never split and went as one piece, which VK rejected.
-  // Downloaded with a size ceiling — a foreign URL can return anything.
+  //
+  // Streamed straight to disk rather than buffered and then written: at the
+  // 128 MB ceiling the old path peaked at twice that in memory, on a machine
+  // that also holds local models.
   if (isHttpUrl(audioSource)) {
-    const body = await fetchBoundedRemoteAudio(audioSource);
-    if (!body) {
+    let dir: string;
+    try {
+      dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
+    } catch {
       return null;
     }
-    return await materializeLocalAudioFile(body, title);
+    const path = join(dir, title.replace(/[\\/]/g, "_") || "voice.ogg");
+    const cleanup = async () => {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    };
+    const handle = await open(path, "w").catch(() => null);
+    if (!handle) {
+      await cleanup();
+      return null;
+    }
+    try {
+      const total = await streamBoundedRemoteMedia(
+        audioSource,
+        { maxBytes: getVkRemoteMediaMaxBytes() },
+        async (chunk) => {
+          await handle.write(chunk);
+        },
+      );
+      if (total === null) {
+        await cleanup();
+        return null;
+      }
+      return { path, cleanup };
+    } catch {
+      await cleanup();
+      return null;
+    } finally {
+      await handle.close().catch(() => {});
+    }
   }
 
   // data: and file:// are left alone: the first is already in memory and arrives

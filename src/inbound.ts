@@ -670,7 +670,7 @@ export async function handleVkInbound(params: {
           // label as the draft: progress stays distinguishable from the answer
           // even when progress consists of pictures.
           if (progressDraft && !isFinal && normalized.text?.trim()) {
-            const label = resolveVkProgressLabel(config);
+            const label = resolveVkProgressLabel(vkStreamingEntry);
             if (label && !normalized.text.startsWith(label)) {
               normalized.text = `${label} ${normalized.text}`;
             }

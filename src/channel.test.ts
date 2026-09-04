@@ -36,6 +36,12 @@ vi.mock("openclaw/plugin-sdk/channel-status", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  // Progress label resolution: mirrors the core contract ("auto"/false plus a
+  // default label list) so the draft label can be asserted.
+  resolveChannelProgressDraftConfig: (entry: any) => ({
+    ...(entry?.streaming?.progress ?? {}),
+    labels: entry?.streaming?.progress?.labels ?? ["⏳ Работаю"],
+  }),
   createAccountStatusSink:
     ({ accountId, setStatus }: { accountId: string; setStatus: (next: unknown) => void }) =>
     (patch: Record<string, unknown>) => setStatus({ accountId, ...patch }),

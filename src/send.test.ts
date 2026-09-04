@@ -1438,6 +1438,38 @@ describe("sendPayloadVk", () => {
     );
   });
 
+  it("refuses a remote photo that exceeds the media ceiling", async () => {
+    // The photo path used to read `arrayBuffer()` with no limit at all, on the
+    // same untrusted model-supplied URL the audio path already capped.
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "4";
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: () => "image/png" },
+      body: (async function* () {
+        yield new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      })(),
+    } as unknown as Response);
+    mockMessagesSend.mockResolvedValue(77);
+
+    try {
+      await sendPayloadVk(
+        "123",
+        { text: "caption", mediaUrl: "https://example.com/big.png" },
+        { cfg },
+      );
+      // The oversized body is dropped, so no second upload attempt is made
+      // from it; delivery falls through to the document path instead.
+      expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+    }
+  });
+
   it("retries image upload with downloaded buffer when VK rejects URL source", async () => {
     const invalidPhotoError = Object.assign(
       new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
@@ -1449,6 +1481,10 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "image/png",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Uint8Array.from([1, 2, 3, 4]));
+      })(),
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
     } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(34);
@@ -1499,6 +1535,10 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "image/png",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Uint8Array.from([1, 2, 3, 4]));
+      })(),
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
     } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(38);
@@ -1581,6 +1621,10 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "text/html; charset=utf-8",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Buffer.from("<html>not image</html>"));
+      })(),
       arrayBuffer: async () => Buffer.from("<html>not image</html>").buffer,
     } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(36);

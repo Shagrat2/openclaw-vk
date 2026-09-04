@@ -168,6 +168,12 @@ const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  // Progress label resolution: mirrors the core contract ("auto"/false plus a
+  // default label list) so the draft label can be asserted.
+  resolveChannelProgressDraftConfig: (entry: any) => ({
+    ...(entry?.streaming?.progress ?? {}),
+    labels: entry?.streaming?.progress?.labels ?? ["⏳ Работаю"],
+  }),
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
   logTypingFailure: mockLogTypingFailure,
@@ -232,9 +238,13 @@ vi.mock("./progress-draft.js", () => ({
   // The label resolver lives in the same module — the mock keeps the real config
   // parsing, otherwise the test would never check that the label comes from
   // settings at all.
-  resolveVkProgressLabel: (cfg: any) => {
-    const label = cfg?.channels?.vk?.streaming?.progress?.label;
-    return typeof label === "string" && label.trim() ? label.trim() : undefined;
+  // Takes the channel entry now, not the whole config: the label is resolved
+  // through the core, which reads the same entry the compositor is given.
+  resolveVkProgressLabel: (entry: any) => {
+    const label = entry?.streaming?.progress?.label;
+    return typeof label === "string" && label.trim() && label.trim() !== "auto"
+      ? label.trim()
+      : undefined;
   },
   createVkProgressDraftCompositor: mockCreateVkProgressDraft,}));
 

@@ -1,6 +1,9 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
 import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gateway-runtime";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
+import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/channel-inbound";
 import { envPositiveInt } from "./env.js";
 import { globalAgent } from "node:https";
 import { PollingTransport, VK } from "vk-io";
@@ -308,10 +311,16 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   //   2. per-key serialization means the core never dispatches two replies for
   //      the same conversation concurrently, which is exactly what triggers its
   //      reply-dispatch concurrency bugs.
-  // Coalescing is opt-in: VK_INBOUND_DEBOUNCE_MS defaults to 0, which disables
-  // batching while keeping per-peer serialization — sequential, no added latency.
+  // The window comes from the core resolver, the same one every other channel
+  // uses (`messages.inboundDebounceMs` plus per-channel overrides). VK used to
+  // read a private env knob and so fell outside that path entirely; the knob
+  // stays as an explicit override for a running gateway.
   const inboundDebouncer = core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
-    debounceMs: envPositiveInt("VK_INBOUND_DEBOUNCE_MS", 0),
+    debounceMs: resolveInboundDebounceMs({
+      cfg: opts.config as OpenClawConfig,
+      channel: "vk",
+      overrideMs: parseStrictPositiveInteger(process.env.VK_INBOUND_DEBOUNCE_MS),
+    }),
     serializeImmediate: true,
     buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
     // Only merge plain-text messages; ones carrying attachments or a payload

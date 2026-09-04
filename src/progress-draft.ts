@@ -1,5 +1,8 @@
 import type { ChannelProgressDraftMode, StreamingCompatEntry } from "./sdk-compat.js";
-import { createChannelProgressDraftCompositor } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  createChannelProgressDraftCompositor,
+  resolveChannelProgressDraftConfig,
+} from "openclaw/plugin-sdk/channel-outbound";
 
 /**
  * The compositor type is derived from the factory rather than imported.
@@ -48,17 +51,26 @@ export type VkProgressDraftParams = {
 };
 
 /**
- * Live draft label from `channels.vk.streaming.progress.label`. It marks both
- * the draft and intermediate messages carrying media — its absence is what tells
- * the reader the final answer has arrived.
+ * Live draft label for the progress bubble.
+ *
+ * Resolved through the core rather than by walking the config by hand. The core
+ * treats `label: "auto"` as "pick one of `labels`" and `label: false` as "hide
+ * it"; reading the raw value printed the literal string "auto" as a header and
+ * had no way to express `false`. It also reads the same `entry` the compositor
+ * is given, so the two cannot disagree on a per-account config.
  */
-export function resolveVkProgressLabel(cfg: unknown): string | undefined {
-  const label = (
-    cfg as
-      | { channels?: { vk?: { streaming?: { progress?: { label?: unknown } } } } }
-      | undefined
-  )?.channels?.vk?.streaming?.progress?.label;
-  return typeof label === "string" && label.trim() ? label.trim() : undefined;
+export function resolveVkProgressLabel(
+  entry: StreamingCompatEntry | null | undefined,
+): string | undefined {
+  const label = resolveChannelProgressDraftConfig(entry).label;
+  // `false` hides the title and "auto" asks the core to pick one; neither means
+  // "prefix this literal string", which is what reading the raw value did — it
+  // printed "auto" as a header and could not express `false` at all. Only an
+  // explicit label is prefixed here, so the default stays "no header", as
+  // before.
+  return typeof label === "string" && label.trim() && label.trim() !== "auto"
+    ? label.trim()
+    : undefined;
 }
 
 /**
@@ -99,7 +111,7 @@ export function createVkProgressDraftCompositor(
   // change with a label configured. So we add it here, at the single write
   // point, to cover both steps and text chunks. The startsWith check guards
   // against a duplicate when the label was already added above.
-  const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.cfg);
+  const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.entry);
 
   const overwrite = async (rawText: string): Promise<boolean> => {
     if (closed) {
