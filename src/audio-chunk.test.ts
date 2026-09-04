@@ -375,3 +375,24 @@ describe("splitAudioAtSilence — input size ceiling", () => {
     }
   });
 });
+
+describe("cleanupAudioSegments — path safety", () => {
+  it("never derives a directory from a bare filename", async () => {
+    // `slice(0, -1)` on a name with no separator yields the name minus its last
+    // character, and this function removes what it collects recursively.
+    const dir = await mkdtemp(join(tmpdir(), "vk-voice-bare-"));
+    const sibling = join(dir, "part-00");
+    await writeFile(sibling, "x");
+    const cwd = process.cwd();
+
+    try {
+      process.chdir(dir);
+      await cleanupAudioSegments(["part-000"]);
+      // The neighbour that a truncated name would have matched is untouched.
+      await expect(stat(sibling)).resolves.toBeTruthy();
+    } finally {
+      process.chdir(cwd);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

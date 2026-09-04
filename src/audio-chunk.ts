@@ -398,9 +398,12 @@ export async function cleanupAudioSegments(files: readonly string[]): Promise<vo
     if (!file) {
       continue;
     }
-    const dir = file.slice(0, Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\")));
-    if (dir) {
-      dirs.add(dir);
+    // A bare filename has no separator, and `slice(0, -1)` would then yield the
+    // name minus its last character — a path this function goes on to remove
+    // recursively. Only a real parent directory is collected.
+    const separator = Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\"));
+    if (separator > 0) {
+      dirs.add(file.slice(0, separator));
     }
     await rm(file, { force: true }).catch(() => {});
   }

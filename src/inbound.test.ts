@@ -207,11 +207,14 @@ const mockProgressCompositor = vi.hoisted(() => ({
 const mockCurrentMessageId = vi.hoisted(() => vi.fn<[], number | undefined>(() => undefined));
 const mockDraftRemove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockDraftClose = vi.hoisted(() => vi.fn());
+// `overwrite` resolves to whether the text made it into the draft; shared so a
+// test can make one write fail.
+const mockDraftOverwrite = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const mockCreateVkProgressDraft = vi.hoisted(() =>
   vi.fn(() => ({
     compositor: mockProgressCompositor,
     currentMessageId: mockCurrentMessageId,
-    overwrite: vi.fn().mockResolvedValue(undefined),
+    overwrite: mockDraftOverwrite,
     remove: mockDraftRemove,
     close: mockDraftClose,
   })),
@@ -1647,6 +1650,39 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
 
     // The draft stays: it is the answer.
     expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("sends the block the usual way when the draft write fails", async () => {
+    // `overwrite` reports the outcome instead of throwing, so a failed VK edit
+    // has to be checked. Missing that left the person with nothing at all on a
+    // blocks-plus-empty-final turn: the block went into a draft that was never
+    // written, and the final carried no text of its own.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftOverwrite.mockResolvedValueOnce(false);
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver({ text: "ответ блоком" }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The block reached the person as an ordinary message rather than vanishing.
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+    const sentText = JSON.stringify(mockSendPayloadVk.mock.calls);
+    expect(sentText).toContain("ответ блоком");
     mockCurrentMessageId.mockReturnValue(undefined);
   });
 

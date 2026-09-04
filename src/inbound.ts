@@ -181,7 +181,14 @@ export async function handleVkInbound(params: {
 
   statusSink?.({ lastInboundAt: message.timestamp });
 
+  // The real id: pairing challenges, the reply target and `SenderId` all carry
+  // it, so it must stay exact.
   const senderDisplay = String(message.senderId);
+  // The same id for log lines. These are operational warnings that print at
+  // every level, so a raw VK id in them would contradict the redaction the
+  // channel applies to `peerId` right next to them; the hash keeps them
+  // correlatable without naming anyone.
+  const senderForLog = redactVkId(message.senderId);
   const isGroup = message.isGroup;
   const groupConfig = isGroup
     ? (account.config.groups?.[String(message.peerId)] ?? account.config.groups?.["*"])
@@ -246,13 +253,13 @@ export async function handleVkInbound(params: {
         senderId: message.senderId,
       });
       if (!senderAllowed.allowed) {
-        runtime.log?.(`vk: drop group sender ${senderDisplay} (groupPolicy=allowlist)`);
+        runtime.log?.(`vk: drop group sender ${senderForLog} (groupPolicy=allowlist)`);
         return;
       }
     }
   } else {
     if (dmPolicy === "disabled") {
-      runtime.log?.(`vk: drop DM sender=${senderDisplay} (dmPolicy=disabled)`);
+      runtime.log?.(`vk: drop DM sender=${senderForLog} (dmPolicy=disabled)`);
       return;
     }
     if (dmPolicy !== "open") {
@@ -277,11 +284,11 @@ export async function handleVkInbound(params: {
               });
             },
             onReplyError: (err) => {
-              runtime.error?.(`vk: pairing reply failed for ${senderDisplay}: ${String(err)}`);
+              runtime.error?.(`vk: pairing reply failed for ${senderForLog}: ${String(err)}`);
             },
           });
         }
-        runtime.log?.(`vk: drop DM sender ${senderDisplay} (dmPolicy=${dmPolicy})`);
+        runtime.log?.(`vk: drop DM sender ${senderForLog} (dmPolicy=${dmPolicy})`);
         return;
       }
     }
@@ -545,12 +552,12 @@ export async function handleVkInbound(params: {
       log: runtime.log,
       onError: (err) => {
         runtime.log?.(
-          `vk: progress-draft error for cmid=${message.conversationMessageId}: ${String(err)}`,
+          `vk: progress-draft error for cmid=${redactVkId(message.conversationMessageId)}: ${String(err)}`,
         );
       },
     });
     runtime.log?.(
-      `vk: step-progress draft enabled (mode=${progressStreamMode}) cmid=${message.conversationMessageId}`,
+      `vk: step-progress draft enabled (mode=${progressStreamMode}) cmid=${redactVkId(message.conversationMessageId)}`,
     );
   }
 
@@ -642,15 +649,17 @@ export async function handleVkInbound(params: {
             } else {
               // The label is added by the draft itself (the single write point).
               const draftText = chunks[0]?.text ?? accumulated;
-              try {
-                await progressDraft.overwrite(draftText);
+              // `overwrite` never rejects — it reports the outcome, so a failed
+              // draft write has to be checked rather than caught. Missing that
+              // meant a VK edit failure on a blocks-plus-empty-final turn left
+              // the person with nothing at all.
+              if (await progressDraft.overwrite(draftText)) {
                 draftAnswerText = draftText;
                 vkDiag("block into draft", { len: draftText.length });
                 return;
-              } catch (err) {
-                runtime.log?.(`vk: block → draft failed: ${String(err)}`);
-                // the draft could not be rewritten — let it go the usual way
               }
+              runtime.log?.("vk: block → draft failed, sending it the usual way");
+              draftAnswerText = null;
             }
           }
 
@@ -834,7 +843,7 @@ export async function handleVkInbound(params: {
                 if (statusReactions) await statusReactions.setTool(toolName);
                 if (progressDraft) {
                   runtime.log?.(
-                    `vk: step-progress tool name=${toolName ?? "?"} phase=${payload?.phase ?? "?"} cmid=${message.conversationMessageId}`,
+                    `vk: step-progress tool name=${toolName ?? "?"} phase=${payload?.phase ?? "?"} cmid=${redactVkId(message.conversationMessageId)}`,
                   );
                   // Build the full draft line (like Telegram). Passing undefined
                   // leaves the compositor with nothing to render; startImmediately

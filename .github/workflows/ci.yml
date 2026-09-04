@@ -32,6 +32,14 @@ jobs:
       - name: Run repository checks
         run: npm run check
 
+      # Typechecking needs the host SDK, which is an optional peer and therefore
+      # absent from `npm ci`. Installed without touching the lockfile, the same
+      # way check:runtime documents it.
+      - name: Typecheck against the host SDK
+        run: |
+          npm install --no-save --package-lock=false "openclaw@${{ matrix.openclaw || '2026.9.2' }}"
+          npm run check:types
+
   runtime-compatibility:
     name: OpenClaw runtime (${{ matrix.openclaw }})
     runs-on: ubuntu-latest

@@ -59,13 +59,21 @@ if (!version) {
 // node_modules/openclaw/node_modules/zod». Это артефакт раскладки, а не дефект
 // кода — в обычной установке пакетный менеджер сводит их в одну копию.
 // Поэтому перед проверкой подтягиваем ровно ту zod, против которой собрано ядро.
+// The host's *installed* version, not its declared range: comparing a range
+// ("^4.4.3") against a version ("4.4.3") would differ on every run, reinstall
+// each time, and — the moment the host declares a caret — install the wrong zod.
 const hostZod = (() => {
-  try {
-    return JSON.parse(readFileSync(resolve(root, "node_modules/openclaw/package.json"), "utf8"))
-      .dependencies?.zod;
-  } catch {
-    return undefined;
+  for (const rel of [
+    "node_modules/openclaw/node_modules/zod/package.json",
+    "node_modules/zod/package.json",
+  ]) {
+    try {
+      return JSON.parse(readFileSync(resolve(root, rel), "utf8")).version;
+    } catch {
+      // try the next layout
+    }
   }
+  return undefined;
 })();
 const localZod = (() => {
   try {
@@ -87,9 +95,11 @@ if (hostZod && localZod && hostZod !== localZod) {
 }
 
 let output = "";
+let tscFailed = false;
 try {
   execFileSync("npx", ["tsc", "--noEmit"], { cwd: root, encoding: "utf8" });
 } catch (error) {
+  tscFailed = true;
   output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
 }
 
@@ -111,6 +121,18 @@ function parseErrors(text) {
 }
 
 const current = parseErrors(output);
+
+// A failed run that produced no parseable errors means tsc itself did not work:
+// typescript missing, npx unable to fetch it, or a config-level error like
+// TS18003 that carries no file(line,col) prefix. Left alone, the ratchet would
+// read that as "no errors" and wave the build through — the exact defect class
+// it exists to stop. Verified by hiding node_modules/typescript: the check
+// reported "0 known error kinds" and exited 0.
+if (tscFailed && current.size === 0) {
+  console.error("Typecheck did not run — refusing to report a clean result.\n");
+  console.error(output.trim() || "(tsc produced no output)");
+  process.exit(1);
+}
 const baseline = existsSync(baselinePath)
   ? new Map(Object.entries(JSON.parse(readFileSync(baselinePath, "utf8"))))
   : new Map();

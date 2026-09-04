@@ -70,7 +70,12 @@ export type VkProgressDraftHandle = {
   /** message_id of the live draft, or undefined before the first render / after delete. */
   currentMessageId(): number | undefined;
   /** Replace the draft's text in place; falls back to a fresh send if the edit fails. */
-  overwrite(text: string): Promise<void>;
+  /**
+   * Rewrite the draft. Resolves to `false` when the text did not make it —
+   * callers fall back to sending the block as a normal message. It never
+   * rejects: a throwing draft must not take the reply down with it.
+   */
+  overwrite(text: string): Promise<boolean>;
   /** Remove the draft message entirely (best-effort). */
   remove(): Promise<void>;
   /**
@@ -96,9 +101,9 @@ export function createVkProgressDraftCompositor(
   // against a duplicate when the label was already added above.
   const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.cfg);
 
-  const overwrite = async (rawText: string): Promise<void> => {
+  const overwrite = async (rawText: string): Promise<boolean> => {
     if (closed) {
-      return;
+      return false;
     }
     const label = resolveProgressLabel();
     const text =
@@ -112,7 +117,7 @@ export function createVkProgressDraftCompositor(
         const id = Number(result.messageId);
         messageId = Number.isFinite(id) && id > 0 ? id : undefined;
         params.log?.(`vk: step-progress draft sent msgId=${messageId ?? "?"} len=${text.length}`);
-        return;
+        return messageId !== undefined;
       }
       const ok = await editMessageVk(params.to, messageId, text, params.account);
       params.log?.(`vk: step-progress draft edited msgId=${messageId} ok=${ok} len=${text.length}`);
@@ -121,8 +126,14 @@ export function createVkProgressDraftCompositor(
         // starts a fresh draft instead of silently dropping progress.
         messageId = undefined;
       }
+      return ok;
     } catch (err) {
+      // A throw leaves the same dead id behind as a `false` result would, so it
+      // is forgotten here too — otherwise the draft freezes on that message and
+      // the documented fresh-send fallback never fires.
+      messageId = undefined;
       params.onError?.(err);
+      return false;
     }
   };
 
