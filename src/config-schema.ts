@@ -65,6 +65,28 @@ const VkDiagnosticsSchema = z
   .strict()
   .optional();
 
+// Voice and media limits (`channels.vk.audio`). These were environment-only,
+// which put a dozen user-facing settings outside schema validation, `doctor` and
+// live reload. The environment still overrides, as an escape hatch on a running
+// gateway.
+const VkAudioSchema = z
+  .object({
+    /** Hard cap for one voice message; VK rejects longer ones. */
+    maxVoiceMs: z.number().int().positive().optional(),
+    /** Deadline for the whole split operation. */
+    splitDeadlineMs: z.number().int().positive().optional(),
+    /** Timeout for a single ffmpeg/ffprobe run. */
+    splitTimeoutMs: z.number().int().positive().optional(),
+    /** Input files larger than this are not split at all. */
+    maxInputBytes: z.number().int().positive().optional(),
+    /** Ceiling on segments: nobody listens to more voice messages than this. */
+    maxSegments: z.number().int().positive().optional(),
+    /** Download ceiling for remote media; the URL comes from a model reply. */
+    remoteMaxBytes: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
