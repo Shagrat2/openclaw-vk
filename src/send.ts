@@ -27,7 +27,7 @@ import {
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
-import { envPositiveInt } from "./env.js";
+import { vkPositiveSetting } from "./settings.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
@@ -47,7 +47,7 @@ const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 
 /** Download ceiling for remote media: the URL comes from a model reply. */
 function getVkRemoteMediaMaxBytes(): number {
-  return envPositiveInt("VK_REMOTE_AUDIO_MAX_BYTES", 128 * 1024 * 1024);
+  return vkPositiveSetting({ env: "VK_REMOTE_AUDIO_MAX_BYTES", section: "audio", key: "remoteMaxBytes", fallback: 128 * 1024 * 1024 });
 }
 const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
@@ -664,6 +664,54 @@ export async function sendMessageVk(
   return getLastSendResult(results) ?? { messageId: "", chatId: normalizeVkTargetId(to) };
 }
 
+/**
+ * Sends an attachment with its caption, then any overflow chunks.
+ *
+ * The three attachment senders (photo, document, voice) ended with the same
+ * block: split the caption, put the first chunk on the attachment, send the rest
+ * as plain messages. The rule that keyboards belong on the last message and
+ * `replyTo` on the first lived in each copy separately, which is how three
+ * copies of one invariant drift apart without anyone noticing.
+ */
+async function sendVkAttachmentWithCaption(params: {
+  to: string;
+  peerId: number;
+  account: ResolvedVkAccount;
+  attachment: string;
+  text?: string | VkPreparedFormattedMessage;
+  opts: SendVkOptions;
+}): Promise<SendVkResult> {
+  const [firstChunk, ...tailChunks] = toPreparedVkMessages(params.text);
+  const firstResult = await sendVkApiMessage({
+    to: params.to,
+    peerId: params.peerId,
+    account: params.account,
+    formatted: firstChunk ?? { text: "" },
+    attachment: params.attachment,
+    opts: {
+      ...params.opts,
+      // Buttons ride the last message of the reply, so they wait if more chunks
+      // are coming.
+      buttons: tailChunks.length === 0 ? params.opts.buttons : undefined,
+      clearKeyboard: tailChunks.length === 0 ? params.opts.clearKeyboard : undefined,
+    },
+  });
+
+  if (tailChunks.length === 0) {
+    return firstResult;
+  }
+
+  const tailResults = await sendMessageChunksVk({
+    to: params.to,
+    chunks: tailChunks,
+    // `replyTo` belongs to the first message only; repeating it would quote the
+    // same message on every chunk.
+    opts: { ...params.opts, replyTo: undefined },
+  });
+
+  return getLastSendResult(tailResults) ?? firstResult;
+}
+
 export async function sendPhotoVk(
   to: string,
   photoSource: string | Buffer,
@@ -707,34 +755,14 @@ export async function sendPhotoVk(
         }),
       }),
   });
-  const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
-  const firstResult = await sendVkApiMessage({
+  return await sendVkAttachmentWithCaption({
     to: normalizedTo,
     peerId,
     account,
-    formatted: firstChunk ?? { text: "" },
     attachment: String(attachment),
-    opts: {
-      ...opts,
-      buttons: tailChunks.length === 0 ? opts.buttons : undefined,
-      clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
-    },
+    text: text,
+    opts,
   });
-
-  if (tailChunks.length === 0) {
-    return firstResult;
-  }
-
-  const tailResults = await sendMessageChunksVk({
-    to: normalizedTo,
-    chunks: tailChunks,
-    opts: {
-      ...opts,
-      replyTo: undefined,
-    },
-  });
-
-  return getLastSendResult(tailResults) ?? firstResult;
 }
 
 export async function sendDocumentVk(
@@ -767,34 +795,14 @@ export async function sendDocumentVk(
         title,
       }),
   });
-  const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
-  const firstResult = await sendVkApiMessage({
+  return await sendVkAttachmentWithCaption({
     to: normalizedTo,
     peerId,
     account,
-    formatted: firstChunk ?? { text: "" },
     attachment: String(attachment),
-    opts: {
-      ...opts,
-      buttons: tailChunks.length === 0 ? opts.buttons : undefined,
-      clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
-    },
+    text: text,
+    opts,
   });
-
-  if (tailChunks.length === 0) {
-    return firstResult;
-  }
-
-  const tailResults = await sendMessageChunksVk({
-    to: normalizedTo,
-    chunks: tailChunks,
-    opts: {
-      ...opts,
-      replyTo: undefined,
-    },
-  });
-
-  return getLastSendResult(tailResults) ?? firstResult;
 }
 
 /**
@@ -1117,6 +1125,35 @@ async function deliverTtsContinuation(params: {
   vkDiag("tts continuation done", { parts: manifest.parts.length, dir: params.dir });
 }
 
+/**
+ * Claims the continuation directory for a just-sent head audio and starts
+ * delivering it, if there is one.
+ *
+ * Both audio paths — split and single-file — ended with the same claim-and-start
+ * pair; a third path would have needed a third copy.
+ */
+async function startTtsContinuationForHead(params: {
+  vk: VK;
+  peerId: number;
+  to: string;
+  account: ResolvedVkAccount;
+  headDurationMs: number | null;
+  opts: SendVkOptions;
+}): Promise<void> {
+  const dir = await claimTtsParts(params.headDurationMs);
+  if (!dir) {
+    return;
+  }
+  startTtsContinuation({
+    vk: params.vk,
+    peerId: params.peerId,
+    to: params.to,
+    account: params.account,
+    dir,
+    opts: params.opts,
+  });
+}
+
 function startTtsContinuation(params: {
   vk: VK;
   peerId: number;
@@ -1183,10 +1220,14 @@ export async function sendAudioMessageVk(
           tailChunks,
           opts,
         });
-        const partsDir = await claimTtsParts(headDurationMs);
-        if (partsDir) {
-          startTtsContinuation({ vk, peerId, to: normalizedTo, account, dir: partsDir, opts });
-        }
+        await startTtsContinuationForHead({
+          vk,
+          peerId,
+          to: normalizedTo,
+          account,
+          headDurationMs,
+          opts,
+        });
         return result;
       } finally {
         await cleanupAudioSegments(segments);
@@ -1226,10 +1267,14 @@ export async function sendAudioMessageVk(
     },
   });
 
-  const partsDir = await claimTtsParts(headDurationMs);
-  if (partsDir) {
-    startTtsContinuation({ vk, peerId, to: normalizedTo, account, dir: partsDir, opts });
-  }
+  await startTtsContinuationForHead({
+    vk,
+    peerId,
+    to: normalizedTo,
+    account,
+    headDurationMs,
+    opts,
+  });
 
   if (tailChunks.length === 0) {
     return firstResult;

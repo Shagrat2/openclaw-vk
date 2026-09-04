@@ -33,6 +33,7 @@ import { redactIdentifier, redactSensitiveText } from "openclaw/plugin-sdk/loggi
 import type { RuntimeLogger } from "openclaw/plugin-sdk/core";
 import { tryGetVkRuntime } from "./runtime.js";
 import { VK_DIAG_LEVELS, type VkDiagLevel } from "./types.js";
+import { vkStringSetting } from "./settings.js";
 import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
 
 export type { VkDiagLevel };
@@ -304,7 +305,7 @@ export function vkDiagFailure(
 let diagFileTail: Promise<void> = Promise.resolve();
 
 function appendVkDiagFile(event: string, fields: Record<string, unknown>): void {
-  const target = process.env.VK_VOICE_DEBUG_LOG;
+  const target = vkStringSetting({ env: "VK_VOICE_DEBUG_LOG", section: "diagnostics", key: "file" });
   if (!target) {
     return;
   }

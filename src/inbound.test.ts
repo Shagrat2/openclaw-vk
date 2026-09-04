@@ -168,6 +168,21 @@ const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  resolveChannelPreviewStreamMode: mockResolveStreamMode,
+  // Return the raw input as the "line" so tests can assert what was built.
+  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
+  // The core decides whether a final is truncated and which text wins.
+  isPotentialTruncatedFinal: (text: string) => text.trim().length === 0,
+  selectLongerFinalText: ({
+    finalText,
+    candidateTexts,
+  }: {
+    finalText: string;
+    candidateTexts: readonly (string | undefined)[];
+  }) =>
+    [finalText, ...candidateTexts]
+      .filter((t): t is string => Boolean(t))
+      .sort((a, b) => b.length - a.length)[0],
   // Progress label resolution: mirrors the core contract ("auto"/false plus a
   // default label list) so the draft label can be asserted.
   resolveChannelProgressDraftConfig: (entry: any) => ({
@@ -226,13 +241,6 @@ const mockCreateVkProgressDraft = vi.hoisted(() =>
   })),
 );
 
-vi.mock("openclaw/plugin-sdk/channel-message", () => ({
-  resolveChannelPreviewStreamMode: mockResolveStreamMode,
-  // Return the raw input as the "line" so tests can assert what was built.
-  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
-  // Used only by progress-draft.ts (mocked below); stub keeps the shape complete.
-  createChannelProgressDraftCompositor: vi.fn(() => mockProgressCompositor),
-}));
 
 vi.mock("./progress-draft.js", () => ({
   // The label resolver lives in the same module — the mock keeps the real config
@@ -1674,6 +1682,41 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
 
     // The draft stays: it is the answer.
     expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("keeps the fuller draft when the final arrives truncated", async () => {
+    // The old test was `!finalText` — a final that is present but plainly cut
+    // short still lost the fuller answer along with the draft. The core decides
+    // both questions now: whether the final looks truncated, and which text wins.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockEditMessageVk.mockClear();
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, async ({ dispatcherOptions }: any) => {
+      await dispatcherOptions.onReplyStart?.();
+      await dispatcherOptions.deliver(
+        { text: "полный ответ, который сложился из блоков по ходу работы" },
+        { kind: "block" },
+      );
+      await dispatcherOptions.deliver({ text: "   " }, { kind: "final" });
+    });
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      expect.anything(),
+      4242,
+      expect.stringContaining("сложился из блоков"),
+      expect.anything(),
+    );
     mockCurrentMessageId.mockReturnValue(undefined);
   });
 

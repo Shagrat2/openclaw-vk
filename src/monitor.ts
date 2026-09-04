@@ -4,7 +4,7 @@ import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contrac
 import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gateway-runtime";
 import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
 import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/channel-inbound";
-import { envPositiveInt } from "./env.js";
+import { vkPositiveSetting } from "./settings.js";
 import { globalAgent } from "node:https";
 import { PollingTransport, VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
@@ -30,7 +30,7 @@ const FIRST_LONG_POLL_CHECK_ERROR = "VK Long Poll transport check failed";
  * gateway watches `lastTransportActivityAt` too, but with a half-hour default;
  * this only makes the same check faster.
  */
-const TRANSPORT_SILENCE_MS = envPositiveInt("VK_TRANSPORT_SILENCE_MS", 150_000);
+const TRANSPORT_SILENCE_MS = vkPositiveSetting({ env: "VK_TRANSPORT_SILENCE_MS", section: "transport", key: "silenceMs", fallback: 150_000 });
 
 /**
  * Collapses a burst of inbound messages into one: texts joined by newlines,

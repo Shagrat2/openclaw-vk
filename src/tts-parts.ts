@@ -1,7 +1,7 @@
 import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { envPositiveInt } from "./env.js";
+import { vkBooleanSetting, vkPositiveSetting, vkStringSetting } from "./settings.js";
 
 /**
  * Continuation audio produced outside OpenClaw's single-shot TTS call.
@@ -54,7 +54,7 @@ const MANIFEST_FILE = "manifest.json";
 
 /** Directory the TTS command writes continuation parts into. */
 export function getTtsPartsDir(): string {
-  const raw = process.env.TTS_PARTS_DIR?.trim();
+  const raw = vkStringSetting({ env: "TTS_PARTS_DIR", section: "voiceContinuation", key: "dir" });
   if (raw) {
     return raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
   }
@@ -63,22 +63,27 @@ export function getTtsPartsDir(): string {
 
 /** Continuation delivery is on unless explicitly disabled. */
 export function isTtsPartsEnabled(): boolean {
-  return process.env.VK_TTS_PARTS?.trim() !== "0";
+  return vkBooleanSetting({
+    env: "VK_TTS_PARTS",
+    section: "voiceContinuation",
+    key: "enabled",
+    fallback: true,
+  });
 }
 
 /** How far head duration may drift from the manifest (container/codec rewrap). */
 export function getTtsPartsMatchToleranceMs(): number {
-  return envPositiveInt("VK_TTS_PARTS_MATCH_MS", 1_500);
+  return vkPositiveSetting({ env: "VK_TTS_PARTS_MATCH_MS", section: "voiceContinuation", key: "matchToleranceMs", fallback: 1_500 });
 }
 
 /** Manifests older than this are ignored (and swept). */
 export function getTtsPartsMaxAgeMs(): number {
-  return envPositiveInt("VK_TTS_PARTS_MAX_AGE_MS", 600_000);
+  return vkPositiveSetting({ env: "VK_TTS_PARTS_MAX_AGE_MS", section: "voiceContinuation", key: "maxAgeMs", fallback: 600_000 });
 }
 
 /** How long to wait for a single part to finish synthesizing. */
 export function getTtsPartWaitMs(): number {
-  return envPositiveInt("VK_TTS_PARTS_WAIT_MS", 300_000);
+  return vkPositiveSetting({ env: "VK_TTS_PARTS_WAIT_MS", section: "voiceContinuation", key: "partWaitMs", fallback: 300_000 });
 }
 
 function isManifest(value: unknown): value is TtsPartsManifest {

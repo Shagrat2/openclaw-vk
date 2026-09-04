@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
-import { envPositiveInt } from "./env.js";
+import { vkPositiveSetting } from "./settings.js";
 
 // ── Tunables (env-overridable) ──────────────────────────────────────────────
 
@@ -11,17 +11,17 @@ import { envPositiveInt } from "./env.js";
  * than ~5 minutes; we leave a safety margin (4.5 min default).
  */
 export function getVkAudioMessageMaxMs(): number {
-  return envPositiveInt("VK_AUDIO_MESSAGE_MAX_MS", 270_000);
+  return vkPositiveSetting({ env: "VK_AUDIO_MESSAGE_MAX_MS", section: "audio", key: "maxVoiceMs", fallback: 270_000 });
 }
 
 /** Deadline for the whole split operation. */
 function getAudioSplitDeadlineMs(): number {
-  return envPositiveInt("VK_AUDIO_SPLIT_DEADLINE_MS", 5 * 60 * 1000);
+  return vkPositiveSetting({ env: "VK_AUDIO_SPLIT_DEADLINE_MS", section: "audio", key: "splitDeadlineMs", fallback: 5 * 60 * 1000 });
 }
 
 /** Input file size ceiling: we do not split a gigabyte. */
 function getAudioSplitMaxInputBytes(): number {
-  return envPositiveInt("VK_AUDIO_SPLIT_MAX_INPUT_BYTES", 512 * 1024 * 1024);
+  return vkPositiveSetting({ env: "VK_AUDIO_SPLIT_MAX_INPUT_BYTES", section: "audio", key: "maxInputBytes", fallback: 512 * 1024 * 1024 });
 }
 
 
@@ -36,11 +36,11 @@ const SEGMENT_PLANNING_MARGIN_MS = 250;
 
 /** Segment count ceiling: nobody listens to that many voice messages in a row. */
 function getAudioSplitMaxSegments(): number {
-  return envPositiveInt("VK_AUDIO_SPLIT_MAX_SEGMENTS", 12);
+  return vkPositiveSetting({ env: "VK_AUDIO_SPLIT_MAX_SEGMENTS", section: "audio", key: "maxSegments", fallback: 12 });
 }
 
 function getAudioSplitTimeoutMs(): number {
-  return envPositiveInt("VK_AUDIO_SPLIT_TIMEOUT_MS", 120_000);
+  return vkPositiveSetting({ env: "VK_AUDIO_SPLIT_TIMEOUT_MS", section: "audio", key: "splitTimeoutMs", fallback: 120_000 });
 }
 
 function getFfprobeBin(): string {

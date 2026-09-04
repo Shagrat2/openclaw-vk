@@ -17,8 +17,10 @@ import {
 } from "openclaw/plugin-sdk/channel-outbound";
 import {
   buildChannelProgressDraftLineForEntry,
+  isPotentialTruncatedFinal,
   resolveChannelPreviewStreamMode,
-} from "openclaw/plugin-sdk/channel-message";
+  selectLongerFinalText,
+} from "openclaw/plugin-sdk/channel-outbound";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
   readStoreAllowFromForDmPolicy,
@@ -790,14 +792,29 @@ export async function handleVkInbound(params: {
             // is left with a voice message alone. This broke on the switch to a
             // local model: cloud models put the whole text in the final, Qwen
             // sends it empty.
+            //
+            // "Empty" is the core's question, not ours: `selectLongerFinalText`
+            // compares the final against what the draft already holds and
+            // returns the better text, and `isPotentialTruncatedFinal` catches
+            // the case where the final is present but plainly cut short. We used
+            // to test `!finalText` alone, which missed a truncated final and
+            // dropped the fuller answer with the draft.
             const draftMsgId = progressDraft.currentMessageId();
-            if (draftAnswerText && !normalized.text?.trim() && draftMsgId !== undefined) {
+            const finalText = normalized.text?.trim() ?? "";
+            const keptAnswer =
+              draftAnswerText && (!finalText || isPotentialTruncatedFinal(finalText))
+                ? selectLongerFinalText({
+                    finalText,
+                    candidateTexts: [draftAnswerText],
+                  })
+                : undefined;
+            if (keptAnswer && draftMsgId !== undefined) {
               // The draft is the answer — but rewrite it WITHOUT the progress
               // label. `overwrite` always prepends the label, so a finished
               // answer would keep a "working" header forever.
               try {
-                await editMessageVk(String(message.peerId), draftMsgId, draftAnswerText, account);
-                vkDiag("draft kept as answer", { len: draftAnswerText.length });
+                await editMessageVk(String(message.peerId), draftMsgId, keptAnswer, account);
+                vkDiag("draft kept as answer", { len: keptAnswer.length });
               } catch (err) {
                 runtime.log?.(`vk: draft finalize failed: ${String(err)}`);
               }
