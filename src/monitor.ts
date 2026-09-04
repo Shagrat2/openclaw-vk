@@ -1,16 +1,17 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { VK } from "vk-io";
-import {
-  createAccountStatusSink,
-  createArmableStallWatchdog,
-  waitUntilAbort,
-} from "openclaw/plugin-sdk/channel-lifecycle";
-import {
-  channelReadyPatch,
-  channelStoppedPatch,
-  createTransportActivityStatusPatch,
-} from "openclaw/plugin-sdk/gateway-runtime";
+import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
+// ⚠️ deprecated-подпуть. Реестр ядра: code `plugin-sdk-channel-lifecycle-subpath`,
+// removeAfter 2026-09-01, replacement `channel-outbound`. Уйти целиком нельзя:
+// `createArmableStallWatchdog` в замену не переехал и живёт только здесь — ни в
+// 2026.7.1, ни в 2026.8.2 его в `channel-outbound` нет (проверено). Остальные два
+// символа уже переведены. Когда сторож появится в `channel-outbound` — этот импорт
+// удалить целиком.
+import { createArmableStallWatchdog } from "openclaw/plugin-sdk/channel-lifecycle";
+import { createTransportActivityStatusPatch } from "openclaw/plugin-sdk/gateway-runtime";
 import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
+import { channelReadyStatusPatch, channelStoppedStatusPatch } from "./status-patches.js";
+import { readCoreConfig } from "./sdk-compat.js";
 import { resolveVkAccount } from "./accounts.js";
 import { instrumentPollingTransport } from "./transport-liveness.js";
 import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
@@ -86,6 +87,12 @@ const TRANSPORT_SILENCE_MS = envInt("VK_LP_SILENCE_MS", 150_000);
  * нативно с 2026.7.1 (fire-and-forget mirror, PR #99549), поэтому на свежем
  * ядре включать её незачем — она стоит параллелизма. На старом ядре она нужна.
  * Явный override: VK_SERIALIZE_INBOUND=true|false.
+ *
+ * core-compat: автоопределение здесь УЖЕ мертво — порог плагина
+ * (`openclaw.compat.minGatewayVersion` = 2026.7.1) совпал с версией, где дедлок
+ * исправлен, поэтому на любом поддерживаемом ядре ветка даёт false. Оставлено
+ * намеренно, до решения: сносить вместе с самим обходом или держать как
+ * аварийный тумблер. См. doc/core-compat.md.
  */
 export function resolveSerializeInbound(): boolean {
   const flag = process.env.VK_SERIALIZE_INBOUND;
@@ -182,6 +189,9 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         msg.text.length > 0 &&
         (msg.attachments?.length ?? 0) === 0 &&
         msg.messagePayload === undefined,
+      // core-compat: 2026.7 · ветка «вернуть промис» · снять, когда
+      // `openclaw.compat.minGatewayVersion` станет >= 2026.8.1.
+      //
       // ⚠️ Контракт onFlush менялся: ядро ≥2026.8.1 передаёт вторым аргументом
       // фабрику и ждёт назад { admission, completion } — «полоса» освобождается
       // на admission, пока completion ещё идёт. Старое ядро ждало обычный
@@ -213,7 +223,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           return;
         }
         try {
-          const currentCfg = core.config.current() as CoreConfig;
+          const currentCfg = readCoreConfig(core) as CoreConfig;
           const currentAccount = resolveVkAccount({
             cfg: currentCfg,
             accountId: account.accountId,
@@ -233,7 +243,8 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           );
         }
         };
-        // Новое ядро: отдаём ему пару admission/completion. Старое: обычный промис.
+        // core-compat: 2026.7 — новое ядро получает пару admission/completion,
+        // старое обычный промис.
         if (typeof createFlush === "function") {
           return (createFlush as (p: { dispatch: () => Promise<void> }) => unknown)({
             dispatch,
@@ -397,9 +408,9 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         }
 
         // ── Живость транспорта вместо своего сторожа ───────────────────
-        // Ядро с 2026.8.1 владеет перезапуском и бэкоффом, поэтому плагин
-        // больше не перезапускается сам: он публикует состояние и завершает
-        // задачу аккаунта, если long-poll залип.
+        // Перезапуском и бэкоффом владеет ядро — и в 2026.7, и в 2026.8
+        // одинаково, — поэтому плагин не перезапускается сам: он публикует
+        // состояние и завершает задачу аккаунта, если long-poll залип.
         //
         // Честный признак живости один — HTTP-запрос за обновлениями вернулся.
         // Курсор для этого не годится: он двигается по СОБЫТИЯМ, поэтому на
@@ -418,7 +429,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             const silentSec = Math.round(idleMs / 1000);
             const reason = `no completed long-poll request for ${silentSec}s`;
             publishStatus?.(
-              channelStoppedPatch({
+              channelStoppedStatusPatch({
                 lastError: `no completed long-poll request for ${silentSec}s`,
                 lastDisconnect: {
                   at: Date.now(),
@@ -440,7 +451,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
         const startedAt = Date.now();
         publishStatus?.(
-          channelReadyPatch({
+          channelReadyStatusPatch({
             lastConnectedAt: startedAt,
             ...createTransportActivityStatusPatch(startedAt),
             mode: "longpoll",
@@ -463,7 +474,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         // Ошибку публикуем и выходим: перезапуском владеет ядро.
         const msg = err instanceof Error ? err.message : String(err);
         publishStatus?.(
-          channelStoppedPatch({
+          channelStoppedStatusPatch({
             lastError: msg,
             lastDisconnect: { at: Date.now(), error: msg },
           }),

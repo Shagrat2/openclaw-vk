@@ -17,17 +17,21 @@ const mockWatchdog = vi.hoisted(() => ({
   touch: vi.fn(),
   disarm: vi.fn(),
 }));
-vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
+vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createAccountStatusSink:
     ({ accountId }: { accountId: string }) =>
     (patch: Record<string, unknown>) =>
       mockStatusPatches.push({ accountId, ...patch }),
-  createArmableStallWatchdog: vi.fn(() => mockWatchdog),
   waitUntilAbort: (signal: AbortSignal) =>
     new Promise<void>((resolve) => {
       if (signal.aborted) return resolve();
       signal.addEventListener("abort", () => resolve(), { once: true });
     }),
+}));
+// Отдельным моком: сторож остался в deprecated-подпути, потому что в замену он
+// не переехал (см. комментарий у импорта в monitor.ts).
+vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
+  createArmableStallWatchdog: vi.fn(() => mockWatchdog),
 }));
 vi.mock("openclaw/plugin-sdk/gateway-runtime", () => ({
   channelReadyPatch: (extras: Record<string, unknown> = {}) => ({
@@ -141,7 +145,10 @@ const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
 vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
 
 const mockCoreAtLeast = vi.hoisted(() => vi.fn(() => true));
-vi.mock("./sdk-compat.js", () => ({
+// Подменяем ТОЛЬКО версию ядра: `readCoreConfig` должен остаться настоящим,
+// иначе тесты перестанут проверять чтение конфига (модуль импортов не тянет).
+vi.mock("./sdk-compat.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sdk-compat.js")>()),
   coreAtLeast: mockCoreAtLeast,
 }));
 
@@ -456,6 +463,64 @@ describe("message_new handler", () => {
     expect(vi.mocked(core.channel.activity.record)).toHaveBeenCalledWith(
       expect.objectContaining({ channel: "vk", direction: "inbound" }),
     );
+  });
+
+  describe("контракт onFlush различается между версиями ядра", () => {
+    /**
+     * Подменяем дебаунсер так, как его зовёт ядро нужной версии, и возвращаем
+     * то, что монитор отдал наружу. Промах здесь не виден ни в логе, ни в
+     * статусе канала: сообщение просто исчезает.
+     */
+    function captureFlushResult(pass: "createFlush" | "нет") {
+      const core = makeVkRuntime();
+      const seen: { result?: unknown } = {};
+      const createFlush = vi.fn((flush: { dispatch: () => Promise<void> }) => ({
+        admission: flush.dispatch(),
+        completion: Promise.resolve(),
+      }));
+      vi.mocked(core.channel.debounce.createInboundDebouncer).mockImplementation(
+        ((params: { onFlush: (items: unknown[], cf?: unknown) => unknown }) => ({
+          enqueue: vi.fn(async (item: unknown) => {
+            seen.result =
+              pass === "createFlush" ? params.onFlush([item], createFlush) : params.onFlush([item]);
+            await (seen.result as { admission?: Promise<void> })?.admission;
+          }),
+          flushKey: vi.fn(),
+          cancelKey: vi.fn(),
+        })) as never,
+      );
+      setVkRuntime(core);
+      return { seen, createFlush };
+    }
+
+    it("на ядре 2026.8 отдаёт пару admission/completion, построенную фабрикой ядра", async () => {
+      const { seen, createFlush } = captureFlushResult("createFlush");
+
+      activeMonitor = startMonitor();
+      await flush();
+      await getMessageHandler()(makeCtx());
+      await flush();
+
+      expect(createFlush).toHaveBeenCalledOnce();
+      expect(seen.result).toHaveProperty("admission");
+      expect(mockHandleVkInbound).toHaveBeenCalledOnce();
+    });
+
+    it("на ядре 2026.7 отдаёт обычный промис и всё равно обрабатывает сообщение", async () => {
+      const { seen, createFlush } = captureFlushResult("нет");
+
+      activeMonitor = startMonitor();
+      await flush();
+      await getMessageHandler()(makeCtx());
+      await flush();
+
+      expect(createFlush).not.toHaveBeenCalled();
+      // Старое ядро ЖДЁТ промис: вернуть ему объект — значит не дождаться
+      // обработки и потерять сообщение.
+      expect(seen.result).toBeInstanceOf(Promise);
+      await seen.result;
+      expect(mockHandleVkInbound).toHaveBeenCalledOnce();
+    });
   });
 
   it("does not dispatch messages after abort", async () => {

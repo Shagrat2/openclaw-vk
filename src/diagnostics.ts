@@ -35,6 +35,7 @@ import type { RuntimeLogger } from "openclaw/plugin-sdk/core";
 import { tryGetVkRuntime } from "./runtime.js";
 import { VK_DIAG_LEVELS, type VkDiagLevel } from "./types.js";
 import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
+import { readCoreConfig } from "./sdk-compat.js";
 
 export type { VkDiagLevel };
 
@@ -72,7 +73,8 @@ export function resolveVkDiagLevel(): VkDiagLevel {
     return fromEnv;
   }
   try {
-    const channels = tryGetVkRuntime()?.config.current()?.channels as
+    const channels = (readCoreConfig(tryGetVkRuntime()) as { channels?: unknown } | undefined)
+      ?.channels as
       | { vk?: { diagnostics?: { level?: unknown } } }
       | undefined;
     const fromConfig = channels?.vk?.diagnostics?.level;

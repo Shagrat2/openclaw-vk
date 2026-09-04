@@ -23,6 +23,7 @@ const entryPoints = [
   "src/runtime.ts",
   "src/sanitize.ts",
   "src/sdk-compat.ts",
+  "src/status-patches.ts",
   "src/send-support.ts",
   "src/send.ts",
   "src/setup-core.ts",

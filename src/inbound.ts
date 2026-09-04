@@ -17,7 +17,7 @@ import {
 import {
   buildChannelProgressDraftLineForEntry,
   resolveChannelPreviewStreamMode,
-} from "openclaw/plugin-sdk/channel-message";
+} from "openclaw/plugin-sdk/channel-outbound";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 import {
   readStoreAllowFromForDmPolicy,
@@ -53,10 +53,14 @@ import {
   dispatchReplyWithBufferedBlockDispatcher,
   finalizeInboundContext,
 } from "openclaw/plugin-sdk/reply-dispatch-runtime";
-import {
-  formatAgentEnvelope,
-  resolveEnvelopeFormatOptions,
-} from "openclaw/plugin-sdk/channel-inbound";
+// core-compat: 2026.7 · импорт пространством имён · снять, когда
+// `openclaw.compat.minGatewayVersion` станет >= 2026.8.1 — тогда вернуть
+// поимённый импорт `formatAgentEnvelope` и убрать проверку ниже.
+//
+// Пространством имён, а не поимённо: `formatAgentEnvelope` появился только в
+// 2026.8, а именованный импорт отсутствующего символа роняет загрузку модуля
+// целиком — плагин не грузится, канал молча исчезает.
+import * as channelInbound from "openclaw/plugin-sdk/channel-inbound";
 import { hasControlCommand } from "openclaw/plugin-sdk/command-auth-native";
 import {
   readSessionUpdatedAt,
@@ -354,19 +358,24 @@ export async function handleVkInbound(params: {
       agentId: route.agentId,
     },
   );
-  const envelopeOptions = resolveEnvelopeFormatOptions(config as OpenClawConfig);
+  const envelopeOptions = channelInbound.resolveEnvelopeFormatOptions(config as OpenClawConfig);
   const previousTimestamp = readSessionUpdatedAt({
     storePath,
     sessionKey: route.sessionKey,
   });
-  const body = formatAgentEnvelope({
-    channel: "VK",
-    from: fromLabel,
-    timestamp: message.timestamp,
-    previousTimestamp,
-    envelope: envelopeOptions,
-    body: rawBody,
-  });
+  // core-compat: 2026.7 — конверта в SDK нет, отдаём тело как есть. Это
+  // деградация, а не отказ: сообщение дойдёт без служебной шапки
+  // «канал / от кого / когда».
+  const body = channelInbound.formatAgentEnvelope
+    ? channelInbound.formatAgentEnvelope({
+        channel: "VK",
+        from: fromLabel,
+        timestamp: message.timestamp,
+        previousTimestamp,
+        envelope: envelopeOptions,
+        body: rawBody,
+      })
+    : rawBody;
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
   const resolvedMedia = await resolveVkInboundResolvedMedia({

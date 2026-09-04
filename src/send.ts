@@ -580,9 +580,8 @@ function recordOutboundActivity(accountId: string): void {
 
 async function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: string }) {
   const runtime = getVkRuntime();
-  // 8.1 убрала runtime.config — конфиг берём через мост совместимости.
-  const cfg = (params.cfg ??
-    runtime.config.current()) as CoreConfig;
+  // Метод группы `config` зависит от версии ядра — см. readCoreConfig.
+  const cfg = (params.cfg ?? readCoreConfig(runtime)) as CoreConfig;
   const account = resolveVkAccount({ cfg, accountId: params.accountId });
   if (!account.token) {
     throw new Error("VK token not configured");

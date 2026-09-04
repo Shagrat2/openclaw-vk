@@ -1,8 +1,18 @@
 import type { ChannelProgressDraftMode, StreamingCompatEntry } from "./sdk-compat.js";
-import {
-  createChannelProgressDraftCompositor,
-  type ChannelProgressDraftCompositor,
-} from "openclaw/plugin-sdk/channel-message";
+import { createChannelProgressDraftCompositor } from "openclaw/plugin-sdk/channel-outbound";
+
+/**
+ * Тип компоновщика выводим из самой фабрики, а не импортируем.
+ *
+ * core-compat: обратная развилка — тип есть ТОЛЬКО в 2026.7, снимать нечего,
+ * вывод из `ReturnType` верен для любой версии.
+ *
+ * `ChannelProgressDraftCompositor` объявлен только в SDK 2026.7; в 8.1 и 8.2
+ * такого типа нет вовсе, и импорт держался лишь на том, что сборка идёт
+ * esbuild'ом без проверки типов — то есть был сломан молча. Вывод из
+ * `ReturnType` даёт тот же тип и не зависит от версии ядра.
+ */
+type ChannelProgressDraftCompositor = ReturnType<typeof createChannelProgressDraftCompositor>;
 import { deleteMessageVk, editMessageVk, sendMessageVk } from "./send.js";
 import type { CoreConfig, ResolvedVkAccount } from "./types.js";
 

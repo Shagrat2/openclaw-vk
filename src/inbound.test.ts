@@ -171,6 +171,11 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
   logTypingFailure: mockLogTypingFailure,
+  resolveChannelPreviewStreamMode: mockResolveStreamMode,
+  // Return the raw input as the "line" so tests can assert what was built.
+  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
+  // Used only by progress-draft.ts (mocked below); stub keeps the shape complete.
+  createChannelProgressDraftCompositor: vi.fn(() => mockProgressCompositor),
 }));
 
 // Мокаем компат-слой, а не конкретные пути SDK: он на то и заведён, чтобы
@@ -224,14 +229,6 @@ const mockCreateVkProgressDraft = vi.hoisted(() =>
     close: mockDraftClose,
   })),
 );
-
-vi.mock("openclaw/plugin-sdk/channel-message", () => ({
-  resolveChannelPreviewStreamMode: mockResolveStreamMode,
-  // Return the raw input as the "line" so tests can assert what was built.
-  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
-  // Used only by progress-draft.ts (mocked below); stub keeps the shape complete.
-  createChannelProgressDraftCompositor: vi.fn(() => mockProgressCompositor),
-}));
 
 vi.mock("./progress-draft.js", () => ({
   // Резолвер метки живёт в том же модуле — в моке отдаём настоящий разбор
