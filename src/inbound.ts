@@ -184,11 +184,10 @@ export async function handleVkInbound(params: {
   // The real id: pairing challenges, the reply target and `SenderId` all carry
   // it, so it must stay exact.
   const senderDisplay = String(message.senderId);
-  // The same id for log lines. These are operational warnings that print at
-  // every level, so a raw VK id in them would contradict the redaction the
-  // channel applies to `peerId` right next to them; the hash keeps them
-  // correlatable without naming anyone.
-  const senderForLog = redactVkId(message.senderId);
+  // The same id for log lines: operational warnings print at every level, so a
+  // raw VK id in them would contradict the redaction applied to `peerId` right
+  // next to them. Computed on demand — only the drop branches log it.
+  const senderForLog = () => redactVkId(message.senderId);
   const isGroup = message.isGroup;
   const groupConfig = isGroup
     ? (account.config.groups?.[String(message.peerId)] ?? account.config.groups?.["*"])
@@ -253,13 +252,13 @@ export async function handleVkInbound(params: {
         senderId: message.senderId,
       });
       if (!senderAllowed.allowed) {
-        runtime.log?.(`vk: drop group sender ${senderForLog} (groupPolicy=allowlist)`);
+        runtime.log?.(`vk: drop group sender ${senderForLog()} (groupPolicy=allowlist)`);
         return;
       }
     }
   } else {
     if (dmPolicy === "disabled") {
-      runtime.log?.(`vk: drop DM sender=${senderForLog} (dmPolicy=disabled)`);
+      runtime.log?.(`vk: drop DM sender=${senderForLog()} (dmPolicy=disabled)`);
       return;
     }
     if (dmPolicy !== "open") {
@@ -284,11 +283,11 @@ export async function handleVkInbound(params: {
               });
             },
             onReplyError: (err) => {
-              runtime.error?.(`vk: pairing reply failed for ${senderForLog}: ${String(err)}`);
+              runtime.error?.(`vk: pairing reply failed for ${senderForLog()}: ${String(err)}`);
             },
           });
         }
-        runtime.log?.(`vk: drop DM sender ${senderForLog} (dmPolicy=${dmPolicy})`);
+        runtime.log?.(`vk: drop DM sender ${senderForLog()} (dmPolicy=${dmPolicy})`);
         return;
       }
     }

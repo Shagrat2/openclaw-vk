@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { extname, join } from "node:path";
+import { envPositiveInt } from "./env.js";
 
 // ── Tunables (env-overridable) ──────────────────────────────────────────────
 
@@ -10,17 +11,17 @@ import { join } from "node:path";
  * than ~5 minutes; we leave a safety margin (4.5 min default).
  */
 export function getVkAudioMessageMaxMs(): number {
-  return readPositiveIntEnv("VK_AUDIO_MESSAGE_MAX_MS", 270_000);
+  return envPositiveInt("VK_AUDIO_MESSAGE_MAX_MS", 270_000);
 }
 
 /** Deadline for the whole split operation. */
 function getAudioSplitDeadlineMs(): number {
-  return readPositiveIntEnv("VK_AUDIO_SPLIT_DEADLINE_MS", 5 * 60 * 1000);
+  return envPositiveInt("VK_AUDIO_SPLIT_DEADLINE_MS", 5 * 60 * 1000);
 }
 
 /** Input file size ceiling: we do not split a gigabyte. */
 function getAudioSplitMaxInputBytes(): number {
-  return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_INPUT_BYTES", 512 * 1024 * 1024);
+  return envPositiveInt("VK_AUDIO_SPLIT_MAX_INPUT_BYTES", 512 * 1024 * 1024);
 }
 
 
@@ -35,11 +36,11 @@ const SEGMENT_PLANNING_MARGIN_MS = 250;
 
 /** Segment count ceiling: nobody listens to that many voice messages in a row. */
 function getAudioSplitMaxSegments(): number {
-  return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_SEGMENTS", 12);
+  return envPositiveInt("VK_AUDIO_SPLIT_MAX_SEGMENTS", 12);
 }
 
 function getAudioSplitTimeoutMs(): number {
-  return readPositiveIntEnv("VK_AUDIO_SPLIT_TIMEOUT_MS", 120_000);
+  return envPositiveInt("VK_AUDIO_SPLIT_TIMEOUT_MS", 120_000);
 }
 
 function getFfprobeBin(): string {
@@ -50,14 +51,6 @@ function getFfmpegBin(): string {
   return process.env.FFMPEG_BIN?.trim() || "ffmpeg";
 }
 
-function readPositiveIntEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) {
-    return fallback;
-  }
-  const parsed = Number.parseInt(raw.trim(), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 // ── Process helper ──────────────────────────────────────────────────────────
 
@@ -199,13 +192,10 @@ export function selectCutPointsMs(
         break;
       }
     }
+    // `chosen` is strictly past `segmentStart` (candidates at or before it are
+    // skipped above) and `limit` is `segmentStart + target` with `target >= 1`,
+    // so the cut always advances.
     const cut = chosen ?? limit;
-    // Guard against zero-length / non-advancing segments.
-    if (cut <= segmentStart) {
-      boundaries.push(limit);
-      segmentStart = limit;
-      continue;
-    }
     boundaries.push(cut);
     segmentStart = cut;
   }
@@ -214,10 +204,15 @@ export function selectCutPointsMs(
 
 // ── Segment extraction ──────────────────────────────────────────────────────
 
-function fileExtension(file: string): string {
-  const base = file.split(/[\\/]/).pop() ?? "";
-  const dot = base.lastIndexOf(".");
-  return dot > 0 ? base.slice(dot) : ".ogg";
+/**
+ * Extension of an audio file, defaulting to `.ogg`.
+ *
+ * Exported because the send path needs the same answer: it used to carry its own
+ * copy of this rule plus a third, cruder variant (`endsWith(".wav") ? … : ".ogg"`),
+ * and three answers to one question is how a segment ends up mislabelled.
+ */
+export function audioFileExtension(file: string): string {
+  return extname(file) || ".ogg";
 }
 
 /**
@@ -317,14 +312,13 @@ export async function splitAudioAtSilence(
   }
   ranges.push({ start: prev, end: totalMs });
 
-  if (ranges.length < 2) {
-    return [];
-  }
+  // No `< 2` check: an empty `cutPoints` returned above, and every cut adds a
+  // range, so there are always at least two here.
   if (ranges.length > getAudioSplitMaxSegments()) {
     return [];
   }
 
-  const ext = fileExtension(file);
+  const ext = audioFileExtension(file);
   let dir: string;
   try {
     dir = await mkdtemp(join(tmpdir(), "vk-voice-"));
@@ -363,28 +357,19 @@ export async function splitAudioAtSilence(
     return [];
   }
 
-  if (outputs.length < 2) {
-    // There turned out to be nothing to split.
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
-    return [];
-  }
-
   // Check what came out instead of trusting what was requested. Stream copy
   // only cuts on key frames, so a segment can end up longer than asked — and VK
   // then rejects it exactly as it rejected the original. Returning a split that
   // is known to be unusable is worse than not splitting at all: at least the
   // caller falls back to sending a document.
-  for (const out of outputs) {
-    let actual: number | null;
-    try {
-      actual = await probeAudioDurationMs(out, signal);
-    } catch {
-      actual = null;
-    }
-    if (actual !== null && actual > maxMs) {
-      await rm(dir, { recursive: true, force: true }).catch(() => {});
-      return [];
-    }
+  // Independent probes: awaiting them in turn added (N-1) round trips for
+  // nothing. An unreadable segment stays `null` and is not held against the split.
+  const actualDurations = await Promise.all(
+    outputs.map((out) => probeAudioDurationMs(out, signal).catch(() => null)),
+  );
+  if (actualDurations.some((actual) => actual !== null && actual > maxMs)) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    return [];
   }
   return outputs;
 }

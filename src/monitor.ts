@@ -1,7 +1,7 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
 import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gateway-runtime";
-import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
+import { envPositiveInt } from "./env.js";
 import { globalAgent } from "node:https";
 import { PollingTransport, VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
@@ -10,7 +10,7 @@ import {
   extractVkInboundAttachments,
   resolveVkInboundReplyContext,
 } from "./media.js";
-import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
+import { redactVkId, vkDiag } from "./diagnostics.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { createStallWatchdog } from "./stall-watchdog.js";
 import { primeVkGroupId } from "./send.js";
@@ -18,11 +18,6 @@ import type { CoreConfig, VkInboundMessage } from "./types.js";
 
 const FIRST_LONG_POLL_CHECK_TIMEOUT_MS = 35_000;
 const FIRST_LONG_POLL_CHECK_ERROR = "VK Long Poll transport check failed";
-
-/** Strictly parsed positive integer from the environment. */
-function envInt(name: string, fallback: number): number {
-  return parseStrictPositiveInteger(process.env[name]) ?? fallback;
-}
 
 /**
  * How long the transport may stay silent before we treat it as stalled.
@@ -32,7 +27,7 @@ function envInt(name: string, fallback: number): number {
  * gateway watches `lastTransportActivityAt` too, but with a half-hour default;
  * this only makes the same check faster.
  */
-const TRANSPORT_SILENCE_MS = envInt("VK_TRANSPORT_SILENCE_MS", 150_000);
+const TRANSPORT_SILENCE_MS = envPositiveInt("VK_TRANSPORT_SILENCE_MS", 150_000);
 
 /**
  * Collapses a burst of inbound messages into one: texts joined by newlines,
@@ -88,26 +83,23 @@ class ReadinessPollingTransport extends PollingTransport {
 
   waitForFirstSuccessfulPoll(timeoutMs = FIRST_LONG_POLL_CHECK_TIMEOUT_MS): Promise<void> {
     const timeout = setTimeout(() => {
-      this.settleReadinessFailure();
+      this.settleReadiness(new Error(FIRST_LONG_POLL_CHECK_ERROR));
       this.firstFetchController?.abort();
     }, timeoutMs);
     return this.firstSuccessfulPoll.finally(() => clearTimeout(timeout));
   }
 
-  private settleReadinessSuccess(): void {
+  /** Settles the readiness promise once; `error` decides which way. */
+  private settleReadiness(error?: Error): void {
     if (this.readinessSettled) {
       return;
     }
     this.readinessSettled = true;
+    if (error) {
+      this.rejectFirstSuccessfulPoll(error);
+      return;
+    }
     this.resolveFirstSuccessfulPoll();
-  }
-
-  private settleReadinessFailure(): void {
-    if (this.readinessSettled) {
-      return;
-    }
-    this.readinessSettled = true;
-    this.rejectFirstSuccessfulPoll(new Error(FIRST_LONG_POLL_CHECK_ERROR));
   }
 
   private async fetchReadinessPoll(): Promise<void> {
@@ -189,7 +181,7 @@ class ReadinessPollingTransport extends PollingTransport {
   }
 
   override async stop(): Promise<void> {
-    this.settleReadinessFailure();
+    this.settleReadiness(new Error(FIRST_LONG_POLL_CHECK_ERROR));
     this.firstFetchController?.abort();
     await super.stop();
   }
@@ -213,9 +205,9 @@ class ReadinessPollingTransport extends PollingTransport {
 
     try {
       await this.fetchUpdates();
-      this.settleReadinessSuccess();
+      this.settleReadiness();
     } catch {
-      this.settleReadinessFailure();
+      this.settleReadiness(new Error(FIRST_LONG_POLL_CHECK_ERROR));
       return;
     }
 
@@ -257,11 +249,7 @@ async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: numb
   }
 }
 
-async function waitForAbort(signal?: AbortSignal): Promise<void> {
-  if (!signal) {
-    await new Promise<void>(() => {});
-    return;
-  }
+async function waitForAbort(signal: AbortSignal): Promise<void> {
   if (signal.aborted) {
     return;
   }
@@ -323,7 +311,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   // Coalescing is opt-in: VK_INBOUND_DEBOUNCE_MS defaults to 0, which disables
   // batching while keeping per-peer serialization — sequential, no added latency.
   const inboundDebouncer = core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
-    debounceMs: envInt("VK_INBOUND_DEBOUNCE_MS", 0),
+    debounceMs: envPositiveInt("VK_INBOUND_DEBOUNCE_MS", 0),
     serializeImmediate: true,
     buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
     // Only merge plain-text messages; ones carrying attachments or a payload
@@ -381,9 +369,13 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
 
   // A probe on ALL updates: it shows whether events reach the plugin at all.
   // Without it "the channel is silent" is indistinguishable from "VK sends
-  // nothing", and those are different faults. The middleware is installed only
-  // when diagnostics are on — at `off` it would be dead weight on every update.
-  if (resolveVkDiagLevel() !== "off") {
+  // nothing", and those are different faults.
+  //
+  // Installed unconditionally. The level is read per call everywhere else,
+  // precisely so diagnostics can be switched on without restarting the gateway;
+  // deciding it here once, at account start, made that half-true — the update
+  // trace stayed missing until a restart. `vkDiag` returns immediately at `off`.
+  {
     // vk-io types the middleware around its own Context, and its `next` resolves
     // to unknown rather than void — the probe only reads two optional fields, so
     // it is typed against that shape and handed over as vk-io expects.
@@ -556,15 +548,12 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         : vk.updates.handlePollingUpdate(update),
     );
 
-    if (useBotsLongPoll) {
-      opts.runtime.log?.(`[${opts.accountId}] using Bots Long Poll (group ${botsLp.groupId})`);
-      await pollingTransport.start();
-    } else {
-      opts.runtime.log?.(
-        `[${opts.accountId}] Bots Long Poll unavailable, falling back to User Long Poll`,
-      );
-      await pollingTransport.start();
-    }
+    opts.runtime.log?.(
+      useBotsLongPoll
+        ? `[${opts.accountId}] using Bots Long Poll (group ${botsLp.groupId})`
+        : `[${opts.accountId}] Bots Long Poll unavailable, falling back to User Long Poll`,
+    );
+    await pollingTransport.start();
     updatesStarted = true;
 
     // An abort may arrive while vk-io is awaiting its Long Poll server. Stop

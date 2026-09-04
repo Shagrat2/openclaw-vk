@@ -11,6 +11,7 @@ const entryPoints = [
   "src/channel.ts",
   "src/config-schema.ts",
   "src/diagnostics.ts",
+  "src/env.ts",
   "src/vk-errors.ts",
   "src/format.ts",
   "src/inbound.ts",

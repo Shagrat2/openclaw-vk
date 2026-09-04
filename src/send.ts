@@ -11,6 +11,7 @@ import {
   cleanupAudioSegments,
   getVkAudioMessageMaxMs,
   probeAudioDurationMs,
+  audioFileExtension,
   splitAudioAtSilence,
 } from "./audio-chunk.js";
 import {
@@ -26,6 +27,7 @@ import {
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
+import { envPositiveInt } from "./env.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
@@ -45,8 +47,7 @@ const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 
 /** Download ceiling for remote audio: the source is untrusted. */
 function getVkRemoteAudioMaxBytes(): number {
-  const raw = Number.parseInt(process.env.VK_REMOTE_AUDIO_MAX_BYTES ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 128 * 1024 * 1024;
+  return envPositiveInt("VK_REMOTE_AUDIO_MAX_BYTES", 128 * 1024 * 1024);
 }
 const DEFAULT_ACCOUNT_ID = "default";
 const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
@@ -1017,6 +1018,9 @@ async function deliverTtsContinuation(params: {
     try {
       if ((part.durationMs ?? 0) > maxMs) {
         segments = await splitAudioAtSilence(file, maxMs, {
+          // The manifest already carries it — measuring again would spawn an
+          // ffprobe per part, up to eight on one long reply.
+          knownDurationMs: part.durationMs,
           signal: params.opts.abortSignal,
         });
       }
@@ -1205,12 +1209,6 @@ export async function sendAudioMessageVk(
  * buttons/clearKeyboard apply only to the very last sent message.
  */
 /** Segment file extension: after `-c copy` the container stays as it was. */
-function vkAudioSegmentExtension(segment: string): string {
-  const base = segment.split(/[\\/]/).pop() ?? "";
-  const dot = base.lastIndexOf(".");
-  return dot > 0 ? base.slice(dot) : ".ogg";
-}
-
 async function sendVkAudioSegments(params: {
   to: string;
   peerId: number;
@@ -1245,7 +1243,7 @@ async function sendVkAudioSegments(params: {
         // Take the extension from the segment itself: splitting uses `-c copy`,
         // so the container stays as it was, and naming an mp3 segment ".ogg"
         // would lie to VK about the format.
-        filename: `voice-${String(index + 1).padStart(2, "0")}${vkAudioSegmentExtension(segment)}`,
+        filename: `voice-${String(index + 1).padStart(2, "0")}${audioFileExtension(segment)}`,
         contentType: params.contentType,
       }),
     );

@@ -859,19 +859,16 @@ describe("stall watchdog", () => {
 });
 
 describe("diagnostics wiring", () => {
-  it("installs the update probe only when diagnostics are on", async () => {
-    activeMonitor = startMonitor();
-    await flush();
-    // At `off` the middleware would be dead weight on every update.
-    expect(mockUpdatesUse).not.toHaveBeenCalled();
-
-    activeMonitor.controller.abort();
-    await activeMonitor.promise.catch(() => {});
-    mockDiagLevel.value = "redacted";
-
+  it("installs the update probe regardless of level, so it can be switched on live", async () => {
+    // The level is read per call, precisely so diagnostics can be enabled
+    // without restarting the gateway. Deciding at account start would have kept
+    // the update trace missing until a restart.
+    mockDiagLevel.value = "off";
     activeMonitor = startMonitor();
     await flush();
     expect(mockUpdatesUse).toHaveBeenCalledOnce();
+
+    mockDiagLevel.value = "redacted";
 
     // The probe reports the update type and passes control on.
     const middleware = mockUpdatesUse.mock.calls[0][0] as (

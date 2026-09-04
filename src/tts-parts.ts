@@ -1,6 +1,7 @@
 import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { envPositiveInt } from "./env.js";
 
 /**
  * Continuation audio produced outside OpenClaw's single-shot TTS call.
@@ -50,14 +51,6 @@ export type TtsPartsManifest = {
 const CLAIM_FILE = "claimed.json";
 const MANIFEST_FILE = "manifest.json";
 
-function readPositiveIntEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) {
-    return fallback;
-  }
-  const parsed = Number.parseInt(raw.trim(), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 /** Directory the TTS command writes continuation parts into. */
 export function getTtsPartsDir(): string {
@@ -75,17 +68,17 @@ export function isTtsPartsEnabled(): boolean {
 
 /** How far head duration may drift from the manifest (container/codec rewrap). */
 export function getTtsPartsMatchToleranceMs(): number {
-  return readPositiveIntEnv("VK_TTS_PARTS_MATCH_MS", 1_500);
+  return envPositiveInt("VK_TTS_PARTS_MATCH_MS", 1_500);
 }
 
 /** Manifests older than this are ignored (and swept). */
 export function getTtsPartsMaxAgeMs(): number {
-  return readPositiveIntEnv("VK_TTS_PARTS_MAX_AGE_MS", 600_000);
+  return envPositiveInt("VK_TTS_PARTS_MAX_AGE_MS", 600_000);
 }
 
 /** How long to wait for a single part to finish synthesizing. */
 export function getTtsPartWaitMs(): number {
-  return readPositiveIntEnv("VK_TTS_PARTS_WAIT_MS", 300_000);
+  return envPositiveInt("VK_TTS_PARTS_WAIT_MS", 300_000);
 }
 
 function isManifest(value: unknown): value is TtsPartsManifest {

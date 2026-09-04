@@ -1,4 +1,8 @@
-import { DmPolicySchema, GroupPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
+import {
+  ChannelPreviewStreamingConfigSchema,
+  DmPolicySchema,
+  GroupPolicySchema,
+} from "openclaw/plugin-sdk/channel-config-schema";
 import { VK_DIAG_LEVELS } from "./types.js";
 import { z } from "zod";
 
@@ -42,24 +46,11 @@ const VkGroupConfigSchema = z
   .optional();
 
 // Live progress streaming (`channels.vk.streaming`). The core owns the semantics
-// and full validation (resolveChannelPreviewStreamMode et al.); the full schema is
-// not exported from the plugin SDK, so we declare only the fields VK's step-progress
-// feature documents and `.passthrough()` the rest so additional core streaming keys
-// (block/chunk/coalesce/label/…) are accepted rather than rejected by `.strict()`.
-const VkStreamingSchema = z
-  .object({
-    // "progress" enables the edit-in-place step draft; others match core modes.
-    mode: z.enum(["off", "partial", "block", "progress"]).optional(),
-    preview: z
-      .object({
-        // true = keep one message and rewrite it; false = post steps as history.
-        toolProgress: z.boolean().optional(),
-      })
-      .passthrough()
-      .optional(),
-  })
-  .passthrough()
-  .optional();
+// and full validation. The core exports the real schema, so we use it: our own
+// copy was `.passthrough()` and therefore accepted a typo in `progress.label`
+// or `maxLines` silently, while the core schema is strict and validates exactly
+// the fields the step-progress feature reads.
+const VkStreamingSchema = ChannelPreviewStreamingConfigSchema.optional();
 
 // Channel diagnostics (`channels.vk.diagnostics`). A level rather than a
 // toggle: "off" is silent, "redacted" logs progress without file names or URLs,

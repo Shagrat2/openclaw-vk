@@ -10,5 +10,11 @@ export type StreamingCompatEntry = {
   streaming?: unknown;
 };
 
-/** Draft rendering mode accepted by `channels.vk.streaming.mode`. */
-export type ChannelProgressDraftMode = "off" | "partial" | "block" | "progress";
+/**
+ * Draft rendering mode accepted by `channels.vk.streaming.mode`.
+ *
+ * Re-exported from the core rather than restated: the literals were written out
+ * here, in the config schema and in the core, and a mode added upstream would
+ * have left this copy silently behind.
+ */
+export type { StreamingMode as ChannelProgressDraftMode } from "openclaw/plugin-sdk/channel-outbound";

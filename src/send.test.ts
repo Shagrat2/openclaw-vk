@@ -175,6 +175,9 @@ vi.mock("./audio-chunk.js", () => ({
   probeAudioDurationMs: mockProbeAudioDurationMs,
   splitAudioAtSilence: mockSplitAudioAtSilence,
   cleanupAudioSegments: mockCleanupAudioSegments,
+  // Real implementation: the send path asks it for a segment's extension, and
+  // the answer has to match what splitting actually produced.
+  audioFileExtension: (file: string) => file.slice(file.lastIndexOf(".")) || ".ogg",
 }));
 
 const TOKEN = "test-token";

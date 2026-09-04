@@ -320,8 +320,9 @@ function appendVkDiagFile(event: string, fields: Record<string, unknown>): void 
     rendered = "[fields not serializable]";
   }
   const line = `[${new Date().toISOString()}] ${event}${rendered ? ` ${rendered}` : ""}\n`;
-  diagFileTail = diagFileTail.then(
-    () => appendFile(target, line).catch(() => undefined),
-    () => appendFile(target, line).catch(() => undefined),
-  );
+  // The same continuation for both outcomes: a previous failed append must not
+  // stop the next line from being written.
+  diagFileTail = diagFileTail
+    .catch(() => undefined)
+    .then(() => appendFile(target, line).catch(() => undefined));
 }
