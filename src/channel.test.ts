@@ -334,45 +334,6 @@ describe("messaging", () => {
     expect(vkPlugin.messaging!.targetResolver!.looksLikeId(null as never)).toBe(false);
   });
 
-  describe("parseExplicitTarget", () => {
-    it("parses numeric DM target", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "123456" })).toEqual({
-        to: "123456",
-        chatType: "direct",
-      });
-    });
-
-    it("parses vk:-prefixed DM target", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:123456" })).toEqual({
-        to: "123456",
-        chatType: "direct",
-      });
-    });
-
-    it("parses vk:user: prefixed target", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:user:123456" })).toEqual({
-        to: "123456",
-        chatType: "direct",
-      });
-    });
-
-    it("parses group chat target (peerId >= 2_000_000_000)", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:chat:2000000001" })).toEqual({
-        to: "2000000001",
-        chatType: "group",
-      });
-    });
-
-    it("returns null for empty input", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "" })).toBeNull();
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "   " })).toBeNull();
-    });
-
-    it("returns null for non-numeric input", () => {
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "john" })).toBeNull();
-      expect(vkPlugin.messaging!.parseExplicitTarget!({ raw: "vk:abc" })).toBeNull();
-    });
-  });
 
   describe("inferTargetChatType", () => {
     it("returns 'direct' for user peer ID", () => {

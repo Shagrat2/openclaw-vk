@@ -13,7 +13,7 @@ export type {
 
 export type VkPreparedFormattedMessage = {
   text: string;
-  formatData?: { version: 1; items: VkMarkdownChunk[number]["items"] };
+  formatData?: { version: 1; items: VkMarkdownChunk["items"] };
 };
 
 export function renderVkMarkdownChunks(markdown: string, options: VkMarkdownPipelineOptions = {}): VkPreparedFormattedMessage[] {

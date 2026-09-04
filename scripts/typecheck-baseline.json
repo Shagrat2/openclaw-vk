@@ -1,9 +1,1 @@
-{
-  "src/channel.ts TS2345 Argument of type 'string | undefined' is not assignable to parameter of type 'string'.": 1,
-  "src/channel.ts TS2353 Object literal may only specify known properties, and 'parseExplicitTarget' does not exist in type 'ChannelMessagingAdap": 1,
-  "src/format.ts TS2537 Type 'VkRenderedText' has no matching index signature for type 'number'.": 1,
-  "src/media.ts TS2322 Type '({ type: string; kind: string; url: string | undefined; title: string | undefined; mimeType: string | undefined; }": 1,
-  "src/media.ts TS2677 A type predicate's type must be assignable to its parameter's type.": 1,
-  "src/monitor.ts TS2339 Property 'ts' does not exist on type 'object & Record<\"failed\", unknown>'.": 3,
-  "src/monitor.ts TS2345 Argument of type '(context: { type?: string; subTypes?: string[]; }, next: () => Promise<void>) => Promise<void>' is not": 1
-}
+{}

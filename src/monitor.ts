@@ -131,11 +131,14 @@ class ReadinessPollingTransport extends PollingTransport {
       }
 
       if ("failed" in result) {
+        // `in` narrows to a record carrying `failed` only, so `ts` has to be
+        // read off the payload explicitly rather than through the narrowed type.
+        const failure = result as { failed?: unknown; ts?: unknown };
         if (
-          result.failed === 1
-          && (typeof result.ts === "string" || typeof result.ts === "number")
+          failure.failed === 1
+          && (typeof failure.ts === "string" || typeof failure.ts === "number")
         ) {
-          this.ts = result.ts;
+          this.ts = failure.ts;
           return;
         }
         throw new Error(FIRST_LONG_POLL_CHECK_ERROR);
@@ -381,13 +384,19 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   // nothing", and those are different faults. The middleware is installed only
   // when diagnostics are on — at `off` it would be dead weight on every update.
   if (resolveVkDiagLevel() !== "off") {
-    vk.updates.use(async (context: { type?: string; subTypes?: string[] }, next: () => Promise<void>) => {
+    // vk-io types the middleware around its own Context, and its `next` resolves
+    // to unknown rather than void — the probe only reads two optional fields, so
+    // it is typed against that shape and handed over as vk-io expects.
+    vk.updates.use((async (
+      context: { type?: string; subTypes?: string[] },
+      next: () => Promise<unknown>,
+    ) => {
       vkDiag("update", {
         type: context?.type ?? "?",
         sub: (context?.subTypes ?? []).join(","),
       });
       await next();
-    });
+    }) as Parameters<typeof vk.updates.use>[0]);
   }
 
   // Ingestion self-test (VK_SELFTEST=<peerId>): pushes a synthetic inbound
