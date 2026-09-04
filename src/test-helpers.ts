@@ -24,16 +24,16 @@ export function makeVkRuntime(opts: {
   return {
     version: "0.0.0",
     config: {
-      // Снимок конфига — штатная поверхность PluginRuntimeCore; мок без него
-      // прятал бы падение вызывающего до самого прода.
+      // The config snapshot is a normal PluginRuntimeCore surface; a mock
+      // without it would hide a caller crash all the way to production.
       current: vi.fn().mockReturnValue({}),
-      loadConfig: vi.fn().mockReturnValue({}),
-      writeConfigFile: vi.fn(),
+      mutateConfigFile: vi.fn(),
+      replaceConfigFile: vi.fn(),
     },
     logging: {
       shouldLogVerbose: vi.fn().mockReturnValue(false),
-      // Контракт рантайма обещает логгер, а не undefined: мок, отдающий
-      // undefined, прячет падение в вызывающем коде до самого прода.
+      // The runtime contract promises a logger, not undefined: a mock that
+      // returns undefined hides a crash in the caller until production.
       getChildLogger: vi.fn().mockReturnValue({
         debug: vi.fn(),
         info: vi.fn(),
@@ -128,9 +128,20 @@ export function makeVkRuntime(opts: {
         // (enqueue → onFlush → handleVkInbound) without timers. The real
         // debouncer's batching/serialization is covered by core's own tests.
         createInboundDebouncer: vi.fn(
-          (params: { onFlush: (items: unknown[]) => Promise<void> }) => ({
+          (params: {
+            onFlush: (
+              items: unknown[],
+              createFlush: (flush: { dispatch: () => Promise<void> }) => unknown,
+            ) => unknown;
+          }) => ({
             enqueue: vi.fn(async (item: unknown) => {
-              await params.onFlush([item]);
+              // Mirrors the core contract: the flush factory returns
+              // `{ admission, completion }`, and the lane frees on admission.
+              const flush = params.onFlush([item], ({ dispatch }) => {
+                const admission = dispatch();
+                return { admission, completion: admission };
+              }) as { admission?: Promise<void> } | undefined;
+              await flush?.admission;
             }),
             flushKey: vi.fn(),
             cancelKey: vi.fn(),

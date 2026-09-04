@@ -28,7 +28,7 @@ const entryPoints = [
   "src/setup-core.ts",
   "src/setup-surface.ts",
   "src/tts-parts.ts",
-  "src/transport-liveness.ts",
+  "src/stall-watchdog.ts",
   "src/types.ts",
 ];
 

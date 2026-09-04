@@ -41,9 +41,9 @@ export type VkProgressDraftParams = {
 };
 
 /**
- * Метка живого черновика из `channels.vk.streaming.progress.label`.
- * Ею помечаются и черновик, и промежуточные сообщения с медиа — по её
- * отсутствию видно, что пришёл итоговый ответ.
+ * Live draft label from `channels.vk.streaming.progress.label`. It marks both
+ * the draft and intermediate messages carrying media — its absence is what tells
+ * the reader the final answer has arrived.
  */
 export function resolveVkProgressLabel(cfg: unknown): string | undefined {
   const label = (
@@ -82,11 +82,11 @@ export function createVkProgressDraftCompositor(
   // render can't create a brand-new message after the answer is delivered.
   let closed = false;
 
-  // Метка живого черновика (`streaming.progress.label`). Ядро её не
-  // подставляет ни на одном из путей — проверено по трейсу: длина черновика на
-  // шагах инструментов не менялась при заданной метке. Ставим сами и здесь, в
-  // единственной точке записи, чтобы покрыть и шаги, и текстовые куски.
-  // Проверка startsWith защищает от дубля, если метка уже добавлена выше.
+  // The live draft label (`streaming.progress.label`). The core does not add it
+  // on any path — verified from a trace: the draft length on tool steps did not
+  // change with a label configured. So we add it here, at the single write
+  // point, to cover both steps and text chunks. The startsWith check guards
+  // against a duplicate when the label was already added above.
   const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.cfg);
 
   const overwrite = async (rawText: string): Promise<void> => {

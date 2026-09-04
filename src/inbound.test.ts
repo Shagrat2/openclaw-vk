@@ -173,12 +173,9 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   logTypingFailure: mockLogTypingFailure,
 }));
 
-// Мокаем компат-слой, а не конкретные пути SDK: он на то и заведён, чтобы
-// прятать переезды символов между версиями ядра, а в тестовой среде пакета
-// openclaw нет вовсе, и динамический импорт резолвиться не может.
-// Мост совместимости снят: инбаунд импортирует канонические подпути напрямую,
-// поэтому мокаем именно их. Тестовая среда не имеет пакета openclaw, так что
-// без моков модуль не загрузится вовсе.
+// Inbound imports canonical SDK subpaths directly, so those are what we mock.
+// The test environment has no `openclaw` package at all, so without these mocks
+// the module would not load.
 const currentRuntime = vi.hoisted(() => ({ value: null as any }));
 
 vi.mock("openclaw/plugin-sdk/reply-dispatch-runtime", () => ({
@@ -193,11 +190,6 @@ vi.mock("openclaw/plugin-sdk/session-store-runtime", () => ({
   recordSessionMetaFromInbound: (...a: any[]) =>
     currentRuntime.value.channel.session.recordInboundSession(...a),
 }));
-
-vi.mock("./sdk-compat.js", () => ({
-  coreAtLeast: () => true,
-}));
-
 
 // Step-progress: default mode "off" keeps the existing (reactions/plain) paths;
 // individual tests flip resolveChannelPreviewStreamMode to "progress".
@@ -234,8 +226,9 @@ vi.mock("openclaw/plugin-sdk/channel-message", () => ({
 }));
 
 vi.mock("./progress-draft.js", () => ({
-  // Резолвер метки живёт в том же модуле — в моке отдаём настоящий разбор
-  // конфига, иначе тест не проверит, что метка вообще берётся из настроек.
+  // The label resolver lives in the same module — the mock keeps the real config
+  // parsing, otherwise the test would never check that the label comes from
+  // settings at all.
   resolveVkProgressLabel: (cfg: any) => {
     const label = cfg?.channels?.vk?.streaming?.progress?.label;
     return typeof label === "string" && label.trim() ? label.trim() : undefined;
@@ -296,8 +289,8 @@ function baseCfg(vkOverrides: Record<string, unknown> = {}): CoreConfig {
 function installRuntime(opts: Parameters<typeof makeVkRuntime>[0] = {}) {
   const runtime = makeVkRuntime(opts);
   setVkRuntime(runtime);
-  // Канонические подпути SDK замоканы на шпионов этого же рантайма — так
-  // существующие проверки «ядро вызвано с тем-то» продолжают работать.
+  // Canonical SDK subpaths are mocked onto spies of this same runtime, so the
+  // existing "the core was called with X" assertions keep working.
   currentRuntime.value = runtime;
   return runtime;
 }
@@ -1622,11 +1615,11 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
   });
 
   it("keeps the draft when the final carries no text but the draft already holds the answer", async () => {
-    // Инцидент 02.09: после переключения на локальную модель текст ответа
-    // приходил блоком по ходу и ложился в черновик, а финал был пустым (только
-    // голосовая). Черновик при этом сносился — и собеседник оставался без
-    // текста вовсе. У облачных моделей финал несёт весь текст, поэтому там
-    // проблема не проявлялась.
+    // Real incident: after switching to a local model the answer text arrived as
+    // a block along the way and landed in the draft, while the final was empty
+    // (voice only). The draft was then deleted and the recipient was left with no
+    // text at all. Cloud models put the whole text in the final, so the problem
+    // never showed up there.
     mockResolveStreamMode.mockReturnValue("progress");
     mockCurrentMessageId.mockReturnValue(4242);
     mockDraftRemove.mockClear();
@@ -1635,9 +1628,9 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.onReplyStart?.();
-        // Ответ приходит блоком и ложится в черновик…
+        // The answer arrives as a block and lands in the draft…
         await dispatcherOptions.deliver({ text: "вот полный ответ" }, { kind: "block" });
-        // …а финал несёт только голосовую, без текста.
+        // …while the final carries only the voice message, no text.
         await dispatcherOptions.deliver(
           { text: "", mediaUrl: "/tmp/voice.ogg" },
           { kind: "final" },
@@ -1652,7 +1645,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       runtime: createVkRuntimeEnv(),
     });
 
-    // Черновик остаётся: он и есть ответ.
+    // The draft stays: it is the answer.
     expect(mockDraftRemove).not.toHaveBeenCalled();
     mockCurrentMessageId.mockReturnValue(undefined);
   });
@@ -1778,8 +1771,8 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       runtime: createVkRuntimeEnv(),
     });
 
-    // Картинку в черновик не положишь, поэтому такой кусок уходит отдельным
-    // сообщением — метка нужна, чтобы он не выглядел готовым ответом.
+    // A picture cannot go into the draft, so such a chunk goes as its own
+    // message — the label keeps it from looking like a finished answer.
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({
@@ -1811,7 +1804,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       runtime: createVkRuntimeEnv(),
     });
 
-    // Черновик с ходом работы переписывается текстом ответа…
+    // The progress draft is rewritten with the answer text…
     expect(mockEditMessageVk).toHaveBeenCalledWith(
       String(SENDER_ID),
       555,
@@ -1819,7 +1812,236 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       expect.anything(),
       expect.anything(),
     );
-    // …а картинка/голосовое уходит следом отдельным сообщением.
+    // …and the image or voice message follows as a separate message.
     expect(mockSendPayloadVk).toHaveBeenCalled();
+  });
+});
+
+// ── Status reaction lifecycle ────────────────────────────────────────────────
+
+describe("status reaction lifecycle", () => {
+  async function installStatusController(overrides: Record<string, unknown> = {}) {
+    const { createStatusReactionController } = await import(
+      "openclaw/plugin-sdk/channel-feedback"
+    );
+    const controller = {
+      setQueued: vi.fn().mockResolvedValue(undefined),
+      setThinking: vi.fn().mockResolvedValue(undefined),
+      setTool: vi.fn().mockResolvedValue(undefined),
+      setCompacting: vi.fn().mockResolvedValue(undefined),
+      setDone: vi.fn().mockResolvedValue(undefined),
+      setError: vi.fn().mockResolvedValue(undefined),
+      cancelPending: vi.fn(),
+      clear: vi.fn().mockResolvedValue(undefined),
+      restoreInitial: vi.fn().mockResolvedValue(undefined),
+      ...overrides,
+    };
+    vi.mocked(createStatusReactionController).mockReturnValueOnce(controller as never);
+    return controller;
+  }
+
+  function statusReactionConfig(overrides: Record<string, unknown> = {}): CoreConfig {
+    return {
+      ...baseCfg(),
+      messages: {
+        ackReactionScope: "direct",
+        statusReactions: {
+          enabled: true,
+          emojis: { thinking: "🤔" },
+          timing: { debounceMs: 0 },
+        },
+        ...overrides,
+      },
+    } as unknown as CoreConfig;
+  }
+
+  it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
+    const controller = await installStatusController();
+    const runtime = installRuntime();
+    const statusSink = vi.fn();
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        expect(replyOptions).toEqual(
+          expect.objectContaining({
+            suppressDefaultToolProgressMessages: true,
+            allowProgressCallbacksWhenSourceDeliverySuppressed: true,
+          }),
+        );
+        await dispatcherOptions.onReplyStart();
+        await replyOptions.onReasoningStream();
+        await replyOptions.onToolStart({ name: "web_search" });
+        await replyOptions.onCompactionStart();
+        await replyOptions.onCompactionEnd();
+        await dispatcherOptions.deliver("invalid core payload", { kind: "partial" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        conversationMessageId: 42,
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: statusReactionConfig(),
+      runtime: createVkRuntimeEnv(),
+      statusSink,
+    });
+
+    expect(runtime.channel.reactions.shouldAckReaction).toHaveBeenCalledWith({
+      scope: "direct",
+      isDirect: true,
+      isGroup: false,
+      isMentionableGroup: false,
+      requireMention: false,
+      canDetectMention: true,
+      effectiveWasMentioned: false,
+    });
+    expect(controller.setQueued).toHaveBeenCalledOnce();
+    expect(controller.setThinking).toHaveBeenCalledTimes(3);
+    expect(controller.setTool).toHaveBeenCalledWith("web_search");
+    expect(controller.setCompacting).toHaveBeenCalledOnce();
+    expect(controller.cancelPending).toHaveBeenCalledOnce();
+    expect(controller.setDone).toHaveBeenCalledOnce();
+    expect(controller.setError).not.toHaveBeenCalled();
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(String(SENDER_ID), {}, {
+      accountId: "default",
+    });
+    expect(statusSink).toHaveBeenCalledWith({ lastOutboundAt: expect.any(Number) });
+  });
+
+  it("reports dispatch and reaction cleanup failures while preserving the dispatch error", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = await installStatusController({
+        setError: vi.fn().mockRejectedValue(new Error("final reaction failed")),
+        clear: vi.fn().mockRejectedValue(new Error("clear reaction failed")),
+      });
+      const runtime = installRuntime();
+      const runtimeEnv = createVkRuntimeEnv();
+      const logSpy = vi.spyOn(runtimeEnv, "log").mockImplementation(() => {});
+      const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
+      vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+        async ({ dispatcherOptions }: any) => {
+          dispatcherOptions.onError(new Error("delivery failed"), { kind: "final" });
+          throw new Error("dispatch failed");
+        },
+      );
+
+      await expect(
+        handleVkInbound({
+          message: makeMessage({
+            senderId: SENDER_ID,
+            peerId: SENDER_ID,
+            conversationMessageId: 43,
+          }),
+          account: makeAccount({ config: { dmPolicy: "open" } }),
+          config: statusReactionConfig({ removeAckAfterReply: true }),
+          runtime: runtimeEnv,
+        }),
+      ).rejects.toThrow("dispatch failed");
+
+      expect(errorSpy).toHaveBeenCalledWith("vk final reply failed: Error: delivery failed");
+      expect(controller.setError).toHaveBeenCalledOnce();
+      expect(controller.setDone).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(
+        "vk: status-reaction finalize failed: Error: final reaction failed",
+      );
+      expect(controller.clear).not.toHaveBeenCalled();
+
+      await vi.runAllTimersAsync();
+
+      expect(controller.clear).toHaveBeenCalledOnce();
+      expect(logSpy).toHaveBeenCalledWith(
+        "vk: status-reaction clear failed: Error: clear reaction failed",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("logs session metadata persistence errors and still dispatches the message", async () => {
+    const runtime = installRuntime();
+    const runtimeEnv = createVkRuntimeEnv();
+    const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
+    vi.mocked(runtime.channel.session.recordInboundSession).mockImplementation(
+      async ({ onRecordError }: any) => {
+        onRecordError(new Error("session store unavailable"));
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: runtimeEnv,
+    });
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "vk: failed updating session meta: Error: session store unavailable",
+    );
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
+  });
+
+  it("does not report outbound activity when VK returns no send result", async () => {
+    const runtime = installRuntime({
+      upsertPairingRequest: vi.fn().mockResolvedValue({ code: "PAIR00", created: true }),
+    });
+    const statusSink = vi.fn();
+    mockSendPayloadVk.mockResolvedValueOnce(undefined as never);
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "pairing", allowFrom: [] } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+      statusSink,
+    });
+
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      { text: "pairing-reply-text" },
+      { accountId: "default" },
+    );
+    expect(statusSink).toHaveBeenCalledTimes(1);
+    expect(statusSink).toHaveBeenCalledWith({ lastInboundAt: 1_700_000_000_000 });
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+  });
+
+  it("labels unsupported attachment kinds as unknown in the agent media context", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "shared link",
+        attachments: [
+          {
+            type: "link",
+            kind: "link",
+            url: "https://example.com/article",
+            title: "Article",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(runtime.channel.reply.finalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        media: [
+          expect.objectContaining({
+            url: "https://example.com/article",
+            fileName: "Article",
+            kind: "unknown",
+          }),
+        ],
+      }),
+    );
   });
 });

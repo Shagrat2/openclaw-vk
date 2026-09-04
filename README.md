@@ -27,22 +27,35 @@
 ```
 
 ```bash
-openclaw plugins install @openclaw-vk/vk
+# OpenClaw 2026.8.2 requires explicit trust and capability consent
+openclaw plugins install @openclaw-vk/vk --force --accept-capabilities
+openclaw plugins info vk --json
+```
+
+В OpenClaw 2026.8.2 успешная установка сразу включает плагин, поэтому отдельная
+команда `openclaw plugins enable vk` обычно не нужна. Выполните её только если
+`openclaw plugins info vk --json` явно показывает, что уже установленный плагин
+отключён:
+
+```bash
 openclaw plugins enable vk
 ```
+
+Флаги `--force --accept-capabilities` подтверждают установку внешнего npm-пакета
+и запрошенные им возможности. Используйте их только для пакета, источник которого
+вы проверили.
 
 ### 2.1 Обновление плагина
 
 ```bash
-# Обновить VK-плагин
+# OpenClaw 2026.8.2 обновляет установленный плагин по его id
 openclaw plugins update vk
 
 # Или обновить все плагины
 openclaw plugins update --all
-openclaw plugins update @openclaw-vk/vk@latest
 
 # Установить конкретную версию
-openclaw plugins install @openclaw-vk/vk@2026.8.31
+openclaw plugins install @openclaw-vk/vk@2026.9.2 --force --accept-capabilities
 openclaw gateway restart
 openclaw channels status --json --probe
 ```

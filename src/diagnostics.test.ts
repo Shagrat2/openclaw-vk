@@ -21,8 +21,8 @@ vi.mock("./runtime.js", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
-  // Ядро отдаёт стабильный `sha256:<12 hex>` — здесь важно лишь то, что
-  // значение заменяется и остаётся одинаковым для одного и того же входа.
+  // The core returns a stable `sha256:<12 hex>` — all that matters here is that
+  // the value is replaced and stays the same for the same input.
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
   redactSensitiveText: (text: string) => text.replace(/vk1\.a\.\S+/g, "[REDACTED]"),
 }));
@@ -66,7 +66,7 @@ describe("VK diagnostics levels", () => {
   });
 
   it("keeps a filesystem error from smuggling a path into an off-level log", () => {
-    // Живой случай: ENOENT приносит абсолютный путь прямо в тексте ошибки.
+    // A real case: ENOENT carries an absolute path inside the error text.
     vkDiagFailure(
       "tts continuation failed",
       new Error("ENOENT: no such file or directory, open '/srv/agent/renders/frame.jpg'"),
@@ -142,8 +142,8 @@ describe("VK diagnostics levels", () => {
   });
 
   it("hides identifiers in plain operational log lines too", () => {
-    // Не всё в плагине идёт через vkDiag: «сообщение отброшено политикой» —
-    // рабочее предупреждение, оно видно всегда, но peer id в нём печатать нельзя.
+    // Not everything goes through vkDiag: "message dropped by policy" is an
+    // operational warning, always visible, but its peer id must not be printed.
     process.env.VK_DIAG_LEVEL = "redacted";
     expect(redactVkId(12324712)).not.toContain("12324712");
     expect(redactVkId(undefined)).toBe("-");
@@ -152,14 +152,14 @@ describe("VK diagnostics levels", () => {
   });
 
   it("не пропускает имена мимо редактора ни одним из обходных путей", () => {
-    // Каждый случай найден пробой 03.09 — все просачивались в лог как есть.
+    // Every case here was found by probing — all of them reached the log as is.
     process.env.VK_DIAG_LEVEL = "redacted";
     vkDiag("probe", {
       windows: "C:\\Users\\ivan\\Secret\\frame.jpg",
       bareFile: "frame-024-secret.jpg",
       nested: { path: "/srv/media/secret.jpg", peerId: 12324712 },
-      // peerId числом: проверка идентификаторов раньше стояла после отсечения
-      // нестрок, поэтому числовой id уходил сырым.
+      // peerId as a number: the identifier check used to run after non-strings
+      // were returned early, so a numeric id reached the log raw.
       peerId: 12324712,
       failure: new Error("ENOENT: open '/srv/media/secret.jpg'"),
     });
@@ -171,13 +171,13 @@ describe("VK diagnostics levels", () => {
     expect(rendered).not.toContain("12324712");
     expect(f.peerId).toBe("sha256:8");
     expect((f.nested as Record<string, unknown>).peerId).toBe("sha256:8");
-    // Сообщение ошибки сохраняется — терялось как `{}`.
+    // The error message survives — it used to be lost as `{}`.
     expect(String(f.failure)).toContain("ENOENT");
   });
 
   it("не падает на циклическом МАССИВЕ", () => {
-    // Ограничитель глубины стоял только в ветке объектов, поэтому массив,
-    // ссылающийся сам на себя, уходил в бесконечную рекурсию и ронял отправку.
+    // The depth guard was only in the object branch, so a self-referencing
+    // array recursed forever and took the send down.
     process.env.VK_DIAG_LEVEL = "full";
     const arr: unknown[] = ["x"];
     arr.push(arr);
@@ -185,7 +185,7 @@ describe("VK diagnostics levels", () => {
   });
 
   it("не падает на циклической ссылке в поле", () => {
-    // JSON.stringify стоит на пути отправки: исключение здесь уронило бы ответ.
+    // JSON.stringify sits on the send path: an exception here would drop the reply.
     process.env.VK_DIAG_LEVEL = "full";
     process.env.VK_VOICE_DEBUG_LOG = "/dev/null";
     const cyclic: Record<string, unknown> = { name: "x" };

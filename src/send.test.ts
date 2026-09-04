@@ -37,8 +37,8 @@ import { makeAccount } from "./test-helpers.js";
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
-  // Ядро сериализует задачи по ключу; здесь та же семантика в трёх строках,
-  // чтобы тесты видели реальный порядок, а не заглушку-проходную.
+  // The core serializes tasks by key; this is the same semantics in three lines,
+  // so the tests observe real ordering instead of a pass-through stub.
   enqueueKeyedTask: async <T,>({
     tails,
     key,
@@ -87,7 +87,7 @@ const mockGetVkRuntime = vi.hoisted(() =>
     channel: {
       activity: { record: vi.fn() },
     },
-    config: { loadConfig: vi.fn().mockReturnValue({}) },
+    config: { current: vi.fn().mockReturnValue({}) },
     logging: {
       shouldLogVerbose: vi.fn().mockReturnValue(false),
       getChildLogger: vi.fn().mockReturnValue(mockUploadLogger),
@@ -540,8 +540,8 @@ describe("sendPhotoVk", () => {
       sendPhotoVk("456", Buffer.from("b"), undefined, { cfg }),
     ];
 
-    // Обе отправки уже запущены, но до upload-сервера дошла ровно одна: вторая
-    // ждёт очереди. Без неё здесь было бы два шлюза сразу.
+    // Both sends have started, but exactly one reached the upload server: the
+    // second is queued. Without the queue there would be two at once.
     await vi.waitFor(() => expect(gates.length).toBe(1));
     gates[0]?.();
     await vi.waitFor(() => expect(gates.length).toBe(2));
@@ -553,9 +553,9 @@ describe("sendPhotoVk", () => {
   });
 
   it("retries a local photo on transient «photo is undefined» instead of falling back to a document", async () => {
-    // Живой случай 02.09: кадр на 177 КБ отвалился с attempt=1, и вместо
-    // картинки собеседник получил серую плашку «JPG · 173 KB» — откат в
-    // документ сработал на отказе, который проходит с повтора.
+    // A real case: a 177 KB frame failed on attempt 1 and the recipient got a
+    // grey "JPG · 173 KB" card instead of the picture — the document fallback
+    // fired on a failure that a retry gets through.
     const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-photo-"));
     const filePath = join(tempDir, "frame.jpg");
     await writeFile(filePath, "jpeg-bytes");
@@ -594,7 +594,7 @@ describe("sendPhotoVk", () => {
       "vk upload failed",
       expect.objectContaining({ kind: "photo", code: 100, bytes: 3 }),
     );
-    // Содержимое вложения не пишется никогда — Buffer превращается в вид источника.
+    // Attachment content is never logged — a Buffer becomes the source kind.
     const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
     expect((meta as { source?: unknown })?.source).toBe("buffer");
   });
@@ -709,8 +709,9 @@ describe("sendAudioMessageVk", () => {
       cfg,
     });
 
-    // Сервер загрузки берётся отдельным запросом (у него свой узкий повтор),
-    // и передача идёт по готовому uploadUrl — vk-io за сервером уже не ходит.
+    // The upload server is fetched by a separate request (with its own narrow
+    // retry) and the transfer uses the ready uploadUrl — vk-io no longer goes
+    // for the server itself.
     expect(mockGetMessagesUploadServer).toHaveBeenCalledWith({
       type: "audio_message",
       peer_id: 456,
@@ -736,15 +737,15 @@ describe("sendAudioMessageVk", () => {
       }),
     );
     expect(result).toEqual({ messageId: "88", chatId: "456" });
-    // Ссылку скачиваем, чтобы можно было измерить и порезать. Здесь fetch не
-    // отдал тела, поэтому материализация не удалась и нарезка не запускалась —
-    // отправка ушла одним куском, как и раньше.
+    // A URL is downloaded so it can be measured and split. Here fetch returned
+    // no body, so materialization failed and no split ran — the send went as a
+    // single piece, as before.
     expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
   });
 
   it("скачивает удалённое аудио, чтобы длинную запись можно было порезать", async () => {
-    // Раньше ссылка не резалась вовсе: путь материализации отдавал null для
-    // http, и длинная запись уходила одним куском, который VK отвергал.
+    // A URL used not to be split at all: materialization returned null for
+    // http, and a long recording went as one piece, which VK rejected.
     const audio = Buffer.alloc(2048, 7);
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -763,7 +764,7 @@ describe("sendAudioMessageVk", () => {
 
     expect(mockFetch).toHaveBeenCalledWith("https://example.com/long.ogg", expect.anything());
     expect(mockSplitAudioAtSilence).toHaveBeenCalled();
-    // Два куска — две голосовые.
+    // Two segments mean two voice messages.
     expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
   });
 
@@ -782,15 +783,15 @@ describe("sendAudioMessageVk", () => {
       cfg,
     });
 
-    // Скачивание отклонено по объявленному размеру — нарезки не было.
+    // The download was rejected by its declared size — no split happened.
     expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
     delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
   });
 
   it("retries only the upload-server request on a transient code=15", async () => {
-    // Ревью требовало сузить повтор: раньше на код 15 переигрывался весь
-    // конвейер (взять сервер → залить → сохранить), и повтор после удачной
-    // заливки мог создать документ дважды.
+    // Review asked for a narrower retry: code 15 used to replay the whole
+    // pipeline (get server → upload → save), and a retry after a successful
+    // upload could create the document twice.
     const batchedError = Object.assign(new Error("Access denied"), { code: 15 });
     mockGetMessagesUploadServer
       .mockReset()
@@ -807,14 +808,14 @@ describe("sendAudioMessageVk", () => {
     );
 
     expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
-    // Файл заливается ровно один раз — дубля документа быть не может.
+    // The file is uploaded exactly once — no duplicate document is possible.
     expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ messageId: "88", chatId: "456" });
   });
 
   it("берёт свежий upload_url на каждую попытку заливки", async () => {
-    // upload_url у VK одноразовый: повтор multipart по уже использованному
-    // адресу падал бы всегда, и ретрай на «file is undefined» был бы бесполезен.
+    // VK's upload_url is single-use: replaying multipart against a spent address
+    // would always fail, making the "file is undefined" retry pointless.
     const fileUndefined = Object.assign(new Error("file is undefined"), { code: 100 });
     mockGetMessagesUploadServer
       .mockReset()
@@ -840,8 +841,8 @@ describe("sendAudioMessageVk", () => {
   });
 
   it("does not replay the upload when code=15 comes from a later stage", async () => {
-    // Постоянный отказ по правам на самой заливке: повторять нечего, лишние
-    // попытки только оттягивают штатный переход на отправку документом.
+    // A permanent permission failure on the upload itself: nothing to retry, and
+    // extra attempts only delay the normal switch to sending a document.
     const scopeError = Object.assign(
       new Error("Access denied: no access to call this method with current scopes"),
       { code: 15 },
@@ -920,7 +921,7 @@ describe("sendAudioMessageVk", () => {
     });
 
     expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000, {
-      // Длительность уже измерена вызывающим — второй раз ffprobe не гоняем.
+      // The duration was already measured by the caller — no second ffprobe run.
       knownDurationMs: 600_000,
     });
     // Two voice uploads, one per segment.

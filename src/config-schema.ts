@@ -61,12 +61,12 @@ const VkStreamingSchema = z
   .passthrough()
   .optional();
 
-// Диагностика канала (`channels.vk.diagnostics`). Уровень вместо тумблера:
-// "off" молчит, "redacted" пишет ход без имён файлов и ссылок, "full" — всё.
-// Подробности и таблица — в src/diagnostics.ts.
+// Channel diagnostics (`channels.vk.diagnostics`). A level rather than a
+// toggle: "off" is silent, "redacted" logs progress without file names or URLs,
+// "full" logs everything. Details and the table live in src/diagnostics.ts.
 const VkDiagnosticsSchema = z
   .object({
-    // Набор уровней объявлен один раз — в diagnostics.ts, где и разбирается.
+    // The set of levels is declared once, in diagnostics.ts, where it is parsed.
     level: z.enum(VK_DIAG_LEVELS).optional(),
   })
   .strict()

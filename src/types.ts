@@ -1,4 +1,4 @@
-/** Уровни диагностики канала. Разбор и обезличивание — в src/diagnostics.ts. */
+/** Channel diagnostic levels. Parsing and redaction live in src/diagnostics.ts. */
 export const VK_DIAG_LEVELS = ["off", "redacted", "full"] as const;
 export type VkDiagLevel = (typeof VK_DIAG_LEVELS)[number];
 

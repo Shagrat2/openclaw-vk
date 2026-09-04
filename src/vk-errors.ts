@@ -1,14 +1,14 @@
 /**
- * Чтение отказов VK API.
+ * Reading VK API failures.
  *
- * Живёт отдельным модулем, потому что нужно двоим: пути отправки (решить,
- * повторять ли) и диагностике (что написать в лог). Пока это были локальные
- * функции `send.ts`, диагностика доставала код и текст ошибки своими способами —
- * и в ветке голосовых читала только `message`, теряя `description`, где vk-io
- * как раз держит текст отказа по правам.
+ * A module of its own because two callers need it: the send path (to decide
+ * whether to retry) and diagnostics (what to write to the log). While these were
+ * local helpers in `send.ts`, diagnostics extracted the code and message its own
+ * way — and the voice branch read only `message`, losing `description`, which is
+ * exactly where vk-io keeps permission failure text.
  */
 
-/** Код отказа: vk-io кладёт его то в `code`, то в `error_code`. */
+/** Failure code: vk-io puts it either in `code` or in `error_code`. */
 export function readVkErrorCode(error: unknown): number | undefined {
   if (!error || typeof error !== "object") {
     return undefined;
@@ -23,7 +23,7 @@ export function readVkErrorCode(error: unknown): number | undefined {
   return undefined;
 }
 
-/** Текст отказа, склеенный из всех полей, куда его кладут разные слои vk-io. */
+/** Failure text, joined from every field the vk-io layers put it in. */
 export function readVkErrorMessage(error: unknown): string {
   if (!error || typeof error !== "object") {
     return "";

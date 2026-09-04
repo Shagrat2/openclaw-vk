@@ -1,55 +1,43 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
-import { VK } from "vk-io";
-import {
-  createAccountStatusSink,
-  createArmableStallWatchdog,
-  waitUntilAbort,
-} from "openclaw/plugin-sdk/channel-lifecycle";
-import {
-  channelReadyPatch,
-  channelStoppedPatch,
-  createTransportActivityStatusPatch,
-} from "openclaw/plugin-sdk/gateway-runtime";
+import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
+import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gateway-runtime";
 import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
+import { globalAgent } from "node:https";
+import { PollingTransport, VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
-import { instrumentPollingTransport } from "./transport-liveness.js";
-import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
 import { handleVkInbound } from "./inbound.js";
 import {
   extractVkInboundAttachments,
   resolveVkInboundReplyContext,
 } from "./media.js";
-import { getVkRuntime } from "./runtime.js";
-import { coreAtLeast } from "./sdk-compat.js";
+import { redactVkId, resolveVkDiagLevel, vkDiag } from "./diagnostics.js";
+import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
+import { createStallWatchdog } from "./stall-watchdog.js";
 import { primeVkGroupId } from "./send.js";
 import type { CoreConfig, VkInboundMessage } from "./types.js";
 
-// ── Inbound coalescing (debounce) ────────────────────────────────────────────
-// Rapid same-conversation messages are buffered and flushed as ONE combined
-// inbound, the way every other channel (whatsapp/telegram/feishu/msteams/…) uses
-// the core inbound debouncer. VK was the odd one out that dispatched each message
-// immediately. Two wins:
-//   1. A burst of quick messages becomes a single coherent reply instead of N.
-//   2. The debouncer's per-key serialization means core never dispatches two
-//      replies for the same conversation concurrently — which is exactly the
-//      trigger for the core reply-dispatch concurrency bugs (deadlock / #98562
-//      "reply session initialization conflicted"). So this both improves UX and
-//      sidesteps those core bugs, without a strict per-peer promise chain.
-// Coalescing is opt-in: VK_INBOUND_DEBOUNCE_MS defaults to 0, which disables
-// batching but keeps per-peer serialization (via serializeImmediate) — the safe
-// sequential behavior with no added latency. Set it > 0 to enable coalescing.
+const FIRST_LONG_POLL_CHECK_TIMEOUT_MS = 35_000;
+const FIRST_LONG_POLL_CHECK_ERROR = "VK Long Poll transport check failed";
+
+/** Strictly parsed positive integer from the environment. */
+function envInt(name: string, fallback: number): number {
+  return parseStrictPositiveInteger(process.env[name]) ?? fallback;
+}
 
 /**
- * Долгоживущий приём VK: long-poll, разбор входящих и публикация состояния.
+ * How long the transport may stay silent before we treat it as stalled.
  *
- * Перезапуском, бэкоффом и health-мониторингом владеет ядро (2026.8.1+).
- * Плагин лишь сообщает, что видит у своего транспорта, и завершает задачу
- * аккаунта, когда опросы прекратились, — поднимает канал заново гейт.
+ * A long poll waits up to ~25 seconds for an event and then returns, so no
+ * completed request for minutes is an anomaly rather than a quiet chat. The
+ * gateway watches `lastTransportActivityAt` too, but with a half-hour default;
+ * this only makes the same check faster.
  */
+const TRANSPORT_SILENCE_MS = envInt("VK_TRANSPORT_SILENCE_MS", 150_000);
+
 /**
- * Склеивает пачку входящих в одно сообщение: тексты через перевод строки,
- * идентичность — от последнего. Нужна дебаунсеру, когда собеседник шлёт
- * несколько сообщений подряд.
+ * Collapses a burst of inbound messages into one: texts joined by newlines,
+ * identity taken from the last. Used by the debouncer when a person sends
+ * several messages in a row.
  */
 export function combineVkInboundMessages(
   items: VkInboundMessage[],
@@ -68,47 +56,180 @@ export function combineVkInboundMessages(
   return { ...last, text: combinedText };
 }
 
-/** Положительное целое из окружения. Разбор — строгий, из ядра. */
-function envInt(name: string, fallback: number): number {
-  return parseStrictPositiveInteger(process.env[name]) ?? fallback;
+/**
+ * Uses the first real poll as the readiness check, then hands control back to
+ * vk-io's normal retrying fetch loop. This avoids a second preflight consumer
+ * and ensures updates returned by the readiness poll enter the normal
+ * middleware pipeline.
+ */
+class ReadinessPollingTransport extends PollingTransport {
+  private readinessSettled = false;
+  private firstFetchController: AbortController | undefined;
+  private activeFetch: Promise<void> | undefined;
+  private readonly firstSuccessfulPoll: Promise<void>;
+  private resolveFirstSuccessfulPoll!: () => void;
+  private rejectFirstSuccessfulPoll!: (error: Error) => void;
+  private readonly onSuccessfulPoll: () => void;
+
+  constructor(
+    options: ConstructorParameters<typeof PollingTransport>[0],
+    onSuccessfulPoll: () => void,
+  ) {
+    super(options);
+    this.onSuccessfulPoll = onSuccessfulPoll;
+    this.firstSuccessfulPoll = new Promise<void>((resolve, reject) => {
+      this.resolveFirstSuccessfulPoll = resolve;
+      this.rejectFirstSuccessfulPoll = reject;
+    });
+    // The observer is attached after transport bootstrap succeeds. Keep an
+    // immediate failed poll from becoming an unhandled rejection meanwhile.
+    void this.firstSuccessfulPoll.catch(() => {});
+  }
+
+  waitForFirstSuccessfulPoll(timeoutMs = FIRST_LONG_POLL_CHECK_TIMEOUT_MS): Promise<void> {
+    const timeout = setTimeout(() => {
+      this.settleReadinessFailure();
+      this.firstFetchController?.abort();
+    }, timeoutMs);
+    return this.firstSuccessfulPoll.finally(() => clearTimeout(timeout));
+  }
+
+  private settleReadinessSuccess(): void {
+    if (this.readinessSettled) {
+      return;
+    }
+    this.readinessSettled = true;
+    this.resolveFirstSuccessfulPoll();
+  }
+
+  private settleReadinessFailure(): void {
+    if (this.readinessSettled) {
+      return;
+    }
+    this.readinessSettled = true;
+    this.rejectFirstSuccessfulPoll(new Error(FIRST_LONG_POLL_CHECK_ERROR));
+  }
+
+  private async fetchReadinessPoll(): Promise<void> {
+    const controller = new AbortController();
+    this.firstFetchController = controller;
+    this.url.searchParams.set("ts", String(this.ts));
+    this.url.searchParams.set("wait", "1");
+    try {
+      const response = await fetch(new URL(this.url), {
+        method: "GET",
+        signal: controller.signal,
+        headers: { connection: "keep-alive" },
+      });
+      if (!response.ok) {
+        throw new Error(FIRST_LONG_POLL_CHECK_ERROR);
+      }
+
+      const result: unknown = await response.json();
+      if (!result || typeof result !== "object") {
+        throw new Error(FIRST_LONG_POLL_CHECK_ERROR);
+      }
+
+      if ("failed" in result) {
+        if (
+          result.failed === 1
+          && (typeof result.ts === "string" || typeof result.ts === "number")
+        ) {
+          this.ts = result.ts;
+          return;
+        }
+        throw new Error(FIRST_LONG_POLL_CHECK_ERROR);
+      }
+
+      if (
+        !("updates" in result)
+        || !Array.isArray(result.updates)
+        || !("ts" in result)
+        || (typeof result.ts !== "string" && typeof result.ts !== "number")
+      ) {
+        throw new Error(FIRST_LONG_POLL_CHECK_ERROR);
+      }
+
+      this.restarted = 0;
+      this.ts = result.ts;
+      if ("pts" in result && (typeof result.pts === "string" || typeof result.pts === "number")) {
+        this.pts = Number(result.pts);
+      }
+      for (const update of result.updates) {
+        this.pollingHandler(update as unknown[]);
+      }
+    } catch {
+      // Fetch errors can include the Long Poll URL/key. Never surface them.
+      throw new Error(FIRST_LONG_POLL_CHECK_ERROR);
+    } finally {
+      // Only the readiness check is shortened. Normal vk-io polling retains
+      // its standard 25-second server wait after the first successful check.
+      this.url.searchParams.set("wait", "25");
+      if (this.firstFetchController === controller) {
+        this.firstFetchController = undefined;
+      }
+    }
+  }
+
+  override async fetchUpdates(): Promise<void> {
+    const isReadinessPoll = !this.readinessSettled;
+    const activeFetch = isReadinessPoll ? this.fetchReadinessPoll() : super.fetchUpdates();
+    this.activeFetch = activeFetch;
+    try {
+      await activeFetch;
+      this.onSuccessfulPoll();
+    } finally {
+      if (this.activeFetch === activeFetch) {
+        this.activeFetch = undefined;
+      }
+    }
+  }
+
+  override async stop(): Promise<void> {
+    this.settleReadinessFailure();
+    this.firstFetchController?.abort();
+    await super.stop();
+  }
+
+  async stopAndDrain(): Promise<void> {
+    const readinessFetch = this.readinessSettled ? undefined : this.activeFetch;
+    await this.stop();
+    // Drain only the abortable readiness request. After ready, preserve
+    // vk-io's normal immediate stop semantics for its 25-second poll.
+    await readinessFetch?.catch(() => {});
+  }
+
+  protected override async startFetchLoop(): Promise<void> {
+    // vk-io recursively invokes this method after post-ready transport errors.
+    // Only the initial invocation is a readiness probe; subsequent invocations
+    // must retain vk-io's normal retry/restart behavior.
+    if (this.readinessSettled) {
+      await super.startFetchLoop();
+      return;
+    }
+
+    try {
+      await this.fetchUpdates();
+      this.settleReadinessSuccess();
+    } catch {
+      this.settleReadinessFailure();
+      return;
+    }
+
+    if (this.started) {
+      await super.startFetchLoop();
+    }
+  }
 }
 
-/**
- * Порог тишины транспорта. Ядро следит за `lastTransportActivityAt` и само, но
- * с дефолтом в полчаса; здесь мы лишь УСКОРЯЕМ ту же проверку. Long poll ждёт
- * события до ~25 с, поэтому 150 с — заведомо аномалия, а не спокойный диалог.
- */
-const TRANSPORT_SILENCE_MS = envInt("VK_LP_SILENCE_MS", 150_000);
-/**
- * Нужна ли per-peer сериализация входящих.
- *
- * Это был обход дедлока ядра при втором сообщении в диалоге; ядро чинит его
- * нативно с 2026.7.1 (fire-and-forget mirror, PR #99549), поэтому на свежем
- * ядре включать её незачем — она стоит параллелизма. На старом ядре она нужна.
- * Явный override: VK_SERIALIZE_INBOUND=true|false.
- */
-export function resolveSerializeInbound(): boolean {
-  const flag = process.env.VK_SERIALIZE_INBOUND;
-  if (flag === "true") {
-    return true;
-  }
-  if (flag === "false") {
-    return false;
-  }
-  return !coreAtLeast(CORE_VERSION_WITH_MIRROR_FIX);
-}
-
-/** Ядро, начиная с которого дедлок mirror-transcript исправлен нативно. */
-const CORE_VERSION_WITH_MIRROR_FIX = "2026.7.1";
-
-// Inbound debounce window (opt-in, default OFF). When > 0, same-conversation
-// messages arriving within this window are buffered and flushed as one combined
-// inbound (coalesced reply). 0 = no batching, just per-peer serialization — the
-// safe default: avoids the concurrent-dispatch deadlock without adding latency.
-// Set VK_INBOUND_DEBOUNCE_MS>0 to enable coalescing (best paired with a core that
-// has the reply-session reentrancy fix, so the flush after a turn can't hit
-// #98562). ~1000-2000ms is a reasonable window for catching a quick follow-up.
-const INBOUND_DEBOUNCE_MS = envInt("VK_INBOUND_DEBOUNCE_MS", 0);
+export type VkMonitorOptions = {
+  token: string;
+  accountId: string;
+  config: CoreConfig;
+  runtime: RuntimeEnv;
+  abortSignal?: AbortSignal;
+  setStatus?: (patch: Omit<ChannelAccountSnapshot, "accountId">) => void;
+};
 
 /**
  * Check whether the Bots Long Poll API is accessible for this token.
@@ -133,13 +254,24 @@ async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: numb
   }
 }
 
+async function waitForAbort(signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await new Promise<void>(() => {});
+    return;
+  }
+  if (signal.aborted) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
 /**
  * Start monitoring VK community messages via Long Poll API.
- * Prefers Bots Long Poll when the token has the `manage` scope; falls back to
- * User Long Poll (messages.getLongPollServer) when only `messages` is available.
- *
- * The poller is supervised: if it stalls (heartbeat frozen) or stops, it is
- * debug-only/silent).
+ * Prefers Bots Long Poll when the token has the `manage` scope;
+ * falls back to User Long Poll (messages.getLongPollServer) when only
+ * the `messages` scope is available.
  */
 export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   const core = getVkRuntime();
@@ -147,63 +279,60 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     cfg: opts.config,
     accountId: opts.accountId,
   });
-  const tag = `[${opts.accountId}]`;
 
-  let stopped = false;
-  const onAbort = () => {
-    stopped = true;
+  const vk = new VK({ token: opts.token, apiLimit: 20 });
+  // Our own stop signal: when the watchdog sees a stalled transport it ends the
+  // account task, and the gateway brings the channel back with its own backoff.
+  const localStop = new AbortController();
+  const stopSignal = opts.abortSignal
+    ? AbortSignal.any([opts.abortSignal, localStop.signal])
+    : localStop.signal;
+  let stopRequested = false;
+  let updatesStarted = false;
+  let stopPromise: Promise<void> | undefined;
+  let pollingTransport: ReadinessPollingTransport | undefined;
+  let publishPollActivity = false;
+
+  const stopUpdates = async (): Promise<void> => {
+    stopRequested = true;
+    if (!updatesStarted || !pollingTransport) {
+      return;
+    }
+    if (!stopPromise) {
+      stopPromise = pollingTransport.stopAndDrain().catch(() => {
+        // ignore stop race/errors on shutdown
+      });
+    }
+    await stopPromise;
   };
-  if (opts.abortSignal?.aborted) {
-    return;
-  }
-  opts.abortSignal?.addEventListener("abort", onAbort, { once: true });
 
-  // One debouncer per monitor — buffers survive vk-io restarts (the `vk` client
-  // is recreated inside the loop; the debouncer is not). Its per-key
-  // serialization is what keeps core from dispatching two same-conversation
-  // replies concurrently.
-  const inboundDebouncer =
-    core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
-      debounceMs: INBOUND_DEBOUNCE_MS,
-      // Per-peer inbound serialization was the workaround for the core
-      // transcript-mirror completion deadlock (the queueDepth>=2 session-lock
-      // hang: stalled_agent_run, phase=running, recovery=none). Core 2026.7.1
-      // fixes that deadlock natively (fire-and-forget mirror, PR #99549 /
-      // b381559), so serialization is no longer needed for the mirror hang and we
-      // default to true concurrency. Escape hatch: set VK_SERIALIZE_INBOUND=true
-      // to force serialization back on if the separate session-init conflict
-      // (#98562) resurfaces on a concurrent second message.
-      // See doc/interrupt-restart-session-lock-hang.md.
-      serializeImmediate: resolveSerializeInbound(),
-      buildKey: (msg) => `${account.accountId}:${msg.peerId}`,
-      // Only merge plain-text messages; ones carrying attachments or a payload
-      // flush on their own (immediately) but are still serialized per peer.
-      shouldDebounce: (msg) =>
-        msg.text.length > 0 &&
-        (msg.attachments?.length ?? 0) === 0 &&
-        msg.messagePayload === undefined,
-      // ⚠️ Контракт onFlush менялся: ядро ≥2026.8.1 передаёт вторым аргументом
-      // фабрику и ждёт назад { admission, completion } — «полоса» освобождается
-      // на admission, пока completion ещё идёт. Старое ядро ждало обычный
-      // промис. Если вернуть промис новому ядру, оно падает на flush.admission,
-      // и сообщение теряется МОЛЧА: канал показывает приём, обработчик не
-      // зовётся, в логе ни строки (31.08 так «умер» VK после апдейта).
-      onFlush: ((items: VkInboundMessage[], createFlush?: unknown) => {
-        vkDiag("inbound flush", { items: items.length, createFlush: typeof createFlush });
-        const dispatch = async () => {
-          try {
-            return await dispatchInner();
-          } catch (err) {
-            opts.runtime.error?.(
-              `vk: dispatch threw: ${err instanceof Error ? `${err.message} | ${err.stack?.split("\n")[1]?.trim() ?? ""}` : String(err)}`,
-            );
-            throw err;
-          }
-        };
-        const dispatchInner = async () => {
-          vkDiag("inbound dispatch start", { items: items.length, stopped });
-        if (stopped) {
-          // Тихий выход здесь означал «сообщение исчезло без следа» — логируем.
+  // Ensure gateway stop triggers VK polling shutdown.
+  opts.abortSignal?.addEventListener("abort", () => {
+    void stopUpdates();
+  }, { once: true });
+
+  // Every other channel (telegram/whatsapp/feishu/…) funnels inbound through
+  // the core debouncer; VK used to dispatch each message on its own. Two wins:
+  //   1. a burst of quick messages becomes one coherent reply instead of N;
+  //   2. per-key serialization means the core never dispatches two replies for
+  //      the same conversation concurrently, which is exactly what triggers its
+  //      reply-dispatch concurrency bugs.
+  // Coalescing is opt-in: VK_INBOUND_DEBOUNCE_MS defaults to 0, which disables
+  // batching while keeping per-peer serialization — sequential, no added latency.
+  const inboundDebouncer = core.channel.debounce.createInboundDebouncer<VkInboundMessage>({
+    debounceMs: envInt("VK_INBOUND_DEBOUNCE_MS", 0),
+    keyOf: (item) => `vk:${opts.accountId}:${item.peerId}`,
+    serializeImmediate: true,
+    // The core hands a flush factory and expects `{ admission, completion }`
+    // back: the lane frees on admission while completion is still running.
+    // Returning a bare promise makes it fail on `flush.admission`, and the
+    // message is lost silently — no handler call, nothing in the log.
+    onFlush: (items, createFlush) => {
+      vkDiag("inbound flush", { items: items.length });
+      const dispatch = async (): Promise<void> => {
+        vkDiag("inbound dispatch start", { items: items.length, stopped: stopRequested });
+        if (stopRequested) {
+          // Returning quietly here used to read as "the message vanished".
           opts.runtime.log?.("vk: dispatch skipped (monitor stopped)");
           return;
         }
@@ -213,7 +342,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
           return;
         }
         try {
-          const currentCfg = core.config.current() as CoreConfig;
+          const currentCfg = readVkRuntimeConfig(core);
           const currentAccount = resolveVkAccount({
             cfg: currentCfg,
             accountId: account.accountId,
@@ -223,7 +352,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             account: currentAccount,
             config: currentCfg,
             runtime: opts.runtime,
-            // Остановка гейта доходит до внешних процессов отправки (ffmpeg).
+            // A gateway stop must reach external send processes (ffmpeg).
             abortSignal: opts.abortSignal,
           });
         } catch (err) {
@@ -232,248 +361,236 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             `vk: message handler error for peerId=${redactVkId(message.peerId)}: ${errorMessage}`,
           );
         }
-        };
-        // Новое ядро: отдаём ему пару admission/completion. Старое: обычный промис.
-        if (typeof createFlush === "function") {
-          return (createFlush as (p: { dispatch: () => Promise<void> }) => unknown)({
-            dispatch,
-          });
-        }
-        return dispatch();
-      }) as never,
-      onError: (err) => {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        opts.runtime.error?.(`vk: inbound debouncer error: ${errorMessage}`);
+      };
+      return createFlush({ dispatch });
+    },
+    onError: (err) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      opts.runtime.error?.(`vk: inbound debouncer error: ${errorMessage}`);
+    },
+  });
+
+  // A probe on ALL updates: it shows whether events reach the plugin at all.
+  // Without it "the channel is silent" is indistinguishable from "VK sends
+  // nothing", and those are different faults. The middleware is installed only
+  // when diagnostics are on — at `off` it would be dead weight on every update.
+  if (resolveVkDiagLevel() !== "off") {
+    vk.updates.use(async (context: { type?: string; subTypes?: string[] }, next: () => Promise<void>) => {
+      vkDiag("update", {
+        type: context?.type ?? "?",
+        sub: (context?.subTypes ?? []).join(","),
+      });
+      await next();
+    });
+  }
+
+  // Ingestion self-test (VK_SELFTEST=<peerId>): pushes a synthetic inbound
+  // through the same debouncer live messages use. Needed because a broken
+  // receive path cannot be reproduced from outside — only a human can send the
+  // bot a message, and "channel running" proves nothing.
+  const selftestPeer = Number(process.env.VK_SELFTEST ?? "");
+  if (Number.isFinite(selftestPeer) && selftestPeer > 0) {
+    setTimeout(() => {
+      const probe: VkInboundMessage = {
+        // The id must be a valid int32 AND exist in the conversation: VK puts
+        // it into reply_to. A synthetic one only gets in the way, so take it
+        // from VK_SELFTEST_MSGID, or send without a reply (0).
+        messageId: process.env.VK_SELFTEST_MSGID ?? "0",
+        peerId: selftestPeer,
+        senderId: selftestPeer,
+        text: process.env.VK_SELFTEST_TEXT ?? "channel self-test",
+        timestamp: Date.now(),
+        isGroup: false,
+        attachments: [],
+      };
+      opts.runtime.log?.(`vk: selftest enqueue peer=${redactVkId(selftestPeer)}`);
+      void inboundDebouncer
+        .enqueue(probe)
+        .then(() => opts.runtime.log?.("vk: selftest enqueued ok"))
+        .catch((err: unknown) =>
+          opts.runtime.error?.(`vk: selftest enqueue failed: ${String(err)}`),
+        );
+    }, 8000);
+  }
+
+  // Register message handler
+  vk.updates.on("message_new", async (context) => {
+    // A probe at the very entrance: without it "the channel receives but does
+    // not answer" is indistinguishable from "no event arrived at all", and
+    // those are different faults with different fixes.
+    vkDiag("inbound event", {
+      // `messageId`, not `id`: identifier fields are redacted by name, and a
+      // raw VK message id under the name `id` would reach the log unmasked.
+      messageId: context.id,
+      peerId: context.peerId,
+      outbox: context.isOutbox,
+      len: (context.text ?? "").length,
+    });
+    if (stopRequested) {
+      return;
+    }
+
+    // Skip outgoing messages
+    if (context.isOutbox) {
+      return;
+    }
+
+    const peerId = context.peerId;
+    const senderId = context.senderId;
+    const text = context.text ?? "";
+    const isGroup = peerId >= 2_000_000_000;
+    const attachments = extractVkInboundAttachments(context.attachments);
+    const replyContext = resolveVkInboundReplyContext(context.replyMessage);
+    const createdAtSeconds =
+      typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
+        ? context.createdAt
+        : undefined;
+
+    const message: VkInboundMessage = {
+      messageId: String(context.id),
+      conversationMessageId:
+        typeof context.conversationMessageId === "number" && Number.isFinite(context.conversationMessageId)
+          ? context.conversationMessageId
+          : undefined,
+      peerId,
+      senderId,
+      text,
+      timestamp: createdAtSeconds ? createdAtSeconds * 1000 : Date.now(),
+      isGroup,
+      messagePayload: context.messagePayload,
+      attachments,
+      replyToMessageId: replyContext.replyToMessageId,
+      replyToText: replyContext.replyToText,
+    };
+
+    core.channel.activity.record({
+      channel: "vk",
+      accountId: account.accountId,
+      direction: "inbound",
+      at: message.timestamp,
+    });
+    opts.setStatus?.({ lastEventAt: Date.now() });
+
+    // Hand off to the debouncer: it buffers a burst and serializes per peer,
+    // then calls handleVkInbound once via onFlush, which owns error handling —
+    // so one bad turn never breaks ingestion.
+    try {
+      await inboundDebouncer.enqueue(message);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      opts.runtime.error?.(
+        `vk: inbound enqueue error for peerId=${redactVkId(peerId)}: ${errorMessage}`,
+      );
+    }
+  });
+
+  try {
+    // Detect whether Bots LP is available; fall back to User LP otherwise
+    const botsLp = await canUseBotsLongPoll(vk);
+    if (stopRequested || opts.abortSignal?.aborted) {
+      return;
+    }
+    if (botsLp.groupId !== undefined) {
+      primeVkGroupId(opts.token, botsLp.groupId);
+    }
+    const useBotsLongPoll = botsLp.ok && botsLp.groupId !== undefined;
+    // The only honest liveness signal is "a poll request came back". The cursor
+    // is not one: it moves on EVENTS, so it sits still for hours on a quiet
+    // channel; and `isStarted` stays true on a wedged transport.
+    const stallWatchdog = createStallWatchdog({
+      label: `vk:${opts.accountId} long-poll`,
+      timeoutMs: TRANSPORT_SILENCE_MS,
+      abortSignal: stopSignal,
+      runtime: opts.runtime,
+      onTimeout: ({ idleMs }) => {
+        const silentSec = Math.round(idleMs / 1000);
+        opts.setStatus?.(
+          channelStoppedPatch({
+            lastError: `no completed long-poll request for ${silentSec}s`,
+            lastDisconnect: {
+              at: Date.now(),
+              error: `long poll silent for ${silentSec}s`,
+            },
+          }),
+        );
+        opts.runtime.log?.(
+          `[${opts.accountId}] long poll silent for ${silentSec}s — handing restart to the gateway`,
+        );
+        localStop.abort();
       },
     });
 
-  try {
-    {
-      const vk = new VK({ token: opts.token, apiLimit: 20 });
-      // Свой сигнал остановки: сторож тишины завершает задачу аккаунта, и
-      // ядро поднимает канал заново со своим бэкоффом.
-      const localStop = new AbortController();
-      const stopSignal = opts.abortSignal
-        ? AbortSignal.any([opts.abortSignal, localStop.signal])
-        : localStop.signal;
-      const publishStatus = opts.setStatus
-        ? createAccountStatusSink({ accountId: opts.accountId, setStatus: opts.setStatus })
-        : undefined;
-
-      // Датчик на ВСЕ апдейты: показывает, доходят ли до плагина события
-      // вообще. Без него «канал молчит» неотличимо от «VK не присылает
-      // апдейты», а это разные поломки с разным лечением. Промежуточный слой
-      // ставим только когда диагностика включена — на `off` он не нужен.
-      if (resolveVkDiagLevel() !== "off") {
-        vk.updates.use(async (context: { type?: string; subTypes?: string[] }, next: () => Promise<void>) => {
-          vkDiag("update", {
-            type: context?.type ?? "?",
-            sub: (context?.subTypes ?? []).join(","),
-          });
-          await next();
-        });
-      }
-
-      // Самопроверка цепочки (VK_SELFTEST=<peerId>): прогоняем синтетическое
-      // входящее через тот же дебаунсер, что и живые сообщения. Нужна потому,
-      // что поломку приёма нельзя воспроизвести снаружи — сообщение боту может
-      // отправить только человек, а «канал running» ничего не доказывает.
-      const selftestPeer = Number(process.env.VK_SELFTEST ?? "");
-      if (Number.isFinite(selftestPeer) && selftestPeer > 0) {
-        setTimeout(() => {
-          const probe: VkInboundMessage = {
-            // ⚠️ id должен быть валидным int32 И существовать в диалоге: VK
-            // кладёт его в reply_to. Синтетика тут только мешает — берём id из
-            // VK_SELFTEST_MSGID, а без него шлём без ответа-реплая (0).
-            messageId: process.env.VK_SELFTEST_MSGID ?? "0",
-            peerId: selftestPeer,
-            senderId: selftestPeer,
-            text: process.env.VK_SELFTEST_TEXT ?? "селф-тест канала",
-            timestamp: Date.now(),
-            isGroup: false,
-            attachments: [],
-          };
-          opts.runtime.log?.(`vk: selftest enqueue peer=${redactVkId(selftestPeer)}`);
-          void inboundDebouncer
-            .enqueue(probe)
-            .then(() => opts.runtime.log?.("vk: selftest enqueued ok"))
-            .catch((err: unknown) =>
-              opts.runtime.error?.(`vk: selftest enqueue failed: ${String(err)}`),
-            );
-        }, 8000);
-      }
-
-      vk.updates.on("message_new", async (context) => {
-        // Датчик на самом входе: без него «канал принимает, но не отвечает»
-        // неотличимо от «событие вообще не пришло» — а это разные поломки.
-        vkDiag("inbound event", {
-          // Именно `messageId`, а не `id`: обезличиваются поля из списка
-          // IDENTIFIER_FIELDS, и под именем `id` сырой VK message id уходил в лог.
-          messageId: context.id,
-          peerId: context.peerId,
-          outbox: context.isOutbox,
-          len: (context.text ?? "").length,
-        });
-        if (stopped) {
-          return;
+    pollingTransport = new ReadinessPollingTransport(
+      {
+        api: vk.api,
+        agent: globalAgent,
+        pollingWait: 3_000,
+        pollingRetryLimit: 3,
+        ...(useBotsLongPoll ? { pollingGroupId: botsLp.groupId } : {}),
+      },
+      () => {
+        stallWatchdog.touch();
+        if (publishPollActivity) {
+          opts.setStatus?.({ lastTransportActivityAt: Date.now() });
         }
-        // Skip outgoing messages
-        if (context.isOutbox) {
-          return;
-        }
+      },
+    );
+    pollingTransport.subscribe((update) =>
+      useBotsLongPoll
+        ? vk.updates.handleWebhookUpdate(update as unknown as Record<string, unknown>)
+        : vk.updates.handlePollingUpdate(update),
+    );
 
-        const peerId = context.peerId;
-        const senderId = context.senderId;
-        const text = context.text ?? "";
-        const isGroup = peerId >= 2_000_000_000;
-        const attachments = extractVkInboundAttachments(context.attachments);
-        const replyContext = resolveVkInboundReplyContext(context.replyMessage);
-        const createdAtSeconds =
-          typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
-            ? context.createdAt
-            : undefined;
-
-        const message: VkInboundMessage = {
-          messageId: String(context.id),
-          conversationMessageId:
-            typeof context.conversationMessageId === "number" && Number.isFinite(context.conversationMessageId)
-              ? context.conversationMessageId
-              : undefined,
-          peerId,
-          senderId,
-          text,
-          timestamp: createdAtSeconds ? createdAtSeconds * 1000 : Date.now(),
-          isGroup,
-          messagePayload: context.messagePayload,
-          attachments,
-          replyToMessageId: replyContext.replyToMessageId,
-          replyToText: replyContext.replyToText,
-        };
-
-        core.channel.activity.record({
-          channel: "vk",
-          accountId: account.accountId,
-          direction: "inbound",
-          at: message.timestamp,
-        });
-
-        // Hand off to the debouncer: it buffers/merges a burst and serializes
-        // per peer, then calls handleVkInbound once via onFlush. onFlush owns
-        // error handling, so a bad turn never breaks ingestion.
-        try {
-          await inboundDebouncer.enqueue(message);
-        } catch (err) {
-          const errorMessage = err instanceof Error ? err.message : String(err);
-          opts.runtime.error?.(
-            `vk: inbound enqueue error for peerId=${redactVkId(peerId)}: ${errorMessage}`,
-          );
-        }
-      });
-
-      let groupId: number | undefined;
-      const stopVk = async () => {
-        try {
-          await vk.updates.stop();
-        } catch {
-          // ignore stop race/errors on shutdown/restart
-        }
-      };
-
-      try {
-        // Detect whether Bots LP is available; fall back to User LP otherwise.
-        const botsLp = await canUseBotsLongPoll(vk);
-        groupId = botsLp.groupId;
-        if (groupId !== undefined) {
-          primeVkGroupId(opts.token, groupId);
-        }
-        if (botsLp.ok && groupId !== undefined) {
-          opts.runtime.log?.(`${tag} using Bots Long Poll (group ${groupId})`);
-          await vk.updates.start();
-        } else {
-          opts.runtime.log?.(
-            `${tag} Bots Long Poll unavailable, falling back to User Long Poll`,
-          );
-          await vk.updates.startPolling();
-        }
-
-        // ── Живость транспорта вместо своего сторожа ───────────────────
-        // Ядро с 2026.8.1 владеет перезапуском и бэкоффом, поэтому плагин
-        // больше не перезапускается сам: он публикует состояние и завершает
-        // задачу аккаунта, если long-poll залип.
-        //
-        // Честный признак живости один — HTTP-запрос за обновлениями вернулся.
-        // Курсор для этого не годится: он двигается по СОБЫТИЯМ, поэтому на
-        // тихом канале стоит часами, а `isStarted` остаётся true на залипшем
-        // транспорте. Проба токена подтверждает лишь, что жив обычный API.
-        //
-        // ⚠️ Инструментировать можно только ПОСЛЕ старта: `updates.start()`
-        // пересоздаёт транспорт, и обёртка, поставленная раньше, легла бы на
-        // выброшенный объект.
-        const stallWatchdog = createArmableStallWatchdog({
-          label: `vk:${opts.accountId} long-poll`,
-          timeoutMs: TRANSPORT_SILENCE_MS,
-          abortSignal: stopSignal,
-          runtime: opts.runtime,
-          onTimeout: ({ idleMs }) => {
-            const silentSec = Math.round(idleMs / 1000);
-            const reason = `no completed long-poll request for ${silentSec}s`;
-            publishStatus?.(
-              channelStoppedPatch({
-                lastError: `no completed long-poll request for ${silentSec}s`,
-                lastDisconnect: {
-                  at: Date.now(),
-                  error: `long poll silent for ${silentSec}s`,
-                },
-              }),
-            );
-            opts.runtime.log(
-              `${tag} long poll silent for ${silentSec}s — handing restart to the gateway`,
-            );
-            localStop.abort();
-          },
-        });
-
-        const instrumented = instrumentPollingTransport(vk.updates, () => {
-          stallWatchdog.touch();
-          publishStatus?.(createTransportActivityStatusPatch());
-        });
-
-        const startedAt = Date.now();
-        publishStatus?.(
-          channelReadyPatch({
-            lastConnectedAt: startedAt,
-            ...createTransportActivityStatusPatch(startedAt),
-            mode: "longpoll",
-          }),
-        );
-
-        if (instrumented) {
-          stallWatchdog.arm();
-        } else {
-          // Снять сигнал не вышло — говорим вслух, вместо того чтобы делать
-          // вид, что канал под наблюдением. Ядро заметит застой по своему
-          // порогу, просто позже.
-          opts.runtime.log(
-            `${tag} poll instrumentation unavailable — transport liveness will not be reported`,
-          );
-        }
-
-        await waitUntilAbort(stopSignal);
-      } catch (err) {
-        // Ошибку публикуем и выходим: перезапуском владеет ядро.
-        const msg = err instanceof Error ? err.message : String(err);
-        publishStatus?.(
-          channelStoppedPatch({
-            lastError: msg,
-            lastDisconnect: { at: Date.now(), error: msg },
-          }),
-        );
-        opts.runtime.log(`${tag} VK long-poll failed — handing restart to the gateway: ${msg}`);
-      } finally {
-        await stopVk();
-      }
+    if (useBotsLongPoll) {
+      opts.runtime.log?.(`[${opts.accountId}] using Bots Long Poll (group ${botsLp.groupId})`);
+      await pollingTransport.start();
+    } else {
+      opts.runtime.log?.(
+        `[${opts.accountId}] Bots Long Poll unavailable, falling back to User Long Poll`,
+      );
+      await pollingTransport.start();
     }
+    updatesStarted = true;
+
+    // An abort may arrive while vk-io is awaiting its Long Poll server. Stop
+    // the newly started transport before publishing a false-ready snapshot.
+    if (stopRequested || opts.abortSignal?.aborted) {
+      await stopUpdates();
+      return;
+    }
+
+    try {
+      await pollingTransport.waitForFirstSuccessfulPoll();
+    } catch (error) {
+      if (stopRequested || opts.abortSignal?.aborted) {
+        return;
+      }
+      throw error;
+    }
+
+    if (stopRequested || opts.abortSignal?.aborted) {
+      await stopUpdates();
+      return;
+    }
+
+    const connectedAt = Date.now();
+    publishPollActivity = true;
+    opts.setStatus?.(
+      channelReadyPatch({
+        mode: "longpoll",
+        lastConnectedAt: connectedAt,
+        lastTransportActivityAt: connectedAt,
+      }),
+    );
+
+    // Only arm once the transport is proven ready: before that, silence is
+    // expected and would trip the watchdog on every start.
+    stallWatchdog.arm(connectedAt);
+
+    // Keep lifecycle alive until the gateway requests stop, or the watchdog
+    // decides the transport is gone.
+    await waitForAbort(stopSignal);
   } finally {
-    opts.abortSignal?.removeEventListener("abort", onAbort);
+    await stopUpdates();
   }
 }

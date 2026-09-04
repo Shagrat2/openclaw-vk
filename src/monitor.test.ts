@@ -2,63 +2,44 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (for transitive accounts.ts and runtime.ts imports) ────────────
 
-const mockStatusPatches = vi.hoisted(() => [] as unknown[]);
-// Транспорт пересоздаётся на каждый тест: модуль живучести помнит обёрнутые
-// объекты в WeakSet, и переиспользование одного означало бы, что во втором
-// тесте обёртка не ставится.
-const transportHolder = vi.hoisted(() => ({
-  current: { fetchUpdates: vi.fn().mockResolvedValue(undefined) },
-}));
-const mockPollingTransport = vi.hoisted(() => ({
-  fetchUpdates: vi.fn().mockResolvedValue(undefined),
-}));
-const mockWatchdog = vi.hoisted(() => ({
-  arm: vi.fn(),
-  touch: vi.fn(),
-  disarm: vi.fn(),
-}));
-vi.mock("openclaw/plugin-sdk/channel-lifecycle", () => ({
-  createAccountStatusSink:
-    ({ accountId }: { accountId: string }) =>
-    (patch: Record<string, unknown>) =>
-      mockStatusPatches.push({ accountId, ...patch }),
-  createArmableStallWatchdog: vi.fn(() => mockWatchdog),
-  waitUntilAbort: (signal: AbortSignal) =>
-    new Promise<void>((resolve) => {
-      if (signal.aborted) return resolve();
-      signal.addEventListener("abort", () => resolve(), { once: true });
-    }),
-}));
-vi.mock("openclaw/plugin-sdk/gateway-runtime", () => ({
-  channelReadyPatch: (extras: Record<string, unknown> = {}) => ({
-    lifecycle: "ready",
-    ...extras,
-  }),
-  channelStoppedPatch: (extras: Record<string, unknown> = {}) => ({
-    lifecycle: "stopped",
-    ...extras,
-  }),
-  createTransportActivityStatusPatch: (at?: number) => ({
-    lastTransportActivityAt: at ?? Date.now(),
-  }),
-}));
-
-vi.mock("openclaw/plugin-sdk/logging-core", () => ({
-  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
-  redactSensitiveText: (text: string) => text,
-}));
-
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
-  parseStrictPositiveInteger: (v: unknown) => {
-    const n = Number.parseInt(String(v ?? ""), 10);
-    return Number.isFinite(n) && n > 0 ? n : undefined;
+  parseStrictPositiveInteger: (value?: string) => {
+    if (!value || !/^\d+$/.test(value)) return undefined;
+    const parsed = Number.parseInt(value, 10);
+    return parsed > 0 ? parsed : undefined;
   },
+}));
+
+// Diagnostics pull in logging-core; the monitor only needs them to be silent.
+vi.mock("./diagnostics.js", () => ({
+  vkDiag: vi.fn(),
+  vkDiagFailure: vi.fn(),
+  redactVkId: (value: unknown) => String(value),
+  resolveVkDiagLevel: () => "off",
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   normalizeAccountId: (id?: string) => id?.trim() || "default",
+}));
+
+vi.mock("openclaw/plugin-sdk/gateway-runtime", () => ({
+  channelStoppedPatch: (extras: Record<string, unknown> = {}) => ({
+    running: false,
+    connected: false,
+    lifecycle: "stopped",
+    ...extras,
+  }),
+  channelReadyPatch: (extras: Record<string, unknown> = {}) => ({
+    running: true,
+    connected: true,
+    lifecycle: "ready",
+    lastConnectedAt: Date.now(),
+    lastError: null,
+    terminalDisconnect: undefined,
+    ...extras,
+  }),
 }));
 
 vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
@@ -70,33 +51,31 @@ vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
         if (!runtime) throw new Error(errorMsg);
         return runtime;
       },
+      tryGetRuntime: () => runtime,
     };
   },
 }));
 
-import {
-  combineVkInboundMessages,
-  monitorVkProvider,
-  resolveSerializeInbound,
-} from "./monitor.js";
-import { createArmableStallWatchdog } from "openclaw/plugin-sdk/channel-lifecycle";
-import { VK } from "vk-io";
+import { combineVkInboundMessages, monitorVkProvider } from "./monitor.js";
 import { setVkRuntime } from "./runtime.js";
 import {
   createVkRuntimeEnv,
-  makeMessage,
   makeVkRuntime,
 } from "./test-helpers.js";
 import type { CoreConfig } from "./types.js";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
-const mockUpdatesStart = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
-const mockUpdatesStartPolling = vi.hoisted(() =>
-  vi.fn().mockResolvedValue(undefined),
-);
-const mockUpdatesStop = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockPollingTransportOptions = vi.hoisted(() => vi.fn());
+const mockPollingTransportStart = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockPollingTransportStop = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockPollingTransportFetch = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockPollingTransportSubscribe = vi.hoisted(() => vi.fn());
+const mockPollingTransportInstances = vi.hoisted(() => [] as Array<{ fetchUpdates: () => Promise<void> }>);
+const mockFirstLongPollFetch = vi.hoisted(() => vi.fn());
 const mockUpdatesOn = vi.hoisted(() => vi.fn());
+const mockHandleWebhookUpdate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockHandlePollingUpdate = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 const mockGroupsGetById = vi.hoisted(() =>
   vi
@@ -107,30 +86,77 @@ const mockGroupsGetLongPollServer = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ server: "lp.vk.com", key: "abc", ts: 1 }),
 );
 
-vi.mock("vk-io", () => ({
-  // Must use a regular function (not an arrow) so `new VK(...)` works.
-  VK: vi.fn().mockImplementation(function () {
-    return {
-      api: {
-        groups: {
-          getById: mockGroupsGetById,
-          getLongPollServer: mockGroupsGetLongPollServer,
+vi.mock("vk-io", () => {
+  class PollingTransport {
+    started = false;
+    pollingHandler: ((update: unknown[]) => unknown) | undefined;
+    protected ts: string | number = "initial-ts";
+    protected pts = 0;
+    protected restarted = 0;
+    protected url = new URL(
+      "https://lp.vk.test?key=secret-test-key&act=a_check&wait=25",
+    );
+
+    constructor(options: unknown) {
+      mockPollingTransportOptions(options);
+      mockPollingTransportInstances.push(this);
+    }
+
+    async start() {
+      this.started = true;
+      await mockPollingTransportStart();
+      void this.startFetchLoop();
+    }
+
+    async stop() {
+      this.started = false;
+      await mockPollingTransportStop();
+    }
+
+    async fetchUpdates() {
+      this.url.searchParams.set("ts", String(this.ts));
+      await mockPollingTransportFetch(new URL(this.url));
+    }
+
+    subscribe(handler: (update: unknown[]) => unknown) {
+      this.pollingHandler = handler;
+      mockPollingTransportSubscribe(handler);
+    }
+
+    protected async startFetchLoop() {
+      if (!this.started) {
+        return;
+      }
+      try {
+        await this.fetchUpdates();
+      } catch {
+        if (this.started) {
+          void this.startFetchLoop();
+        }
+      }
+    }
+  }
+
+  return {
+    PollingTransport,
+    // Must use a regular function (not an arrow) so `new VK(...)` works.
+    VK: vi.fn().mockImplementation(function () {
+      return {
+        api: {
+          groups: {
+            getById: mockGroupsGetById,
+            getLongPollServer: mockGroupsGetLongPollServer,
+          },
         },
-      },
-      updates: {
-        start: mockUpdatesStart,
-        startPolling: mockUpdatesStartPolling,
-        stop: mockUpdatesStop,
-        on: mockUpdatesOn,
-        use: vi.fn(),
-        // Через него снимается сигнал живости: обёртка вокруг fetchUpdates.
-        get pollingTransport() {
-          return transportHolder.current;
+        updates: {
+          on: mockUpdatesOn,
+          handleWebhookUpdate: mockHandleWebhookUpdate,
+          handlePollingUpdate: mockHandlePollingUpdate,
         },
-      },
-    };
-  }),
-}));
+      };
+    }),
+  };
+});
 
 const mockHandleVkInbound = vi.hoisted(() =>
   vi.fn().mockResolvedValue(undefined),
@@ -140,19 +166,7 @@ vi.mock("./inbound.js", () => ({ handleVkInbound: mockHandleVkInbound }));
 const mockPrimeVkGroupId = vi.hoisted(() => vi.fn());
 vi.mock("./send.js", () => ({ primeVkGroupId: mockPrimeVkGroupId }));
 
-const mockCoreAtLeast = vi.hoisted(() => vi.fn(() => true));
-vi.mock("./sdk-compat.js", () => ({
-  coreAtLeast: mockCoreAtLeast,
-}));
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/** Даёт стартовой части монитора добежать до ожидания сигнала остановки. */
-async function flushMicrotasks(): Promise<void> {
-  for (let i = 0; i < 20; i += 1) {
-    await Promise.resolve();
-  }
-}
 
 function baseCfg(): CoreConfig {
   return { channels: { vk: { token: "test-token" } } };
@@ -210,10 +224,20 @@ function makeCtx(overrides: Record<string, unknown> = {}): Record<string, unknow
 let activeMonitor: { promise: Promise<void>; controller: AbortController } | undefined;
 
 beforeEach(() => {
-  mockUpdatesStart.mockReset().mockResolvedValue(undefined);
-  mockUpdatesStartPolling.mockReset().mockResolvedValue(undefined);
-  mockUpdatesStop.mockReset().mockResolvedValue(undefined);
+  mockPollingTransportOptions.mockReset();
+  mockPollingTransportStart.mockReset().mockResolvedValue(undefined);
+  mockPollingTransportStop.mockReset().mockResolvedValue(undefined);
+  mockPollingTransportFetch.mockReset().mockResolvedValue(undefined);
+  mockPollingTransportSubscribe.mockReset();
+  mockPollingTransportInstances.length = 0;
+  mockFirstLongPollFetch.mockReset().mockResolvedValue({
+    ok: true,
+    json: async () => ({ ts: "next-ts", updates: [] }),
+  });
+  vi.stubGlobal("fetch", mockFirstLongPollFetch);
   mockUpdatesOn.mockReset();
+  mockHandleWebhookUpdate.mockReset().mockResolvedValue(undefined);
+  mockHandlePollingUpdate.mockReset().mockResolvedValue(undefined);
   mockGroupsGetById
     .mockReset()
     .mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
@@ -231,6 +255,7 @@ afterEach(async () => {
     await activeMonitor.promise.catch(() => {});
     activeMonitor = undefined;
   }
+  vi.unstubAllGlobals();
 });
 
 // ── Long Poll mode selection ──────────────────────────────────────────────────
@@ -245,8 +270,14 @@ describe("Long Poll mode selection", () => {
     expect(mockGroupsGetLongPollServer).toHaveBeenCalledWith({
       group_id: 12345678,
     });
-    expect(mockUpdatesStart).toHaveBeenCalledOnce();
-    expect(mockUpdatesStartPolling).not.toHaveBeenCalled();
+    expect(mockPollingTransportOptions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pollingGroupId: 12345678,
+        pollingWait: 3_000,
+        pollingRetryLimit: 3,
+      }),
+    );
+    expect(mockPollingTransportStart).toHaveBeenCalledOnce();
   });
 
   it("falls back to User Long Poll when getLongPollServer throws", async () => {
@@ -258,8 +289,10 @@ describe("Long Poll mode selection", () => {
     await flush();
 
     expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678);
-    expect(mockUpdatesStart).not.toHaveBeenCalled();
-    expect(mockUpdatesStartPolling).toHaveBeenCalledOnce();
+    expect(mockPollingTransportOptions).toHaveBeenCalledWith(
+      expect.not.objectContaining({ pollingGroupId: expect.anything() }),
+    );
+    expect(mockPollingTransportStart).toHaveBeenCalledOnce();
   });
 
   it("falls back to User Long Poll when groups array is empty", async () => {
@@ -268,8 +301,10 @@ describe("Long Poll mode selection", () => {
     activeMonitor = startMonitor();
     await flush();
 
-    expect(mockUpdatesStart).not.toHaveBeenCalled();
-    expect(mockUpdatesStartPolling).toHaveBeenCalledOnce();
+    expect(mockPollingTransportOptions).toHaveBeenCalledWith(
+      expect.not.objectContaining({ pollingGroupId: expect.anything() }),
+    );
+    expect(mockPollingTransportStart).toHaveBeenCalledOnce();
   });
 
   it("falls back to User Long Poll when getById throws", async () => {
@@ -278,23 +313,214 @@ describe("Long Poll mode selection", () => {
     activeMonitor = startMonitor();
     await flush();
 
-    expect(mockUpdatesStart).not.toHaveBeenCalled();
-    expect(mockUpdatesStartPolling).toHaveBeenCalledOnce();
+    expect(mockPollingTransportOptions).toHaveBeenCalledWith(
+      expect.not.objectContaining({ pollingGroupId: expect.anything() }),
+    );
+    expect(mockPollingTransportStart).toHaveBeenCalledOnce();
+  });
+});
+
+// ── Gateway lifecycle status ─────────────────────────────────────────────────
+
+describe("gateway lifecycle status", () => {
+  it("publishes a ready and connected snapshot after the first Long Poll succeeds", async () => {
+    const setStatus = vi.fn();
+
+    activeMonitor = startMonitor({ setStatus });
+    await flush();
+
+    expect(setStatus).toHaveBeenCalledOnce();
+    expect(setStatus).toHaveBeenCalledWith({
+      running: true,
+      connected: true,
+      lifecycle: "ready",
+      lastConnectedAt: expect.any(Number),
+      lastTransportActivityAt: expect.any(Number),
+      lastError: null,
+      terminalDisconnect: undefined,
+      mode: "longpoll",
+    });
+
+    const ready = setStatus.mock.calls[0][0];
+    expect(ready.lastEventAt).toBeUndefined();
+    expect(ready.lastTransportActivityAt).toBe(ready.lastConnectedAt);
+
+    const readinessUrl = mockFirstLongPollFetch.mock.calls[0][0] as URL;
+    const normalPollUrl = mockPollingTransportFetch.mock.calls[0][0] as URL;
+    expect(readinessUrl.searchParams.get("act")).toBe("a_check");
+    expect(readinessUrl.searchParams.get("key")).toBe("secret-test-key");
+    expect(readinessUrl.searchParams.get("ts")).toBe("initial-ts");
+    expect(readinessUrl.searchParams.get("wait")).toBe("1");
+    expect(normalPollUrl.searchParams.get("wait")).toBe("25");
+  });
+
+  it("refreshes transport activity after successful empty polls beyond the stale threshold", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-02T09:00:00Z"));
+    const setStatus = vi.fn();
+
+    activeMonitor = startMonitor({ setStatus });
+    await flush();
+    const connectedAt = setStatus.mock.calls[0][0].lastConnectedAt as number;
+
+    vi.setSystemTime(connectedAt + 31 * 60 * 1000);
+    await mockPollingTransportInstances[0].fetchUpdates();
+
+    expect(setStatus).toHaveBeenLastCalledWith({
+      lastTransportActivityAt: connectedAt + 31 * 60 * 1000,
+    });
+    vi.useRealTimers();
+  });
+
+  it("propagates startup failure without publishing a false-ready snapshot", async () => {
+    const setStatus = vi.fn();
+    mockPollingTransportStart.mockRejectedValueOnce(new Error("Long Poll bootstrap failed"));
+
+    const { promise } = startMonitor({ setStatus });
+
+    await expect(promise).rejects.toThrow("Long Poll bootstrap failed");
+    expect(setStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not publish ready when the first real Long Poll request fails", async () => {
+    const setStatus = vi.fn();
+    mockFirstLongPollFetch.mockRejectedValueOnce(
+      new Error("request failed for https://lp.vk.test?key=secret-long-poll-key"),
+    );
+
+    const { promise } = startMonitor({ setStatus });
+
+    await expect(promise).rejects.toThrow("VK Long Poll transport check failed");
+    expect(setStatus).not.toHaveBeenCalled();
+    expect(mockPollingTransportStop).toHaveBeenCalledOnce();
+    await expect(promise).rejects.not.toThrow("secret-long-poll-key");
+  });
+
+  it("accepts failed=1 as a successful ts refresh before publishing ready", async () => {
+    const setStatus = vi.fn();
+    mockFirstLongPollFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ failed: 1, ts: "refreshed-ts" }),
+    });
+
+    activeMonitor = startMonitor({ setStatus });
+    await flush();
+
+    expect(setStatus).toHaveBeenCalledOnce();
+    const normalPollUrl = mockPollingTransportFetch.mock.calls[0][0] as URL;
+    expect(normalPollUrl.searchParams.get("ts")).toBe("refreshed-ts");
+    expect(normalPollUrl.searchParams.get("wait")).toBe("25");
+  });
+
+  it("dispatches Bots LP updates returned by the readiness poll through VK middleware", async () => {
+    const update = { type: "message_new", group_id: 12345678 };
+    mockFirstLongPollFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ts: "next-ts", updates: [update] }),
+    });
+
+    activeMonitor = startMonitor();
+    await flush();
+
+    expect(mockHandleWebhookUpdate).toHaveBeenCalledWith(update);
+    expect(mockHandlePollingUpdate).not.toHaveBeenCalled();
+  });
+
+  it("dispatches User LP updates returned by the readiness poll through VK middleware", async () => {
+    const update = [4, 99, 0, 123, 1_700_000_000, "message"];
+    mockGroupsGetLongPollServer.mockRejectedValueOnce(new Error("Access denied"));
+    mockFirstLongPollFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ts: "next-ts", updates: [update] }),
+    });
+
+    activeMonitor = startMonitor();
+    await flush();
+
+    expect(mockHandlePollingUpdate).toHaveBeenCalledWith(update);
+    expect(mockHandleWebhookUpdate).not.toHaveBeenCalled();
+  });
+
+  it("retains vk-io retry handling after a post-ready poll failure", async () => {
+    const setStatus = vi.fn();
+    mockPollingTransportFetch
+      .mockRejectedValueOnce(new Error("post-ready transport failure"))
+      .mockResolvedValueOnce(undefined);
+
+    activeMonitor = startMonitor({ setStatus });
+    await flush();
+
+    expect(setStatus).toHaveBeenCalledTimes(2);
+    expect(setStatus).toHaveBeenLastCalledWith({
+      lastTransportActivityAt: expect.any(Number),
+    });
+    expect(mockFirstLongPollFetch).toHaveBeenCalledOnce();
+    expect(mockPollingTransportFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts a hung readiness poll promptly without publishing ready", async () => {
+    const setStatus = vi.fn();
+    let firstPollSignal: AbortSignal | undefined;
+    mockFirstLongPollFetch.mockImplementationOnce(
+      (_url: URL, init: RequestInit) => new Promise((_resolve, reject) => {
+        firstPollSignal = init.signal ?? undefined;
+        firstPollSignal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("The operation was aborted", "AbortError")),
+          { once: true },
+        );
+      }),
+    );
+
+    const { promise, controller } = startMonitor({ setStatus });
+    await flush();
+    expect(firstPollSignal?.aborted).toBe(false);
+
+    controller.abort();
+    await promise;
+
+    expect(firstPollSignal?.aborted).toBe(true);
+    expect(mockPollingTransportStop).toHaveBeenCalledOnce();
+    expect(setStatus).not.toHaveBeenCalled();
+  });
+
+  it("stops a transport that finishes starting after an abort and never marks it ready", async () => {
+    const setStatus = vi.fn();
+    let finishStart!: () => void;
+    mockPollingTransportStart.mockImplementationOnce(
+      () => new Promise<void>((resolve) => {
+        finishStart = resolve;
+      }),
+    );
+
+    const { promise, controller } = startMonitor({ setStatus });
+    await flush();
+    expect(mockPollingTransportStart).toHaveBeenCalledOnce();
+
+    controller.abort();
+    await flush();
+    expect(mockPollingTransportStop).not.toHaveBeenCalled();
+
+    finishStart();
+    await promise;
+
+    expect(mockPollingTransportStop).toHaveBeenCalledOnce();
+    expect(setStatus).not.toHaveBeenCalled();
   });
 });
 
 // ── Abort signal & stop ───────────────────────────────────────────────────────
 
 describe("stop/abort", () => {
-  it("abort signal calls updates.stop()", async () => {
+  it("abort signal stops the active polling transport", async () => {
     const { promise, controller } = startMonitor();
     await flush();
 
-    expect(mockUpdatesStop).not.toHaveBeenCalled();
+    expect(mockPollingTransportStop).not.toHaveBeenCalled();
     controller.abort();
     await promise;
 
-    expect(mockUpdatesStop).toHaveBeenCalledOnce();
+    expect(mockPollingTransportStop).toHaveBeenCalledOnce();
   });
 
   it("does not call stop twice on repeated abort", async () => {
@@ -305,7 +531,7 @@ describe("stop/abort", () => {
     await promise;
 
     // The finally block already called stopUpdates; a second abort should be a no-op.
-    expect(mockUpdatesStop).toHaveBeenCalledOnce();
+    expect(mockPollingTransportStop).toHaveBeenCalledOnce();
   });
 });
 
@@ -487,17 +713,6 @@ describe("message_new handler", () => {
     );
   });
 
-  it("routes each message through the inbound debouncer", async () => {
-    activeMonitor = startMonitor();
-    await flush();
-
-    await getMessageHandler()(makeCtx({ peerId: 777, text: "hi" }));
-
-    // The immediate-flush stub calls onFlush([msg]) → handleVkInbound once.
-    expect(mockHandleVkInbound).toHaveBeenCalledTimes(1);
-    expect(mockHandleVkInbound.mock.calls[0][0].message.text).toBe("hi");
-  });
-
   it("falls back to Date.now() when createdAt is missing", async () => {
     activeMonitor = startMonitor();
     await flush();
@@ -532,7 +747,6 @@ describe("message_new handler", () => {
     await flush();
     await getMessageHandler()(makeCtx());
 
-    // Конфиг берётся снимком рантайма, а не отдельным загрузчиком.
     expect(vi.mocked(core.config.current)).toHaveBeenCalled();
   });
 
@@ -552,135 +766,38 @@ describe("message_new handler", () => {
 });
 
 describe("combineVkInboundMessages", () => {
+  const base = {
+    peerId: 1,
+    senderId: 1,
+    timestamp: 1,
+    isGroup: false,
+    attachments: [],
+  };
+
   it("returns null for an empty batch", () => {
     expect(combineVkInboundMessages([])).toBeNull();
   });
 
-  it("returns the single message unchanged", () => {
-    const msg = makeMessage({ messageId: "m1", text: "solo" });
-    expect(combineVkInboundMessages([msg])).toBe(msg);
+  it("passes a single message through untouched", () => {
+    const only = { ...base, messageId: "1", text: "hi" };
+    expect(combineVkInboundMessages([only])).toBe(only);
   });
 
-  it("merges texts and keeps the last message's identity", () => {
+  it("joins texts with newlines and keeps the last message identity", () => {
     const combined = combineVkInboundMessages([
-      makeMessage({ messageId: "m1", text: "first", timestamp: 1000 }),
-      makeMessage({ messageId: "m2", text: "second", timestamp: 2000 }),
-      makeMessage({ messageId: "m3", text: "third", timestamp: 3000 }),
+      { ...base, messageId: "1", text: "first" },
+      { ...base, messageId: "2", text: "second" },
     ]);
-    expect(combined?.text).toBe("first\nsecond\nthird");
-    // Reply/react target = latest message.
-    expect(combined?.messageId).toBe("m3");
-    expect(combined?.timestamp).toBe(3000);
+    expect(combined?.text).toBe("first\nsecond");
+    // Identity comes from the last message: a reply must land on the newest one.
+    expect(combined?.messageId).toBe("2");
   });
 
-  it("skips empty texts when merging", () => {
+  it("skips empty texts so media-only messages add no blank lines", () => {
     const combined = combineVkInboundMessages([
-      makeMessage({ messageId: "m1", text: "a" }),
-      makeMessage({ messageId: "m2", text: "" }),
-      makeMessage({ messageId: "m3", text: "b" }),
+      { ...base, messageId: "1", text: "text" },
+      { ...base, messageId: "2", text: "" },
     ]);
-    expect(combined?.text).toBe("a\nb");
-  });
-});
-
-// ── Watchdog liveness policy (end-to-end over the supervision loop) ──────────
-//
-// The unit tests above cover how the cursor is READ; these cover what the
-// watchdog DOES with it. That distinction matters: the policy was rewritten
-// after an upstream audit (a static cursor used to imply a restart, which would
-// tear down perfectly healthy idle channels), and nothing guarded the new
-// state transitions — a regression there is invisible until VK ingress either
-// dies silently or flaps in production.
-describe("monitorVkProvider — состояние канала для ядра", () => {
-  beforeEach(() => {
-    mockStatusPatches.length = 0;
-    mockWatchdog.arm.mockClear();
-    mockWatchdog.touch.mockClear();
-    transportHolder.current = { fetchUpdates: vi.fn().mockResolvedValue(undefined) };
-  });
-
-  it("сообщает о готовности с отметкой активности транспорта", async () => {
-    const setStatus = vi.fn();
-    const { promise, controller } = startMonitor({ setStatus });
-    await flushMicrotasks();
-
-    const ready = mockStatusPatches.find(
-      (p) => (p as { lifecycle?: string }).lifecycle === "ready",
-    ) as Record<string, unknown> | undefined;
-    expect(ready).toBeDefined();
-    expect(ready?.mode).toBe("longpoll");
-    expect(typeof ready?.lastTransportActivityAt).toBe("number");
-    expect(mockWatchdog.arm).toHaveBeenCalledTimes(1);
-
-    controller.abort();
-    await promise;
-  });
-
-  it("считает живым каждый завершённый опрос, включая пустой", async () => {
-    const setStatus = vi.fn();
-    const { promise, controller } = startMonitor({ setStatus });
-    await flushMicrotasks();
-    mockStatusPatches.length = 0;
-    mockWatchdog.touch.mockClear();
-
-    // Пустой ответ long-poll — событий нет, но запрос завершился.
-    await transportHolder.current.fetchUpdates();
-
-    expect(mockWatchdog.touch).toHaveBeenCalledTimes(1);
-    expect(mockStatusPatches.at(-1)).toMatchObject({
-      lastTransportActivityAt: expect.any(Number),
-    });
-
-    controller.abort();
-    await promise;
-  });
-
-  it("на залипшем транспорте сообщает разрыв и завершает задачу, а не перезапускается сам", async () => {
-    const setStatus = vi.fn();
-    const { promise, controller } = startMonitor({ setStatus });
-    await flushMicrotasks();
-
-    // Сторож тишины сработал: имитируем его вызов.
-    const onTimeout = vi.mocked(createArmableStallWatchdog).mock.calls.at(-1)?.[0]
-      ?.onTimeout as ((info: { idleMs: number }) => void) | undefined;
-    expect(onTimeout).toBeTypeOf("function");
-    onTimeout?.({ idleMs: 150_000 });
-
-    await promise; // задача аккаунта завершилась сама — рестарт делает ядро
-
-    const stopped = mockStatusPatches.find(
-      (p) => (p as { lifecycle?: string }).lifecycle === "stopped",
-    ) as Record<string, unknown> | undefined;
-    expect(stopped).toBeDefined();
-    expect(String(stopped?.lastError)).toContain("no completed long-poll request");
-    expect(stopped?.lastDisconnect).toMatchObject({ at: expect.any(Number) });
-    controller.abort();
-  });
-});
-
-describe("resolveSerializeInbound", () => {
-  afterEach(() => {
-    delete process.env.VK_SERIALIZE_INBOUND;
-    mockCoreAtLeast.mockReturnValue(true);
-  });
-
-  it("на свежем ядре не сериализует: дедлок mirror-transcript исправлен нативно", () => {
-    mockCoreAtLeast.mockReturnValue(true);
-    expect(resolveSerializeInbound()).toBe(false);
-  });
-
-  it("на старом ядре включает сериализацию сама — обход там ещё нужен", () => {
-    mockCoreAtLeast.mockReturnValue(false);
-    expect(resolveSerializeInbound()).toBe(true);
-  });
-
-  it("явный флаг перебивает автоопределение в обе стороны", () => {
-    mockCoreAtLeast.mockReturnValue(true);
-    process.env.VK_SERIALIZE_INBOUND = "true";
-    expect(resolveSerializeInbound()).toBe(true);
-
-    mockCoreAtLeast.mockReturnValue(false);
-    process.env.VK_SERIALIZE_INBOUND = "false";
-    expect(resolveSerializeInbound()).toBe(false);
+    expect(combined?.text).toBe("text");
   });
 });

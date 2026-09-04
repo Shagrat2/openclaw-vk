@@ -25,7 +25,7 @@ import {
 } from "./tts-parts.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
-import { getVkRuntime } from "./runtime.js";
+import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 export {
@@ -43,7 +43,7 @@ const VK_MESSAGE_TEXT_LIMIT = 4096;
 const VK_TRANSIENT_RETRY_ATTEMPTS = 3;
 const VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS = 15_000;
 
-/** Потолок скачивания удалённого аудио: источник недоверенный. */
+/** Download ceiling for remote audio: the source is untrusted. */
 function getVkRemoteAudioMaxBytes(): number {
   const raw = Number.parseInt(process.env.VK_REMOTE_AUDIO_MAX_BYTES ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 128 * 1024 * 1024;
@@ -56,9 +56,9 @@ const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
 export type SendVkOptions = {
   /**
-   * Остановка гейта. Доходит до внешних процессов (ffmpeg при нарезке
-   * голосовых): без него выключение оставляло их работать, а результат уже
-   * некому забрать.
+   * Gateway stop. Reaches external processes (ffmpeg while splitting voice
+   * messages): without it a shutdown left them running with nobody left to
+   * collect the result.
    */
   abortSignal?: AbortSignal;
   cfg?: CoreConfig;
@@ -129,9 +129,9 @@ function isVkScopeDeniedError(error: unknown): boolean {
 }
 
 /**
- * VK отвечает кодом 100 «X is undefined», когда не принял переданный источник:
- * `photo` — на стадии сохранения, `file` — на оборванной multipart-передаче.
- * Формулировка одна на оба случая, поэтому и разбор один.
+ * VK answers with code 100 "X is undefined" when it did not accept the source:
+ * `photo` at the save stage, `file` on a truncated multipart upload. The wording
+ * is the same for both, so the parsing is shared.
  */
 function isVkUndefinedSourceError(error: unknown, subject: "file" | "photo"): boolean {
   if (readVkErrorCode(error) !== 100) {
@@ -150,27 +150,27 @@ function isVkImageUploadFallbackError(error: unknown): boolean {
 }
 
 /**
- * Повторяем загрузку ФОТО на коде 100 «photo is undefined».
+ * Retry a PHOTO upload on code 100 "photo is undefined".
  *
- * Долгое время этот отказ считался приговором источнику и сразу уводил в
- * откат «фото → документ» — собеседник получал серую плашку с файлом вместо
- * картинки. Замер 02.09 показал обратное: кадр на 177 КБ отвалился с
- * attempt=1, те же байты через восемь секунд ушли документом без ошибки, а
- * следующие два кадра загрузились фотографиями с первой попытки. Это тот же
- * оборванный multipart, что и «file is undefined» на голосовых, только на
- * фото-эндпоинте.
+ * This failure was long treated as a verdict on the source and went straight to
+ * the photo-to-document fallback, so the recipient got a grey file card instead
+ * of a picture. Measurement showed the opposite: a 177 KB frame failed on
+ * attempt 1, the same bytes went through as a document eight seconds later, and
+ * the next two frames uploaded as photos on the first try. It is the same
+ * truncated multipart as "file is undefined" on voice messages, only on the
+ * photo endpoint.
  *
- * Если источник и правда не годится в фото, повторы стоят меньше секунды и
- * откат в документ всё равно сработает — предикат отката не тронут.
+ * If the source really is unusable as a photo, the retries cost under a second
+ * and the document fallback still fires — its predicate is untouched.
  */
 function isVkRetryablePhotoUploadError(error: unknown): boolean {
   return isVkTransientFileUndefinedError(error) || isVkPhotoSourceRejectedError(error);
 }
 
 /**
- * Транзиентный отказ ЗАГРУЗКИ: оборванная multipart-передача, когда VK
- * отвечает кодом 100 «file is undefined». Запрос идемпотентен — повтор
- * проходит.
+ * Transient UPLOAD failure: a truncated multipart transfer, where VK answers
+ * with code 100 "file is undefined". The request is idempotent, so a retry
+ * goes through.
  */
 function isVkTransientFileUndefinedError(error: unknown): boolean {
   return isVkUndefinedSourceError(error, "file");
@@ -217,19 +217,19 @@ function isRetryableVkError(error: unknown): boolean {
 }
 
 /**
- * Диагностика доставки вложений.
+ * Attachment delivery diagnostics.
  *
- * Пишем в тот же VK_VOICE_DEBUG_LOG, где уже лежат следы медиа-пути
- * (ENTRY sendPayloadVk, uploadVkAudioMessage): одна лента на весь путь
- * отправки читается, а разнесённая по двум каналам — нет. Первая версия
- * писала через runtime.logging и оказалась немой: успех там под
- * verbose-гейтом, а гейт на проде закрыт.
+ * Written to the same VK_VOICE_DEBUG_LOG that already holds the media path
+ * traces (ENTRY sendPayloadVk, uploadVkAudioMessage): one timeline for the whole
+ * send path is readable, one split across two sinks is not. The first version
+ * logged through runtime.logging and turned out to be mute — success there sits
+ * behind the verbose gate, and that gate is closed in production.
  *
- * Отказ дублируется в общий лог рантайма — он не под гейтом и виден без
- * включённого opt-in файла.
+ * Failures are mirrored into the general runtime log, which is not gated and is
+ * visible without the opt-in file.
  *
- * Поля только безопасные: вид вложения, размер, номер попытки, код ошибки.
- * Ни URL, ни путей, ни peer id — такие записи легко утекают в отчёты об ошибках.
+ * Only safe fields: attachment kind, size, attempt number, error code. No URLs,
+ * no paths, no peer ids — such records leak easily into bug reports.
  */
 type MediaUploadKind = "photo" | "document" | "audio";
 
@@ -256,38 +256,37 @@ function logMediaUploadOutcome(params: {
 }
 
 /**
- * Очередь загрузок: на один токен — одна передача за раз.
+ * Upload queue: one transfer at a time per token.
  *
- * Внутри одного ответа медиа и так уходит последовательно (sendPayloadMediaVk
- * ждёт каждое вложение), но разные ответы независимы — догоняющие части
- * озвучки, параллельные диалоги — и попадают на upload-сервер одновременно.
- * Ключ по токену держит порядок там, где состояние общее, и не заставляет один
- * аккаунт ждать другой.
+ * Within a single reply media already goes sequentially (sendPayloadMediaVk
+ * awaits every attachment), but separate replies are independent — trailing
+ * voice parts, parallel conversations — and reach the upload server at the same
+ * time. Keying by token keeps order where the state is shared without making one
+ * account wait for another.
  *
- * Ретраи и паузы между ними намеренно ЗА пределами очереди: держать замок во
- * время сна значит останавливать чужие загрузки без всякой пользы.
+ * Retries and the pauses between them are deliberately OUTSIDE the queue:
+ * holding the lock while sleeping would stall other uploads for no gain.
  */
 const mediaUploadTails = new Map<string, Promise<void>>();
 
 
-/** Пауза с джиттером: разводит повторы разных отправок, чтобы они не сходились. */
+/** Jittered pause: spreads retries of different sends so they do not converge. */
 function retryDelayMs(attempt: number): number {
   const base = 250 * attempt;
   return base + Math.floor(Math.random() * base);
 }
 
 /**
- * Загрузка вложения: очередь на время передачи, ретрай на транзиентных отказах
- * и единая диагностика. Вызывающему коду остаётся сказать, что он грузит.
+ * Attachment upload: queued for the transfer, retried on transient failures,
+ * with one shared diagnostic. The caller only has to say what it is uploading.
  */
 /**
- * Размер локального файла для лога. Ревьюер числит число байт среди безопасных
- * полей, но у нас он считался только для буферов — у файла на диске в логе была
- * дыра ровно там, где по нему отличают «пустой рендер» от «целого».
+ * Local file size for the log. Byte counts are among the safe fields, but this
+ * one was only computed for buffers, leaving a hole for on-disk files exactly
+ * where the number tells an empty render from a complete one.
  *
- * Дисковый вызов делаем только при включённой диагностике и один раз на
- * загрузку, а не на попытку: на выключенной путь отправки не должен платить
- * ничего.
+ * The stat call happens only when diagnostics are on, and once per upload rather
+ * than per attempt: with diagnostics off the send path must pay nothing.
  */
 async function localSourceSize(source: string | Buffer): Promise<number | undefined> {
   if (Buffer.isBuffer(source)) {
@@ -310,7 +309,7 @@ async function runMediaUpload<T>(params: {
   mime?: string;
   token: string;
   upload: () => Promise<T>;
-  /** Своя политика повторов, если у вида вложения она отличается от общей. */
+  /** Per-kind retry policy, when this attachment kind differs from the default. */
   retry?: {
     extraRetryableCodes?: readonly number[];
     extraRetryablePredicate?: (error: unknown) => boolean;
@@ -580,9 +579,7 @@ function recordOutboundActivity(accountId: string): void {
 
 async function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string; to: string }) {
   const runtime = getVkRuntime();
-  // 8.1 убрала runtime.config — конфиг берём через мост совместимости.
-  const cfg = (params.cfg ??
-    runtime.config.current()) as CoreConfig;
+  const cfg = params.cfg ?? readVkRuntimeConfig(runtime);
   const account = resolveVkAccount({ cfg, accountId: params.accountId });
   if (!account.token) {
     throw new Error("VK token not configured");
@@ -685,11 +682,11 @@ export async function sendPhotoVk(
     filename?: string;
     contentType?: string;
     /**
-     * Повторять ли «photo is undefined» вместо немедленного отказа. Вызывающий
-     * говорит это сам, потому что знает, есть ли у него запасной ход: у
-     * картинки по ссылке он есть (скачать и попробовать байтами), у локального
-     * файла — нет, и там повтор единственное, что отделяет фото от серой
-     * плашки с документом.
+     * Whether to retry "photo is undefined" instead of failing immediately. The
+     * caller decides, because only it knows whether it has a fallback: a picture
+     * behind a URL does (download and retry with the bytes), a local file does
+     * not, and there the retry is the only thing between a photo and a grey
+     * document card.
      */
     retryTransientPhotoErrors?: boolean;
   },
@@ -815,11 +812,11 @@ export async function sendDocumentVk(
  * (http/data/file:// etc.) yield `null` so the caller skips splitting.
  */
 /**
- * Скачивает удалённое аудио с потолком по размеру.
+ * Downloads remote audio with a size ceiling.
  *
- * Потолок обязателен: ссылка приходит из ответа модели, то есть источник
- * недоверенный, и без ограничения можно вытянуть в память сколько угодно.
- * Читаем потоком и обрываем, как только перебрали лимит.
+ * The ceiling is mandatory: the URL comes from a model reply, so the source is
+ * untrusted, and without a limit an unbounded body could be pulled into memory.
+ * We read as a stream and abort as soon as the limit is exceeded.
  */
 async function fetchBoundedRemoteAudio(url: string): Promise<Buffer | null> {
   if (typeof fetch !== "function") {
@@ -876,16 +873,17 @@ async function materializeLocalAudioFile(
         },
       };
     } catch {
-      // Каталог создан, а запись не удалась — убираем за собой. Раньше на этом
-      // пути в /tmp оставался пустой каталог на каждую неудачу.
+      // The directory was created but the write failed — clean up after
+      // ourselves. This path used to leave an empty directory in /tmp per
+      // failure.
       await rm(dir, { recursive: true, force: true }).catch(() => {});
       return null;
     }
   }
 
-  // Удалённое аудио материализуем во временный файл — иначе длинная запись по
-  // ссылке вообще не резалась и уходила одним куском, который VK отвергал.
-  // Скачиваем с потолком по размеру: чужая ссылка может отдать что угодно.
+  // Materialize remote audio into a temporary file: otherwise a long recording
+  // behind a URL was never split and went as one piece, which VK rejected.
+  // Downloaded with a size ceiling — a foreign URL can return anything.
   if (isHttpUrl(audioSource)) {
     const body = await fetchBoundedRemoteAudio(audioSource);
     if (!body) {
@@ -894,8 +892,8 @@ async function materializeLocalAudioFile(
     return await materializeLocalAudioFile(body, title);
   }
 
-  // data: и file:// не трогаем: первое уже в памяти и приходит буфером,
-  // второе ядро разворачивает в обычный путь до нас.
+  // data: and file:// are left alone: the first is already in memory and arrives
+  // as a buffer, the second the core expands into a plain path before us.
   if (/^data:/i.test(audioSource) || audioSource.startsWith("file://")) {
     return null;
   }
@@ -928,18 +926,19 @@ async function uploadVkAudioMessage(params: {
     peerId: params.peerId,
     filename: params.filename,
   });
-  // Повтор бьёт ТОЧНО по запросу upload-сервера, а не по всей загрузке.
+  // The retry targets EXACTLY the upload-server request, not the whole upload.
   //
-  // `docs.getMessagesUploadServer(type=audio_message)` под нагрузкой отдаёт
-  // code=15 транзиентно (замер: ~20% против нуля при последовательной
-  // отправке), и повторный запрос проходит. Оборачивать в повтор весь конвейер
-  // («взять сервер → залить → сохранить») неверно: настоящий отказ по правам
-  // постоянен, а повтор после успешной заливки может создать документ дважды.
+  // Under load `docs.getMessagesUploadServer(type=audio_message)` returns
+  // code=15 transiently (measured: ~20% versus zero when sending sequentially),
+  // and a repeat request goes through. Wrapping the whole pipeline (get server →
+  // upload → save) in a retry would be wrong: a genuine permission failure is
+  // permanent, and a retry after a successful upload can create the document
+  // twice.
   //
-  // Адрес берём на КАЖДУЮ попытку заливки, а не один раз: upload_url у VK
-  // короткоживущий и по сути одноразовый, поэтому повтор multipart по уже
-  // использованному адресу падал бы всегда — и ретрай на «file is undefined»
-  // был бы бесполезен.
+  // The address is fetched for EVERY upload attempt rather than once: VK's
+  // upload_url is short-lived and effectively single-use, so replaying multipart
+  // against a spent address would always fail and the "file is undefined" retry
+  // would be pointless.
   const requestUploadUrl = (): Promise<string> =>
     withVkRetry(
       async () => {
@@ -975,8 +974,8 @@ async function uploadVkAudioMessage(params: {
         },
         title: params.filename,
       }),
-    // Оборванная multipart-передача (code=100 «file is undefined») повторяется:
-    // файл до VK не доехал, дубля быть не может.
+    // A truncated multipart transfer (code=100 "file is undefined") is retried:
+    // the file never reached VK, so there can be no duplicate.
     retry: { extraRetryablePredicate: isVkTransientFileUndefinedError },
   });
   return String(attachment);
@@ -1101,9 +1100,9 @@ export async function sendAudioMessageVk(
 
   // ── Attempt silence-based split for over-limit local audio ────────────────
   const local = await materializeLocalAudioFile(audioSource, title);
-  // Источник для одиночной отправки. Для ссылки это скачанный нами файл, а не
-  // сам URL: иначе vk-io тянет те же байты во второй раз — мы уже скачали их,
-  // чтобы измерить длительность.
+  // Source for a single send. For a URL this is the file we downloaded, not the
+  // URL itself: otherwise vk-io would pull the same bytes a second time — we
+  // already fetched them to measure the duration.
   let uploadSource: string | Buffer = audioSource;
   let uploadCleanup: (() => Promise<void>) | null = null;
   // Head duration doubles as the key that claims this reply's continuation parts.
@@ -1147,7 +1146,7 @@ export async function sendAudioMessageVk(
       }
     }
     if (typeof audioSource === "string" && isHttpUrl(audioSource)) {
-      // Скачанное оставляем до конца отправки и убираем после.
+      // Keep the download until the send finishes, then clean it up.
       uploadSource = local.path;
       uploadCleanup = local.cleanup;
     } else {
@@ -1205,7 +1204,7 @@ export async function sendAudioMessageVk(
  * remaining text chunks. The first text chunk + replyTo ride the first voice;
  * buttons/clearKeyboard apply only to the very last sent message.
  */
-/** Расширение куска нарезки: контейнер после `-c copy` остаётся исходным. */
+/** Segment file extension: after `-c copy` the container stays as it was. */
 function vkAudioSegmentExtension(segment: string): string {
   const base = segment.split(/[\\/]/).pop() ?? "";
   const dot = base.lastIndexOf(".");
@@ -1227,13 +1226,13 @@ async function sendVkAudioSegments(params: {
   const hasTail = tailChunks.length > 0;
   const results: SendVkResult[] = [];
 
-  // Сначала грузим ВСЕ куски, и только потом отправляем.
+  // Upload ALL segments first, and only then send them.
   //
-  // Раньше каждый кусок уходил сразу после своей загрузки, и сбой на втором
-  // оставлял собеседника с обрезанным ответом: первая половина фразы
-  // доставлена, второй нет и уже не будет. Загрузка ничего не показывает
-  // собеседнику, поэтому её отказ можно обработать целиком — и тогда
-  // вызывающий код штатно откатится на отправку одним файлом.
+  // Each segment used to be sent right after its own upload, so a failure on the
+  // second left the recipient with a truncated answer: the first half of the
+  // phrase delivered, the second never coming. Uploading shows the recipient
+  // nothing, so its failure can be handled as a whole — and the caller then
+  // falls back to sending a single file.
   const attachments: string[] = [];
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index] as string;
@@ -1243,9 +1242,9 @@ async function sendVkAudioSegments(params: {
         token: params.account.token,
         peerId: params.peerId,
         source: segment,
-        // Расширение берём у самого куска: нарезка идёт `-c copy`, то есть
-        // контейнер остаётся исходным, и назвать mp3-кусок «.ogg» значит
-        // соврать VK о формате.
+        // Take the extension from the segment itself: splitting uses `-c copy`,
+        // so the container stays as it was, and naming an mp3 segment ".ogg"
+        // would lie to VK about the format.
         filename: `voice-${String(index + 1).padStart(2, "0")}${vkAudioSegmentExtension(segment)}`,
         contentType: params.contentType,
       }),
@@ -1678,9 +1677,9 @@ async function sendPayloadMediaVk(params: {
         clearKeyboard: shouldApplyKeyboard ? params.opts.clearKeyboard : undefined,
       },
     });
-    // Замыкает след пути отправки: загрузка отчиталась выше, здесь видно, дошло
-    // ли вложение до сообщения. Без этого «картинка не пришла» неотличимо от
-    // «картинка не отправлялась».
+    // Closes the send-path trace: the upload reported above, and here we see
+    // whether the attachment made it into the message. Without this, "the image
+    // did not arrive" is indistinguishable from "the image was never sent".
     vkDiag("media sent", {
       index: index + 1,
       total: params.mediaRefs.length,

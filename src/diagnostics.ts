@@ -1,33 +1,32 @@
 /**
- * Диагностика VK-канала: три уровня вместо «есть/нет».
+ * VK channel diagnostics: three levels instead of on/off.
  *
- * Прежний `VK_VOICE_DEBUG_LOG` был всё-или-ничего и писал в файл целые пути,
- * ссылки и идентификаторы собеседников — включать его на живом канале было
- * нельзя. Отказываться от переключателя тоже неправильно: именно он позволил
- * найти, почему картинки приходили серой плашкой. Поэтому переключатель
- * остался, но стал уровнем:
+ * The old `VK_VOICE_DEBUG_LOG` was all-or-nothing and wrote whole paths, URLs
+ * and peer identifiers to a file, so it could not be turned on for a live
+ * channel. Dropping the switch would be wrong too: it is what revealed why
+ * pictures arrived as grey file cards. So the switch stayed and became a level:
  *
- * | уровень    | что видно |
- * |------------|-----------|
- * | `off`      | ничего (по умолчанию); отказы всё равно пишутся — см. ниже |
- * | `redacted` | ход дела без имён: вид вложения, размер, MIME, попытка, код |
- * | `full`     | то же плюс пути, ссылки, имена файлов и идентификаторы |
+ * | level      | what is visible |
+ * |------------|-----------------|
+ * | `off`      | nothing (default); failures are still logged — see below |
+ * | `redacted` | progress without names: attachment kind, size, MIME, attempt, code |
+ * | `full`     | the same plus paths, URLs, file names and identifiers |
  *
- * **Обезличивание — свойство этого канала, а не дисциплина вызывающего.**
- * Вызывающий передаёт один словарь полей и не делит их на «можно» и «нельзя»:
- * решает `redactField` ниже, по форме значения и имени поля. Прежняя версия
- * требовала от каждого места вызова разложить поля на `safe`/`sensitive`, и
- * этого хватило ровно до первого невнимательного вызова — текст ошибки
- * считался безопасным, а `ENOENT` приносит в нём абсолютный путь.
+ * **Redaction is a property of this channel, not caller discipline.** Callers
+ * pass one field map and never split it into allowed and forbidden: `redactField`
+ * below decides, from the shape of the value and the name of the field. The
+ * previous version asked every call site to sort fields into `safe`/`sensitive`,
+ * which held exactly until the first inattentive call — an error message counted
+ * as safe, and `ENOENT` carries an absolute path inside it.
  *
- * Отказы пишутся всегда, даже на `off`: они уже обезличены, а молчащий канал
- * об ошибке — та самая ловушка, из-за которой поломку VK однажды искали
- * полдня.
+ * Failures are always logged, even at `off`: they are already redacted, and a
+ * channel that stays silent about an error is the very trap that once turned a
+ * VK breakage into half a day of searching.
  *
- * Куда пишем: штатный логгер ядра (`runtime.logging.getChildLogger`) — он
- * умеет уровни, ротацию и не требует своего файла. Отдельный файл остаётся
- * необязательным дополнением через `VK_VOICE_DEBUG_LOG` для случая, когда
- * лента гейта слишком шумная.
+ * Where it goes: the core logger (`runtime.logging.getChildLogger`) — it knows
+ * levels and rotation and needs no file of its own. A separate file stays an
+ * optional extra through `VK_VOICE_DEBUG_LOG`, for when the gateway feed is too
+ * noisy.
  */
 import { appendFile } from "node:fs/promises";
 import { redactIdentifier, redactSensitiveText } from "openclaw/plugin-sdk/logging-core";
@@ -40,13 +39,13 @@ export type { VkDiagLevel };
 
 const VK_DIAG_LOG_BINDINGS = { module: "vk-diag" } as const;
 
-/** Длина текстовых полей в логе: достаточно, чтобы узнать отказ, мало, чтобы утащить содержимое. */
+/** Text field length in the log: enough to recognize a failure, too little to carry content away. */
 const MAX_TEXT_FIELD = 120;
 
 /**
- * Поля, значение которых называет собеседника или сообщение. На `redacted` они
- * не выбрасываются, а хэшируются: две неудачные отправки разным людям остаются
- * различимы в ленте, но кто это — по логу не узнать.
+ * Fields whose value names a peer or a message. At `redacted` they are hashed
+ * rather than dropped: two failed sends to different people stay distinguishable
+ * in the feed, while the log never says who they are.
  */
 const IDENTIFIER_FIELDS = new Set(["to", "peerId", "chatId", "messageId", "accountId"]);
 
@@ -55,16 +54,17 @@ function isVkDiagLevel(value: unknown): value is VkDiagLevel {
 }
 
 /**
- * Уровень берём на каждый вызов, а не один раз при старте: правка конфига
- * подхватывается ядром на лету, и диагностику должно быть можно включить не
- * перезапуская гейт. Снимок конфига у ядра закреплён в памяти, так что это
- * чтение поля, а не диска.
+ * The level is read on every call rather than once at startup: the core picks
+ * up config edits live, and it must be possible to turn diagnostics on without
+ * restarting the gateway. The core keeps the config snapshot in memory, so this
+ * is a field read, not a disk read.
  *
- * Переменная окружения перебивает конфиг — ей включают на пару минут, не трогая
- * `openclaw.json`.
+ * The environment variable overrides the config — it is what you use to switch
+ * diagnostics on for a couple of minutes without touching `openclaw.json`.
  *
- * ⚠️ Читается только `channels.vk.diagnostics`, без разбора по аккаунтам — так
- * же, как рядом устроен `streaming`. На мультиаккаунтном гейте уровень общий.
+ * Only `channels.vk.diagnostics` is read, with no per-account split — the same
+ * way `streaming` works next to it. On a multi-account gateway the level is
+ * shared.
  */
 export function resolveVkDiagLevel(): VkDiagLevel {
   const fromEnv = process.env.VK_DIAG_LEVEL?.trim().toLowerCase();
@@ -80,16 +80,16 @@ export function resolveVkDiagLevel(): VkDiagLevel {
       return fromConfig;
     }
   } catch {
-    /* диагностика никогда не должна ломать отправку */
+    /* diagnostics must never break a send */
   }
   return "off";
 }
 
 /**
- * Вид источника вместо самого источника: по нему видно, откуда бралось
- * вложение, но не что именно и не чьё. `file://` — это тоже локальный файл,
- * поэтому он попадает в `local`: набор видов намеренно совпадает со списком из
- * ревью (`local` / `remote` / `data`).
+ * The kind of source instead of the source itself: it shows where an attachment
+ * came from, but not which one or whose. `file://` is a local file too, so it
+ * maps to `local`: the set of kinds deliberately matches the review's list
+ * (`local` / `remote` / `data`).
  */
 export function describeVkSourceKind(
   source: unknown,
@@ -110,26 +110,26 @@ export function describeVkSourceKind(
 }
 
 /**
- * Вычищает имена, спрятанные ВНУТРИ текста. Сообщения об ошибках — главный
- * канал утечки: `ENOENT: no such file or directory, open '/srv/renders/a.jpg'`
- * выглядит как описание проблемы, а несёт абсолютный путь. Целиком такую
- * строку выбросить нельзя — без неё непонятно, что случилось.
+ * Scrubs names hidden INSIDE text. Error messages are the main leak channel:
+ * `ENOENT: no such file or directory, open '/srv/renders/a.jpg'` looks like a
+ * description of the problem while carrying an absolute path. The string cannot
+ * simply be dropped — without it there is no telling what happened.
  */
 function scrubNames(text: string): string {
   return (
     text
       .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>")
-      // POSIX-пути.
+      // POSIX paths.
       .replace(/(?:~|\.)?(?:\/[\w.@+-]+){2,}\/?/g, "<path>")
-      // Windows-пути: `C:\Users\…` и UNC `\\host\share\…`. Раньше уходили
-      // в лог целиком — регулярка знала только про слэш вперёд.
+      // Windows paths: `C:\Users\…` and UNC `\\host\share\…`. These used to
+      // reach the log intact — the pattern only knew about forward slashes.
       .replace(/(?:[a-z]:)?(?:\\[\w.@+ -]+){2,}\\?/gi, "<path>")
-      // Одиночное имя файла без пути: тоже имя, и по нему опознаётся вложение.
+      // A bare file name with no path: still a name, and it identifies the attachment.
       .replace(/\b[\w.@+-]+\.(?:jpe?g|png|gif|webp|ogg|opus|mp3|m4a|wav|mp4|pdf|docx?|xlsx?|zip|json|md|txt)\b/gi, "<file>")
   );
 }
 
-/** Строка, которая называет файл или адрес, а не описывает происходящее. */
+/** A string that names a file or an address rather than describing what happens. */
 function namesSomething(value: string): boolean {
   return (
     value.startsWith("data:") ||
@@ -141,31 +141,31 @@ function namesSomething(value: string): boolean {
 }
 
 /**
- * Единственное место, где решается, что попадёт в лог. Все поля проходят здесь,
- * поэтому новое место вызова не может «забыть» обезличить своё значение.
+ * The single place that decides what reaches the log. Every field passes through
+ * here, so a new call site cannot forget to redact its value.
  */
 function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0): unknown {
-  // Ограничитель глубины стоит ДО разбора массивов: иначе массив, ссылающийся
-  // сам на себя, уходит в бесконечную рекурсию и роняет отправку по стеку —
-  // `vkDiag` вызывается прямо на пути отправки и ни во что не завёрнут.
+  // The depth guard comes BEFORE the array branch: otherwise a self-referencing
+  // array recurses forever and takes the send down with a stack overflow —
+  // `vkDiag` is called straight from the send path and is wrapped in nothing.
   if (depth >= 4) {
-    return "[глубже 4 уровней]";
+    return "[deeper than 4 levels]";
   }
   if (Array.isArray(value)) {
     return value.map((item) => redactField(key, item, level, depth + 1));
   }
   if (Buffer.isBuffer(value)) {
-    // Содержимое вложения не пишем никогда, ни на одном уровне.
+    // Attachment content is never written, at any level.
     return "buffer";
   }
   if (value instanceof Error) {
-    // Ошибка как значение поля превращалась в `{}` — сообщение терялось.
+    // An Error as a field value used to serialize to `{}` — the message was lost.
     return redactField(key, `${value.name}: ${value.message}`, level, depth + 1);
   }
   if (value && typeof value === "object") {
-    // Вложенные объекты раньше уходили в лог КАК ЕСТЬ, мимо редактора: любое
-    // поле-объект с путём или peer id было утечкой. Разбираем рекурсивно и
-    // ограничиваем глубину, чтобы циклическая ссылка не увела в бесконечность.
+    // Nested objects used to reach the log AS IS, bypassing redaction: any
+    // object field holding a path or a peer id was a leak. We walk them
+    // recursively and cap the depth so a cycle cannot run away.
     if (value instanceof Map || value instanceof Set) {
       return `[${value.constructor.name}, ${value.size}]`;
     }
@@ -177,9 +177,10 @@ function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0)
     }
     return out;
   }
-  // Идентификаторы приходят и числами (`peerId: 12324712`), а не только
-  // строками — проверку на них надо делать ДО отсечения нестрок, иначе peer id
-  // уходит в лог сырым. На этом и попались: тесты подавали id строкой.
+  // Identifiers also arrive as numbers (`peerId: 12324712`), not only strings,
+  // so they must be checked BEFORE non-strings are returned early — otherwise a
+  // peer id reaches the log raw. That is exactly what slipped through: the tests
+  // passed ids as strings.
   if (typeof value === "number" && IDENTIFIER_FIELDS.has(key)) {
     return level === "full" ? value : redactIdentifier(String(value));
   }
@@ -187,7 +188,7 @@ function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0)
     return value;
   }
   if (level === "full") {
-    // Даже на полном уровне снимаем токены и ключи: они не нужны никогда.
+    // Even at full level, tokens and keys are stripped: they are never needed.
     return redactSensitiveText(value);
   }
   if (namesSomething(value)) {
@@ -214,9 +215,9 @@ function redactFields(
 }
 
 /**
- * Дочерний логгер ядра не кэшируется само́й функцией `getChildLogger` — она
- * клонирует настройки и создаёт объект на каждый вызов. Держим один на процесс
- * и пересоздаём, только если сменился сам рантайм (перерегистрация плагина).
+ * The core does not cache child loggers inside `getChildLogger` — it clones the
+ * settings and builds an object on every call. We keep one per process and
+ * rebuild it only when the runtime itself changes (plugin re-registration).
  */
 let cachedLogger: { runtime: unknown; logger: RuntimeLogger } | null = null;
 
@@ -241,14 +242,14 @@ function emit(event: string, fields: Record<string, unknown>, failure: boolean):
 }
 
 /**
- * Идентификатор для строки штатного лога.
+ * An identifier for a regular log line.
  *
- * Не всё в плагине проходит через `vkDiag`: часть сообщений — не диагностика,
- * а рабочие предупреждения («сообщение отброшено политикой», «не удалось
- * пометить прочитанным»), и они должны быть видны всегда. Печатать в них peer id
- * сырым нельзя, а выбрасывать — значит потерять возможность связать строки
- * между собой. Хэшируем так же, как поля диагностики; на `full` оставляем как
- * есть.
+ * Not everything in the plugin goes through `vkDiag`: some messages are not
+ * diagnostics but operational warnings ("message dropped by policy", "failed to
+ * mark as read"), and they must always be visible. Printing a raw peer id in
+ * them is not acceptable, and dropping it would make lines impossible to
+ * correlate. So they are hashed the same way diagnostic fields are; at `full`
+ * they are left as they are.
  */
 export function redactVkId(value: string | number | undefined | null): string {
   if (value === undefined || value === null || value === "") {
@@ -257,7 +258,7 @@ export function redactVkId(value: string | number | undefined | null): string {
   return resolveVkDiagLevel() === "full" ? String(value) : redactIdentifier(String(value));
 }
 
-/** Ход дела. Молчит на `off`; поля обезличиваются по уровню. */
+/** Progress. Silent at `off`; fields are redacted according to the level. */
 export function vkDiag(event: string, fields: Record<string, unknown> = {}): void {
   const level = resolveVkDiagLevel();
   if (level === "off") {
@@ -267,9 +268,10 @@ export function vkDiag(event: string, fields: Record<string, unknown> = {}): voi
 }
 
 /**
- * Отказ. Пишется на любом уровне, включая `off`, и всегда через `logger.error`.
- * Код и текст ошибки достаются здесь, а не в местах вызова: раньше их читали
- * тремя разными способами, и ветка голосовых теряла `description`.
+ * A failure. Logged at every level, including `off`, and always through
+ * `logger.error`. The error code and message are extracted here rather than at
+ * the call sites: they used to be read in three different ways, and the voice
+ * branch lost `description`.
  */
 export function vkDiagFailure(
   event: string,
@@ -292,12 +294,12 @@ export function vkDiagFailure(
 }
 
 /**
- * Необязательный отдельный файл: удобно, когда лента гейта слишком шумная.
+ * An optional separate file: useful when the gateway feed is too noisy.
  *
- * Записи выстроены в цепочку, а не отправлены параллельно: замер показал, что
- * несвязанные `appendFile` ложатся в файл не в порядке вызова (55 строк из 200),
- * а ценность этого файла ровно в том, что он хронологический. Ждать запись
- * вызывающий не должен — отправка не может зависеть от диска.
+ * Writes are chained rather than issued in parallel: measurement showed that
+ * unrelated `appendFile` calls land out of call order (55 lines out of 200), and
+ * the whole value of this file is that it is chronological. The caller must not
+ * await the write — a send cannot depend on the disk.
  */
 let diagFileTail: Promise<void> = Promise.resolve();
 
@@ -306,15 +308,16 @@ function appendVkDiagFile(event: string, fields: Record<string, unknown>): void 
   if (!target) {
     return;
   }
-  // Сериализация в try: циклическая ссылка в поле роняла `JSON.stringify`, а он
-  // стоит на пути отправки сообщения — диагностика не имеет права уронить ответ.
+  // Serialization inside try: a cycle in a field used to crash `JSON.stringify`,
+  // which sits on the message send path — diagnostics may never take a reply
+  // down.
   let rendered: string;
   try {
     rendered = Object.entries(fields)
       .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
       .join(" ");
   } catch {
-    rendered = "[поля не сериализуются]";
+    rendered = "[fields not serializable]";
   }
   const line = `[${new Date().toISOString()}] ${event}${rendered ? ` ${rendered}` : ""}\n`;
   diagFileTail = diagFileTail.then(

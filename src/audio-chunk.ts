@@ -13,27 +13,27 @@ export function getVkAudioMessageMaxMs(): number {
   return readPositiveIntEnv("VK_AUDIO_MESSAGE_MAX_MS", 270_000);
 }
 
-/** Дедлайн на всю операцию нарезки. */
+/** Deadline for the whole split operation. */
 function getAudioSplitDeadlineMs(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_DEADLINE_MS", 5 * 60 * 1000);
 }
 
-/** Потолок размера входного файла: гигабайт не режем. */
+/** Input file size ceiling: we do not split a gigabyte. */
 function getAudioSplitMaxInputBytes(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_INPUT_BYTES", 512 * 1024 * 1024);
 }
 
 
 /**
- * Запас при ПЛАНИРОВАНИИ резов. `-c copy` режет по ключевым кадрам, поэтому
- * кусок выходит длиннее заказанного (замер: запрос 10.000 с → файл 10.020 с).
- * Компенсируем это здесь, а не допуском на приёмке: допуск в секунды делал
- * проверку беззубой — кусок, вылезший за лимит VK почти на две секунды, её бы
- * прошёл и был бы отвергнут уже на заливке.
+ * Margin used when PLANNING the cuts. `-c copy` cuts on key frames, so a
+ * segment comes out longer than requested (measured: 10.000 s requested →
+ * 10.020 s file). We compensate here rather than with a tolerance on the check:
+ * a tolerance in seconds made the check toothless — a segment nearly two seconds
+ * over the VK limit would pass it and be rejected at upload instead.
  */
 const SEGMENT_PLANNING_MARGIN_MS = 250;
 
-/** Потолок числа кусков: столько голосовых подряд собеседник читать не станет. */
+/** Segment count ceiling: nobody listens to that many voice messages in a row. */
 function getAudioSplitMaxSegments(): number {
   return readPositiveIntEnv("VK_AUDIO_SPLIT_MAX_SEGMENTS", 12);
 }
@@ -64,10 +64,10 @@ function readPositiveIntEnv(name: string, fallback: number): number {
 type ExecResult = { stdout: string; stderr: string };
 
 /**
- * Запуск ffmpeg/ffprobe с пробросом отмены.
+ * Runs ffmpeg/ffprobe with cancellation propagated.
  *
- * Без `signal` остановка гейта оставляла работать ffmpeg: процесс живёт своей
- * жизнью, пишет в /tmp и держит диск, а вернуться к его результату уже некому.
+ * Without `signal` a gateway stop left ffmpeg running: the process lives on,
+ * writes into /tmp and holds disk, with nobody left to collect its result.
  */
 function runProcess(
   bin: string,
@@ -180,9 +180,9 @@ export function selectCutPointsMs(
     .filter((ms) => Number.isFinite(ms) && ms > 0 && ms < totalMs)
     .sort((a, b) => a - b);
 
-  // Планируем с запасом: stream copy сдвигает рез до ближайшего ключевого
-  // кадра ВПЕРЁД, поэтому цель ставим чуть раньше лимита — тогда куски
-  // укладываются в лимит по построению, а проверка на выходе остаётся строгой.
+  // Plan with a margin: stream copy moves a cut FORWARD to the nearest key
+  // frame, so the target sits slightly below the limit — segments then fit by
+  // construction and the check on the way out stays strict.
   const target = Math.max(1, maxMs - SEGMENT_PLANNING_MARGIN_MS);
   let segmentStart = 0;
   while (totalMs - segmentStart > maxMs) {
@@ -234,9 +234,9 @@ export async function splitAudioAtSilence(
   file: string,
   maxMs: number,
   opts: {
-    /** Уже измеренная длительность: вызывающий обычно знает её — не мерим второй раз. */
+    /** Already measured duration: the caller usually knows it, so we do not measure twice. */
     knownDurationMs?: number | null;
-    /** Остановка гейта не должна оставлять ffmpeg работать. */
+    /** A gateway stop must not leave ffmpeg running. */
     signal?: AbortSignal;
   } = {},
 ): Promise<string[]> {
@@ -244,22 +244,22 @@ export async function splitAudioAtSilence(
     return [];
   }
 
-  // Общий дедлайн на всю операцию: нарезка не должна тянуться дольше, чем
-  // собеседник готов ждать голосовое. Складывается с отменой от гейта.
+  // An overall deadline: splitting must not take longer than someone is willing
+  // to wait for a voice message. Combined with the gateway's own cancellation.
   const deadline = AbortSignal.timeout(getAudioSplitDeadlineMs());
   const signal = opts.signal
     ? AbortSignal.any([opts.signal, deadline])
     : deadline;
 
-  // Потолок размера входа: гигабайтную запись не стоит даже открывать.
-  // Не смогли узнать размер — не повод отказываться от нарезки: ffmpeg всё
-  // равно споткнётся о негодный файл, и вызывающий откатится штатно.
+  // Input size ceiling: a gigabyte recording is not worth opening at all.
+  // Failing to learn the size is no reason to refuse the split: ffmpeg will
+  // stumble on a bad file anyway and the caller falls back normally.
   try {
     if ((await stat(file)).size > getAudioSplitMaxInputBytes()) {
       return [];
     }
   } catch {
-    /* размер неизвестен — идём дальше */
+    /* size unknown — carry on */
   }
 
   let totalMs: number | null;
@@ -275,11 +275,11 @@ export async function splitAudioAtSilence(
   if (totalMs === null || totalMs <= maxMs) {
     return [];
   }
-  // Ранний выход по ЕДИНСТВЕННОЙ ручке: если кусков заведомо выйдет больше
-  // потолка, резать бессмысленно — и не стоит гонять дорогой поиск тишины
-  // (на двухчасовой записи это секунды впустую). Раньше тот же предохранитель
-  // стоял вторым, отдельным потолком по длительности: две ручки про одно, и их
-  // приходилось держать согласованными вручную.
+  // Early exit on a SINGLE knob: if the segment count is bound to exceed the
+  // ceiling, splitting is pointless — and the expensive silence search is not
+  // worth running (seconds wasted on a two-hour recording). The same guard used
+  // to exist as a second, separate duration ceiling: two knobs for one thing,
+  // kept consistent by hand.
   if (Math.ceil(totalMs / maxMs) > getAudioSplitMaxSegments()) {
     return [];
   }
@@ -357,23 +357,23 @@ export async function splitAudioAtSilence(
       outputs.push(out);
     }
   } catch {
-    // Любой сбой извлечения — сносим каталог целиком: все куски лежат внутри
-    // него, отдельная уборка файлов была лишней.
+    // Any extraction failure drops the whole directory: every segment lives
+    // inside it, so cleaning files separately was redundant.
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }
 
   if (outputs.length < 2) {
-    // Резать оказалось нечего.
+    // There turned out to be nothing to split.
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }
 
-  // Проверяем, что получилось, а не верим тому, что заказывали. Stream copy
-  // режет только по ключевым кадрам, поэтому кусок может выйти длиннее
-  // запрошенного — и тогда VK отвергнет его ровно так же, как исходник.
-  // Отдавать заведомо негодную нарезку хуже, чем не резать вовсе: вызывающий
-  // хотя бы уйдёт на отправку документом.
+  // Check what came out instead of trusting what was requested. Stream copy
+  // only cuts on key frames, so a segment can end up longer than asked — and VK
+  // then rejects it exactly as it rejected the original. Returning a split that
+  // is known to be unusable is worse than not splitting at all: at least the
+  // caller falls back to sending a document.
   for (const out of outputs) {
     let actual: number | null;
     try {

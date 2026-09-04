@@ -155,7 +155,7 @@ export async function handleVkInbound(params: {
   config: CoreConfig;
   runtime: RuntimeEnv;
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
-  /** Остановка гейта: доводится до ffmpeg при нарезке длинных голосовых. */
+  /** Gateway stop: propagated to ffmpeg while splitting long voice messages. */
   abortSignal?: AbortSignal;
 }): Promise<void> {
   const { message, account, config, runtime, statusSink, abortSignal } = params;
@@ -520,10 +520,10 @@ export async function handleVkInbound(params: {
   }
 
   let progressDraft: VkProgressDraftHandle | null = null;
-  // Текст ОТВЕТА, лежащий сейчас в черновике (не список шагов). Живёт на весь
-  // ход, а не на одну доставку: блок приходит раньше финала. Сбрасывается,
-  // когда черновик перезатирают шагами инструментов — иначе сохранили бы как
-  // «ответ» список шагов.
+  // The ANSWER text currently sitting in the draft (not the step list). It
+  // lives for the whole turn rather than one delivery: blocks arrive before the
+  // final. Reset when the draft is overwritten with tool steps — otherwise the
+  // step list itself would be kept as the "answer".
   let draftAnswerText: string | null = null;
   if (progressDraftEnabled) {
     progressDraft = createVkProgressDraftCompositor({
@@ -577,13 +577,14 @@ export async function handleVkInbound(params: {
         typingCallbacks,
         deliver: async (payload: unknown, info?: { kind?: string }) => {
           {
-            // Показывает, какие куски ядро отдаёт по ходу, а что приходит
-            // финалом: без этого не понять, можно ли держать рассказ в
-            // черновике, оставляя в финале только итог.
+            // Shows which chunks the core delivers along the way and what
+            // arrives as the final one: without it there is no telling whether
+            // the narration can stay in the draft while the final carries only
+            // the result.
             //
-            // Раньше сюда писалась «голова» текста (первые 70 символов) — то
-            // есть содержимое переписки. Для этого вопроса достаточно длины и
-            // наличия медиа; содержимое не печатаем ни на одном уровне.
+            // This used to log the head of the text (first 70 characters) —
+            // that is, conversation content. Length and the presence of media
+            // answer the question; content is not printed at any level.
             const p = payload as { text?: string; mediaUrl?: string } | null;
             vkDiag("deliver", {
               kind: info?.kind ?? "?",
@@ -599,14 +600,14 @@ export async function handleVkInbound(params: {
           const isFinal = info?.kind === "final";
           let draftHandled = false;
 
-          // ── Промежуточный блок → в черновик, а не отдельным сообщением ────
-          // С включённым блочным стримингом ядро отдаёт рассказ о работе
-          // кусками (kind=block), а итог — отдельно (kind=final). Раньше
-          // каждый кусок уходил своим сообщением, и в чате росла простыня.
-          // Теперь кусок переписывает черновик: ход виден в одном пузыре и
-          // сменяется по мере работы, а в конце этот же пузырь становится
-          // ответом. Медиа и кнопки идут прежним путём — их в черновик не
-          // положишь.
+          // ── Intermediate block → into the draft, not a separate message ──
+          // With block streaming on, the core delivers the narration in chunks
+          // (kind=block) and the result separately (kind=final). Each chunk used
+          // to go out as its own message, and the chat grew into a wall. Now a
+          // chunk rewrites the draft: progress lives in one bubble and changes
+          // as work goes on, and at the end that same bubble becomes the answer.
+          // Media and buttons keep their old path — they cannot go into a
+          // draft.
           if (
             progressDraft &&
             !isFinal &&
@@ -615,22 +616,23 @@ export async function handleVkInbound(params: {
             !(normalized.mediaUrls?.length ?? 0) &&
             !resolvedButtons
           ) {
-            // Блоки — это КУСКИ ответа, а не его накопленная версия (ядро режет
-            // поток через block-chunker). Черновик перезаписывается целиком,
-            // поэтому копим сами: иначе на пустом финале мы сохранили бы как
-            // «ответ» только последний абзац, а в озвучке был бы весь текст.
+            // Blocks are CHUNKS of the answer, not its accumulated version (the
+            // core splits the stream through a block chunker). The draft is
+            // rewritten in full, so we accumulate ourselves: otherwise an empty
+            // final would keep only the last paragraph as the "answer" while the
+            // voice-over carried the whole text.
             const accumulated = draftAnswerText
               ? `${draftAnswerText}\n\n${normalized.text.trim()}`
               : normalized.text.trim();
             const chunks = renderVkMarkdownChunks(accumulated);
             if (chunks.length > 1) {
-              // Накопленное перестало влезать в одно сообщение VK. Дальше
-              // черновик ответом быть не может — отдаём этот блок обычным
-              // путём и забываем накопленное, чтобы не сохранить огрызок.
+              // The accumulated text no longer fits one VK message. From here
+              // the draft cannot become the answer — send this block the usual
+              // way and forget the accumulation so no stub is kept.
               draftAnswerText = null;
               vkDiag("block overflows draft", { len: accumulated.length });
             } else {
-              // Метку добавляет сам черновик (единственная точка записи).
+              // The label is added by the draft itself (the single write point).
               const draftText = chunks[0]?.text ?? accumulated;
               try {
                 await progressDraft.overwrite(draftText);
@@ -639,18 +641,18 @@ export async function handleVkInbound(params: {
                 return;
               } catch (err) {
                 runtime.log?.(`vk: block → draft failed: ${String(err)}`);
-                // не смогли переписать черновик — пусть уходит обычным путём
+                // the draft could not be rewritten — let it go the usual way
               }
             }
           }
 
-          // ── Промежуточный блок С МЕДИА → своим сообщением, но с меткой ────
-          // Картинку в черновик не положишь: это одно текстовое сообщение,
-          // которое мы правим через messages.edit, вложение туда не подставить.
-          // Убирать подпись в черновик тоже нельзя — она относится к самому
-          // снимку и читается вместе с ним. Поэтому помечаем такие сообщения
-          // той же меткой, что и черновик: тогда ход отличим от ответа, даже
-          // когда ход состоит из картинок.
+          // ── Intermediate block WITH MEDIA → own message, but labelled ────
+          // A picture cannot go into the draft: that is a single text message we
+          // edit through messages.edit, and an attachment cannot be slipped in.
+          // Moving the caption into the draft is wrong too — it belongs to the
+          // image and is read together with it. So such messages carry the same
+          // label as the draft: progress stays distinguishable from the answer
+          // even when progress consists of pictures.
           if (progressDraft && !isFinal && normalized.text?.trim()) {
             const label = resolveVkProgressLabel(config);
             if (label && !normalized.text.startsWith(label)) {
@@ -669,18 +671,18 @@ export async function handleVkInbound(params: {
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
             const finalText = normalized.text?.trim();
-            // Медиа больше не отменяет замену: черновик с ходом работы
-            // переписываем текстом ответа, а голосовые уходят следом
-            // отдельными сообщениями. Раньше любой озвученный ответ шёл мимо
-            // замены — черновик просто удалялся, и ход работы пропадал, а
-            // ответ приходил новым сообщением.
+            // Media no longer cancels the replacement: the progress draft is
+            // rewritten with the answer text, and voice messages follow as
+            // separate messages. Any spoken answer used to bypass the
+            // replacement — the draft was simply deleted, progress vanished and
+            // the answer arrived as a new message.
             if (draftMsgId !== undefined && finalText && !resolvedButtons) {
               const chunks = renderVkMarkdownChunks(normalized.text ?? "");
-              // Раньше замена работала только для ответа в одно сообщение, и
-              // длинный вывод («ход мыслей» + итог) вместо замены оставлял
-              // черновик простынёй, а ответ приходил отдельно. Теперь первым
-              // куском переписываем черновик, остальные дописываем следом —
-              // пузырь один и тот же, хвост идёт продолжением.
+              // The replacement used to work only for single-message answers,
+              // so long output (narration plus result) left the draft as a wall
+              // and delivered the answer separately. Now the first chunk
+              // rewrites the draft and the rest follow it — the same bubble,
+              // with the tail as a continuation.
               if (chunks.length >= 1) {
                 progressDraft.compositor.markFinalReplyStarted();
                 let edited = false;
@@ -701,8 +703,8 @@ export async function handleVkInbound(params: {
                   runtime.log?.(
                     `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
-                  // Хвост длинного ответа досылаем обычными сообщениями: VK не
-                  // умеет держать больше ~4096 символов в одном пузыре.
+                  // The tail of a long answer goes as ordinary messages: VK
+                  // cannot hold more than ~4096 characters in one bubble.
                   for (const chunk of chunks.slice(1)) {
                     try {
                       await sendMessageVk(String(message.peerId), chunk.text, {
@@ -714,8 +716,9 @@ export async function handleVkInbound(params: {
                       );
                     }
                   }
-                  // Голосовые — последними и без текста: текст уже в
-                  // заменённом черновике, дублировать его подписью незачем.
+                  // Voice messages go last and without text: the text is
+                  // already in the replaced draft, so a caption would only
+                  // duplicate it.
                   if (hasMedia) {
                     const mediaList = normalized.mediaUrls?.length
                       ? normalized.mediaUrls
@@ -764,17 +767,18 @@ export async function handleVkInbound(params: {
           if (progressDraft && isFinal && !draftHandled) {
             progressDraft.compositor.markFinalReplyDelivered();
             progressDraft.close();
-            // Черновик сносим только если ответ пришёл чем-то другим. Когда
-            // финал пуст, а в черновике уже лежит текст ответа (модель отдала
-            // его блоками по ходу), удаление уничтожает единственный экземпляр
-            // ответа — собеседник остаётся с одной голосовой. Так ломалось при
-            // переключении на локальную модель: у облачных финал несёт весь
-            // текст, у Qwen он приходит пустым.
+            // The draft is dropped only when the answer arrived some other
+            // way. When the final is empty and the draft already holds the
+            // answer text (the model delivered it as blocks along the way),
+            // deleting it destroys the only copy of the answer and the recipient
+            // is left with a voice message alone. This broke on the switch to a
+            // local model: cloud models put the whole text in the final, Qwen
+            // sends it empty.
             const draftMsgId = progressDraft.currentMessageId();
             if (draftAnswerText && !normalized.text?.trim() && draftMsgId !== undefined) {
-              // Черновик и есть ответ — но переписываем его БЕЗ метки хода.
-              // `overwrite` метку подставляет всегда, поэтому готовый ответ
-              // навсегда оставался бы с «⏳ Работаю» в шапке.
+              // The draft is the answer — but rewrite it WITHOUT the progress
+              // label. `overwrite` always prepends the label, so a finished
+              // answer would keep a "working" header forever.
               try {
                 await editMessageVk(String(message.peerId), draftMsgId, draftAnswerText, account);
                 vkDiag("draft kept as answer", { len: draftAnswerText.length });
@@ -827,10 +831,10 @@ export async function handleVkInbound(params: {
                   // Build the full draft line (like Telegram). Passing undefined
                   // leaves the compositor with nothing to render; startImmediately
                   // shows the step at once instead of waiting out the start gate.
-                  // Шаг инструмента перезатирает черновик своим списком, то
-                  // есть текст ответа, лежавший там от предыдущего блока,
-                  // пропадает. Забываем его: иначе на пустом финале мы бы
-                  // «сохранили как ответ» список шагов.
+                  // A tool step overwrites the draft with its own list, so the
+                  // answer text left there by a previous block is gone. Forget
+                  // it: otherwise an empty final would keep the step list as the
+                  // "answer".
                   draftAnswerText = null;
                   await progressDraft.compositor.pushToolProgress(
                     buildChannelProgressDraftLineForEntry(vkStreamingEntry, {
