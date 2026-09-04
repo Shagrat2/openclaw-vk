@@ -64,3 +64,6 @@ jobs:
 
       - name: Resolve SDK imports and load packaged runtime
         run: npm run check:runtime
+
+      - name: Run tests that need the real SDK
+        run: npm run test:sdk

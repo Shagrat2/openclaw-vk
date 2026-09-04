@@ -41,6 +41,8 @@
     "src/channel.setup.ts",
     "src/channel.ts",
     "src/config-schema.ts",
+    "src/vk-errors.ts",
+    "src/diagnostics.ts",
     "src/format.ts",
     "src/inbound.ts",
     "src/keyboard.ts",
@@ -65,7 +67,8 @@
     "prepack": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "test:sdk": "vitest run src/diagnostics.sdk.test.ts"
   },
   "dependencies": {
     "markdown-to-vk": "^0.3.2",
