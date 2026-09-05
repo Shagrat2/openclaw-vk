@@ -952,7 +952,9 @@ describe("inbound enqueue failures", () => {
 
 describe("dispatch guards", () => {
   /** Captures the debouncer's onFlush so a test can invoke it directly. */
-  function captureFlush(): { flush: () => Promise<void> | undefined } {
+  function captureFlush(): {
+    flush: (items?: unknown[], lifecycle?: unknown) => Promise<void> | undefined;
+  } {
     const captured: { flush?: (items: unknown[], createFlush: unknown) => unknown } = {};
     const core = makeVkRuntime();
     vi.mocked(core.channel.debounce.createInboundDebouncer).mockImplementation(
@@ -963,11 +965,14 @@ describe("dispatch guards", () => {
     );
     setVkRuntime(core);
     return {
-      flush: () => {
-        const result = captured.flush?.([], ({ dispatch }: { dispatch: () => Promise<void> }) => ({
-          admission: dispatch(),
-          completion: Promise.resolve(),
-        })) as { admission?: Promise<void> } | undefined;
+      flush: (items: unknown[] = [], lifecycle?: unknown) => {
+        const result = captured.flush?.(
+          items,
+          ({ dispatch }: { dispatch: (lifecycle: unknown) => Promise<void> }) => ({
+            admission: dispatch(lifecycle),
+            completion: Promise.resolve(),
+          }),
+        ) as { admission?: Promise<void> } | undefined;
         return result?.admission;
       },
     };
@@ -985,6 +990,36 @@ describe("dispatch guards", () => {
 
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining("no message after combine"),
+    );
+  });
+
+  it("hands the core the adoption lifecycle, so the peer lane frees at adoption", async () => {
+    // Without this the lane frees only when the whole answer is done, and a
+    // follow-up sent mid-answer waits inside the plugin — the core never sees
+    // it while the run is active and has nothing to steer into.
+    const captured = captureFlush();
+    const runtime = createVkRuntimeEnv();
+    activeMonitor = startMonitor({ runtime });
+    await flush();
+
+    const lifecycle = { onAdopted: vi.fn(), onAbandoned: vi.fn() };
+    await captured.flush(
+      [
+        {
+          messageId: "1",
+          peerId: 555_000,
+          senderId: 555_000,
+          timestamp: 1,
+          isGroup: false,
+          attachments: [],
+          text: "hi",
+        },
+      ],
+      lifecycle,
+    );
+
+    expect(mockHandleVkInbound).toHaveBeenCalledWith(
+      expect.objectContaining({ turnAdoptionLifecycle: lifecycle }),
     );
   });
 

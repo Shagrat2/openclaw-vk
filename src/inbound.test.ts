@@ -1958,6 +1958,34 @@ describe("status reaction lifecycle", () => {
     } as unknown as CoreConfig;
   }
 
+  it("passes the adoption lifecycle to the core as replyOptions.turnAdoptionLifecycle", async () => {
+    // The core frees the debounce lane on this signal. Drop it here and the
+    // lane holds until the answer is finished, so a follow-up sent mid-answer
+    // cannot be steered into the running turn.
+    const runtime = installRuntime();
+    const seen: unknown[] = [];
+    mockReplyDispatcher(runtime, async ({ replyOptions }: any) => {
+      seen.push(replyOptions.turnAdoptionLifecycle);
+    });
+    const turnAdoptionLifecycle = {
+      abortSignal: new AbortController().signal,
+      onAdopted: async () => {},
+      onDeferred: () => undefined,
+      onAdoptionFinalizing: () => {},
+      onAbandoned: async () => {},
+    };
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: statusReactionConfig(),
+      runtime: createVkRuntimeEnv(),
+      turnAdoptionLifecycle,
+    });
+
+    expect(seen).toEqual([turnAdoptionLifecycle]);
+  });
+
   it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
     const controller = await installStatusController();
     const runtime = installRuntime();

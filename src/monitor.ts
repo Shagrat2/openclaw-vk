@@ -8,7 +8,7 @@ import { vkPositiveSetting } from "./settings.js";
 import { globalAgent } from "node:https";
 import { PollingTransport, VK } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
-import { handleVkInbound } from "./inbound.js";
+import { handleVkInbound, type VkTurnAdoptionLifecycle } from "./inbound.js";
 import {
   extractVkInboundAttachments,
   resolveVkInboundReplyContext,
@@ -335,7 +335,11 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     // message is lost silently — no handler call, nothing in the log.
     onFlush: (items, createFlush) => {
       vkDiag("inbound flush", { items: items.length });
-      const dispatch = async (): Promise<void> => {
+      // The lifecycle goes down to the core: it frees this peer's lane the
+      // moment the turn is adopted, not when the answer is finished. That is
+      // what lets a follow-up sent mid-answer reach the core and be steered
+      // into the running turn — natively, with no debounce window.
+      const dispatch = async (lifecycle: VkTurnAdoptionLifecycle): Promise<void> => {
         vkDiag("inbound dispatch start", { items: items.length, stopped: stopRequested });
         if (stopRequested) {
           // Returning quietly here used to read as "the message vanished".
@@ -360,6 +364,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
             runtime: opts.runtime,
             // A gateway stop must reach external send processes (ffmpeg).
             abortSignal: opts.abortSignal,
+            turnAdoptionLifecycle: lifecycle,
           });
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);

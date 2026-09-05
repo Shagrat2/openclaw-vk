@@ -152,6 +152,32 @@ async function deliverVkReply(params: {
   params.statusSink?.({ lastOutboundAt: Date.now() });
 }
 
+/**
+ * The lifecycle the core debouncer hands to a flush, forwarded to the core as
+ * `replyOptions.turnAdoptionLifecycle`.
+ *
+ * Without it the per-peer debounce lane frees only when the whole turn ends,
+ * because the debouncer races `admission` against `completion` and admission is
+ * settled by the dispatch promise when nothing signals adoption. A follow-up
+ * message then waits inside the plugin until the answer is finished, and the
+ * core never sees it while the run is active — so `messages.queue.mode: "steer"`
+ * has nothing to inject into. Forwarding it frees the lane at adoption, the way
+ * Discord does (`turnAdoptionLifecycle: admissionLifecycle`), and costs nothing:
+ * no debounce window, no added latency.
+ *
+ * Declared structurally because no `plugin-sdk` entry point exports the type,
+ * even though the core both hands this object to the plugin and takes it back.
+ */
+export type VkTurnAdoptionLifecycle = {
+  abortSignal: AbortSignal;
+  onAdopted: () => Promise<void>;
+  onDeferred: () => boolean | void;
+  onDeferredHeartbeat?: () => void;
+  onAdoptionFinalizing: () => void;
+  onFailed?: (error: unknown) => Promise<void>;
+  onAbandoned: () => Promise<void>;
+};
+
 export async function handleVkInbound(params: {
   message: VkInboundMessage;
   account: ResolvedVkAccount;
@@ -160,6 +186,8 @@ export async function handleVkInbound(params: {
   statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
   /** Gateway stop: propagated to ffmpeg while splitting long voice messages. */
   abortSignal?: AbortSignal;
+  /** Frees the peer's debounce lane once the core adopts the turn. */
+  turnAdoptionLifecycle?: VkTurnAdoptionLifecycle;
 }): Promise<void> {
   const { message, account, config, runtime, statusSink, abortSignal } = params;
   const core = getVkRuntime();
@@ -827,6 +855,9 @@ export async function handleVkInbound(params: {
       },
       replyOptions: {
         onModelSelected,
+        ...(params.turnAdoptionLifecycle
+          ? { turnAdoptionLifecycle: params.turnAdoptionLifecycle }
+          : {}),
         // Reactions and the step draft are independent surfaces — fan each
         // progress event out to whichever is enabled (both, when both are on).
         ...(progressDraft || statusReactions
