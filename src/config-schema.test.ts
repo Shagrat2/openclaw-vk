@@ -224,3 +224,22 @@ describe("VkConfigSchema", () => {
     expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain("accounts.work");
   });
 });
+
+// ── Transport ────────────────────────────────────────────────────────────────
+
+describe("VkAccountSchema transport", () => {
+  it("accepts a positive silence threshold", () => {
+    const result = VkAccountSchema.safeParse({ transport: { silenceMs: 30_000 } });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a non-positive or fractional threshold", () => {
+    expect(VkAccountSchema.safeParse({ transport: { silenceMs: 0 } }).success).toBe(false);
+    expect(VkAccountSchema.safeParse({ transport: { silenceMs: 1.5 } }).success).toBe(false);
+  });
+
+  it("rejects unknown transport fields (strict)", () => {
+    const result = VkAccountSchema.safeParse({ transport: { silence: 30_000 } });
+    expect(result.success).toBe(false);
+  });
+});

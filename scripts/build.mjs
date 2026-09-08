@@ -11,6 +11,7 @@ const entryPoints = [
   "src/config-schema.ts",
   "src/vk-errors.ts",
   "src/diagnostics.ts",
+  "src/stall-watchdog.ts",
   "src/format.ts",
   "src/inbound.ts",
   "src/keyboard.ts",

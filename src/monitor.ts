@@ -1,8 +1,10 @@
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
-import { channelReadyPatch } from "openclaw/plugin-sdk/gateway-runtime";
+import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gateway-runtime";
+import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/core";
 import { globalAgent } from "node:https";
 import { PollingTransport, VK } from "vk-io";
+import { createStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound } from "./inbound.js";
 import {
@@ -11,7 +13,7 @@ import {
 } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { primeVkGroupId } from "./send.js";
-import type { CoreConfig, VkInboundMessage } from "./types.js";
+import type { CoreConfig, VkAccountConfig, VkInboundMessage } from "./types.js";
 
 const FIRST_LONG_POLL_CHECK_TIMEOUT_MS = 35_000;
 const FIRST_LONG_POLL_CHECK_ERROR = "VK Long Poll transport check failed";
@@ -22,6 +24,32 @@ const FIRST_LONG_POLL_CHECK_ERROR = "VK Long Poll transport check failed";
  * and ensures updates returned by the readiness poll enter the normal
  * middleware pipeline.
  */
+/**
+ * How long the transport may stay silent before we treat it as stalled.
+ *
+ * A long poll waits up to ~25 seconds for an event and then returns, so no
+ * completed request for minutes is an anomaly rather than a quiet chat. The
+ * gateway watches `lastTransportActivityAt` too, but with a half-hour default;
+ * this only makes the same check faster.
+ */
+const DEFAULT_TRANSPORT_SILENCE_MS = 150_000;
+
+/**
+ * Resolved per account start, from the config the gateway hands in, never at
+ * import time: the module is evaluated before the plugin runtime exists, so a
+ * module-level read would only ever see the default, and a later config change
+ * would not reach a constant. The environment still wins when set, because
+ * changing a variable on a running gateway is the fastest way to answer
+ * "is this knob the problem?".
+ */
+function resolveTransportSilenceMs(config: VkAccountConfig): number {
+  const fromEnv = parseStrictPositiveInteger(process.env.VK_TRANSPORT_SILENCE_MS);
+  if (fromEnv !== undefined) {
+    return fromEnv;
+  }
+  return parseStrictPositiveInteger(config.transport?.silenceMs) ?? DEFAULT_TRANSPORT_SILENCE_MS;
+}
+
 class ReadinessPollingTransport extends PollingTransport {
   private readinessSettled = false;
   private firstFetchController: AbortController | undefined;
@@ -241,11 +269,20 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
   });
 
   const vk = new VK({ token: opts.token, apiLimit: 20 });
+  // Our own stop signal: when the watchdog sees a stalled transport it ends the
+  // account task, and the gateway brings the channel back with its own backoff.
+  const localStop = new AbortController();
+  const stopSignal = opts.abortSignal
+    ? AbortSignal.any([opts.abortSignal, localStop.signal])
+    : localStop.signal;
   let stopRequested = false;
   let updatesStarted = false;
   let stopPromise: Promise<void> | undefined;
   let pollingTransport: ReadinessPollingTransport | undefined;
   let publishPollActivity = false;
+  // Declared here so `finally` can reach it: the watchdog owns a timer, and a
+  // start that fails before the watchdog is armed must still release it.
+  let stallWatchdog: StallWatchdog | undefined;
 
   const stopUpdates = async (): Promise<void> => {
     stopRequested = true;
@@ -341,6 +378,29 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       primeVkGroupId(opts.token, botsLp.groupId);
     }
     const useBotsLongPoll = botsLp.ok && botsLp.groupId !== undefined;
+    // The only honest liveness signal is "a poll request came back". The cursor
+    // is not one: it moves on EVENTS, so it sits still for hours on a quiet
+    // channel; and `isStarted` stays true on a wedged transport.
+    stallWatchdog = createStallWatchdog({
+      label: `vk:${opts.accountId} long-poll`,
+      timeoutMs: resolveTransportSilenceMs(account.config),
+      abortSignal: stopSignal,
+      runtime: opts.runtime,
+      onTimeout: ({ idleMs }) => {
+        const silentSec = Math.round(idleMs / 1000);
+        opts.setStatus?.(
+          channelStoppedPatch({
+            lastError: `no completed long-poll request for ${silentSec}s`,
+            lastDisconnect: {
+              at: Date.now(),
+              error: `long poll silent for ${silentSec}s`,
+            },
+          }),
+        );
+        localStop.abort();
+      },
+    });
+
     pollingTransport = new ReadinessPollingTransport(
       {
         api: vk.api,
@@ -350,6 +410,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
         ...(useBotsLongPoll ? { pollingGroupId: botsLp.groupId } : {}),
       },
       () => {
+        stallWatchdog?.touch();
         if (publishPollActivity) {
           opts.setStatus?.({ lastTransportActivityAt: Date.now() });
         }
@@ -403,9 +464,21 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       }),
     );
 
-    // Keep lifecycle alive until gateway requests stop.
-    await waitForAbort(opts.abortSignal);
+    // Armed only after the first successful poll: the connect handshake has no
+    // completed poll behind it and would trip the watchdog on every start.
+    stallWatchdog.arm(connectedAt);
+
+    // Keep lifecycle alive until the gateway requests stop, or the watchdog
+    // ends it because the transport went silent.
+    await waitForAbort(stopSignal);
   } finally {
-    await stopUpdates();
+    try {
+      await stopUpdates();
+    } finally {
+      // Unconditional: a failed start never armed the watchdog, so nothing else
+      // would ever stop it, and each retry would leave another interval behind.
+      stallWatchdog?.stop();
+      localStop.abort();
+    }
   }
 }
