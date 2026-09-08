@@ -9,6 +9,7 @@ const entryPoints = [
   "src/channel.setup.ts",
   "src/channel.ts",
   "src/config-schema.ts",
+  "src/stall-watchdog.ts",
   "src/format.ts",
   "src/inbound.ts",
   "src/keyboard.ts",

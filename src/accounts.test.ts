@@ -287,3 +287,27 @@ describe("listEnabledVkAccounts", () => {
     expect(accounts).toEqual([]);
   });
 });
+
+// ── Transport tunables ───────────────────────────────────────────────────────
+
+describe("transport section", () => {
+  it("reaches the default account from the channel section", () => {
+    const result = resolveVkAccount({
+      cfg: cfg({ token: "base-token", transport: { silenceMs: 30_000 } }),
+      accountId: "default",
+    });
+    expect(result.config.transport).toEqual({ silenceMs: 30_000 });
+  });
+
+  it("a named account overrides the channel-wide threshold", () => {
+    const result = resolveVkAccount({
+      cfg: cfg({
+        token: "base-token",
+        transport: { silenceMs: 30_000 },
+        accounts: { sales: { token: "sales-token", transport: { silenceMs: 90_000 } } },
+      }),
+      accountId: "sales",
+    });
+    expect(result.config.transport).toEqual({ silenceMs: 90_000 });
+  });
+});

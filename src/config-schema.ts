@@ -20,6 +20,19 @@ function requireOpenAllowFrom(params: {
 const OPEN_DM_POLICY_ALLOW_FROM_ERROR =
   'channels.vk.dmPolicy="open" requires channels.vk.allowFrom to include "*"';
 
+// Long-poll transport (`channels.vk.transport`).
+const VkTransportSchema = z
+  .object({
+    /**
+     * Silence after which the account task ends and the gateway restarts the
+     * channel. A long poll returns within ~25s, so minutes of silence is an
+     * anomaly; the gateway's own threshold is half an hour.
+     */
+    silenceMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .optional();
+
 const VkGroupToolPolicySchema = z
   .object({
     allow: z.array(z.string()).optional(),
@@ -47,6 +60,7 @@ const VkAccountSchemaBase = z
     token: z.string().optional(),
     tokenFile: z.string().optional(),
     dmPolicy: DmPolicySchema.optional(),
+    transport: VkTransportSchema,
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     defaultTo: z.string().optional(),
     groupPolicy: GroupPolicySchema.optional(),
