@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  // Pulled in through settings.ts, which the transport-silence knob reads.
+  parseStrictPositiveInteger: (value?: string) => {
+    if (!value || !/^\d+$/.test(value)) return undefined;
+    const parsed = Number.parseInt(value, 10);
+    return parsed > 0 ? parsed : undefined;
+  },
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
@@ -12,6 +18,12 @@ vi.mock("openclaw/plugin-sdk/account-id", () => ({
 }));
 
 vi.mock("openclaw/plugin-sdk/gateway-runtime", () => ({
+  channelStoppedPatch: (extras: Record<string, unknown> = {}) => ({
+    running: false,
+    connected: false,
+    lifecycle: "stopped",
+    ...extras,
+  }),
   channelReadyPatch: (extras: Record<string, unknown> = {}) => ({
     running: true,
     connected: true,
@@ -742,5 +754,159 @@ describe("message_new handler", () => {
     expect(message.attachments).toEqual([]);
     expect(message.replyToMessageId).toBeUndefined();
     expect(message.replyToText).toBeUndefined();
+  });
+});
+
+describe("stall watchdog", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+  });
+
+  function cfgWithSilence(silenceMs: number): CoreConfig {
+    return { channels: { vk: { token: "test-token", transport: { silenceMs } } } };
+  }
+
+  it("reports a disconnect and ends the account task when polls stop coming", async () => {
+    // The gateway watches transport activity too, but with a half-hour default.
+    // A long poll returns within ~25s, so minutes of silence is an anomaly, and
+    // ending the task here lets the gateway restart the channel much sooner.
+    vi.useFakeTimers();
+    const setStatus = vi.fn();
+    const monitor = startMonitor({ setStatus });
+    await flush();
+    setStatus.mockClear();
+
+    await vi.advanceTimersByTimeAsync(160_000);
+    await monitor.promise;
+
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        running: false,
+        connected: false,
+        lifecycle: "stopped",
+        lastError: expect.stringContaining("no completed long-poll request"),
+      }),
+    );
+  });
+
+  it("stays quiet while polls keep completing", async () => {
+    vi.useFakeTimers();
+    const setStatus = vi.fn();
+    activeMonitor = startMonitor({ setStatus });
+    await flush();
+    setStatus.mockClear();
+
+    for (let i = 0; i < 8; i += 1) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await mockPollingTransportInstances[0].fetchUpdates();
+    }
+
+    expect(setStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: "stopped" }),
+    );
+  });
+
+  it("reads the configured silence at account start, not at module import", async () => {
+    // This module was imported at the top of the file, long before any config
+    // existed. A threshold captured at import time would only ever be the
+    // default; the configured value must reach the watchdog when the account
+    // starts.
+    vi.useFakeTimers();
+    const setStatus = vi.fn();
+    const monitor = startMonitor({ setStatus, config: cfgWithSilence(30_000) });
+    await flush();
+    setStatus.mockClear();
+
+    await vi.advanceTimersByTimeAsync(40_000);
+    await monitor.promise;
+
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lifecycle: "stopped",
+        lastError: expect.stringContaining("no completed long-poll request"),
+      }),
+    );
+  });
+
+  it("a second start picks up a changed threshold without re-importing the module", async () => {
+    vi.useFakeTimers();
+    const first = startMonitor({ config: cfgWithSilence(30_000) });
+    await flush();
+    await vi.advanceTimersByTimeAsync(40_000);
+    await first.promise;
+
+    const setStatus = vi.fn();
+    activeMonitor = startMonitor({ setStatus, config: cfgWithSilence(90_000) });
+    await flush();
+    setStatus.mockClear();
+
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(setStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: "stopped" }),
+    );
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await activeMonitor.promise;
+    activeMonitor = undefined;
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: "stopped" }),
+    );
+  });
+
+  it("the environment override wins over the configured threshold", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("VK_TRANSPORT_SILENCE_MS", "20000");
+    const setStatus = vi.fn();
+    const monitor = startMonitor({ setStatus, config: cfgWithSilence(90_000) });
+    await flush();
+    setStatus.mockClear();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await monitor.promise;
+
+    expect(setStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: "stopped" }),
+    );
+  });
+
+  it("releases the watchdog timer when the transport fails to start, so retries leave nothing behind", async () => {
+    // The watchdog is created before `start()` and armed only after the first
+    // successful poll. A start that throws never arms it, so unless `finally`
+    // stops it, every failed start leaves an interval running.
+    vi.useFakeTimers();
+    mockPollingTransportStart.mockRejectedValue(new Error("start exploded"));
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const monitor = startMonitor({ abortSignal: undefined });
+      await expect(monitor.promise).rejects.toThrow("start exploded");
+    }
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases the watchdog timer when the readiness check times out", async () => {
+    vi.useFakeTimers();
+    mockFirstLongPollFetch.mockImplementation(() => new Promise(() => {}));
+
+    const monitor = startMonitor({ abortSignal: undefined });
+    const outcome = expect(monitor.promise).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(40_000);
+    await outcome;
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases the watchdog timer even when stopping the transport fails", async () => {
+    vi.useFakeTimers();
+    mockPollingTransportStop.mockRejectedValue(new Error("stop exploded"));
+    const controller = new AbortController();
+    const monitor = startMonitor({ abortSignal: controller.signal });
+    await flush();
+
+    controller.abort();
+    await monitor.promise;
+
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

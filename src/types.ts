@@ -11,6 +11,8 @@ export type VkAccountConfig = {
   defaultTo?: string;
   groupPolicy?: GroupPolicy;
   groupAllowFrom?: Array<string | number>;
+  /** Long-poll transport tunables; see `resolveTransportSilenceMs` in monitor.ts. */
+  transport?: { silenceMs?: number };
   groups?: Record<
     string,
     {
