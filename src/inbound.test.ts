@@ -1720,6 +1720,231 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
     mockCurrentMessageId.mockReturnValue(undefined);
   });
 
+  // ── Voice supplement must not decide the draft's fate ─────────────────────
+  // The core follows a delivered answer with a SECOND final that carries only
+  // audio and no text, marked `visibleTextAlreadyDelivered`. Read as an ordinary
+  // final, its empty text means "no answer came" and the draft holding the answer
+  // is deleted — on 08.09.2026 that left three live replies as a picture plus a
+  // voice note and no text at all.
+  const voiceSupplement = (spokenText = "полный ответ, который уже отправлен") => ({
+    mediaUrl: "/tmp/speech.opus",
+    audioAsVoice: true,
+    ttsSupplement: { spokenText, visibleTextAlreadyDelivered: true },
+  });
+
+  it("оставляет черновик с ответом, когда следом идёт голосовая добавка", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockEditMessageVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "вот график, который ты просил", mediaUrl: "/tmp/chart.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    // Both attachments still reach the person: the picture and then its voice.
+    const sent = JSON.stringify(mockSendPayloadVk.mock.calls);
+    expect(sent).toContain("/tmp/speech.opus");
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("оставляет черновик, когда добавка идёт за ответом без картинки", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "ответ целиком" }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("доставляет голосовую добавку, когда черновика нет вовсе", async () => {
+    mockResolveStreamMode.mockReturnValue("off");
+    mockDraftRemove.mockClear();
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "ответ" }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "off" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(JSON.stringify(mockSendPayloadVk.mock.calls)).toContain("/tmp/speech.opus");
+  });
+
+  it("оставляет черновик, даже когда накопленный текст блоков уже сброшен", async () => {
+    // The live case. A tool step wipes `draftAnswerText`, so by the time the
+    // supplement arrives the plugin has no accumulated answer of its own — which
+    // is exactly the state in which it used to delete the draft.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(8416);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver({ text: "начало работы" }, { kind: "block" });
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "итог с картинкой", mediaUrl: "/tmp/chart.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("не мешает черновику держать более полный ответ при обрезанном финале", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockEditMessageVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver(
+          { text: "полный ответ, который сложился из блоков по ходу работы" },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver({ text: "   " }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      expect.anything(),
+      4242,
+      expect.stringContaining("сложился из блоков"),
+      expect.anything(),
+    );
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("по-прежнему сносит черновик, когда пустой финал НЕ помечен как добавка", async () => {
+    // The guard is the mark, not the empty text: an ordinary media-only final
+    // with nothing kept in the draft still drops it, exactly as before.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { mediaUrl: "/tmp/speech.opus", audioAsVoice: true },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("переживает несколько голосовых добавок подряд", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "две картинки", mediaUrl: "/tmp/a.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement("первая часть"), { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement("вторая часть"), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
   it("sends the block the usual way when the draft write fails", async () => {
     // `overwrite` reports the outcome instead of throwing, so a failed VK edit
     // has to be checked. Missing that left the person with nothing at all on a

@@ -1,4 +1,5 @@
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth-native";
+import { getReplyPayloadTtsSupplement } from "openclaw/plugin-sdk/reply-payload";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { StreamingCompatEntry } from "./sdk-compat.js";
 import {
@@ -642,6 +643,20 @@ export async function handleVkInbound(params: {
               : {};
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
           const isFinal = info?.kind === "final";
+          // ── A voice supplement is not an answer ──────────────────────────
+          // The core may follow a delivered answer with a SECOND final that
+          // carries only audio and no text, marked `visibleTextAlreadyDelivered`:
+          // the words already went out, this payload is just their voice. Its
+          // empty text says nothing about whether an answer exists, so it must
+          // not decide the step draft's fate. Letting it through deleted the
+          // very message that held the answer — the recipient was left with a
+          // picture and a voice note and no text (live incident 08.09.2026).
+          const isTtsSupplement =
+            isFinal &&
+            getReplyPayloadTtsSupplement(normalized)?.visibleTextAlreadyDelivered === true;
+          // Owns the draft outcome: may rewrite it into the answer, keep it, or
+          // drop it. A supplement owns none of that and only carries its media.
+          const ownsDraftOutcome = isFinal && !isTtsSupplement;
           let draftHandled = false;
 
           // ── Intermediate block → into the draft, not a separate message ──
@@ -712,7 +727,7 @@ export async function handleVkInbound(params: {
           // INTO the answer instead of dropping it and sending a new one. Any
           // richer answer falls through to the normal, proven delivery path so
           // media / buttons / long multi-chunk replies keep full fidelity.
-          if (progressDraft && isFinal) {
+          if (progressDraft && ownsDraftOutcome) {
             const draftMsgId = progressDraft.currentMessageId();
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
@@ -810,7 +825,7 @@ export async function handleVkInbound(params: {
             clearKeyboard:
               payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
           });
-          if (progressDraft && isFinal && !draftHandled) {
+          if (progressDraft && ownsDraftOutcome && !draftHandled) {
             progressDraft.compositor.markFinalReplyDelivered();
             progressDraft.close();
             // The draft is dropped only when the answer arrived some other
