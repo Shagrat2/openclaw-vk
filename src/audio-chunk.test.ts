@@ -261,6 +261,26 @@ describe("splitAudioAtSilence — full extraction path", () => {
     );
   }
 
+  it("shifts segment timestamps to zero, or VK shows the voice as 0:00", async () => {
+    // Stream copy keeps the source timestamps, so every segment after the first
+    // starts at a negative offset (measured 09.09 on a real reply: -0.534 and
+    // -0.857 seconds). Desktop clients decode the stream and show the true
+    // length; the VK mobile client trusts the declared duration and shows 0:00.
+    // Two of three voice messages arrived that way before this flag.
+    stubTools({ durationSec: "100.0" });
+
+    await splitAudioAtSilence("/tmp/voice.ogg", 30_000);
+
+    const extractions = mockExecFile.mock.calls
+      .map((call) => call[1] as string[])
+      .filter((args) => args.includes("copy"));
+    expect(extractions.length).toBeGreaterThan(1);
+    for (const args of extractions) {
+      expect(args).toContain("-avoid_negative_ts");
+      expect(args[args.indexOf("-avoid_negative_ts") + 1]).toBe("make_zero");
+    }
+  });
+
   it("returns one file per range when every segment fits the limit", async () => {
     stubTools({ durationSec: "100.0", segmentDurationSec: "20.0" });
 

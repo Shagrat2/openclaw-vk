@@ -346,7 +346,13 @@ export async function splitAudioAtSilence(
         const durSec = ((range.end - range.start) / 1000).toFixed(3);
         args.push("-t", durSec);
       }
-      args.push("-c", "copy", out);
+      // `-avoid_negative_ts make_zero` — не косметика. Со стрим-копированием
+      // ffmpeg сохраняет исходные метки времени, и у каждого куска, кроме первого,
+      // начало уезжает в минус (замер 09.09: -0.534 и -0.857 секунды). Файл при
+      // этом играется, поэтому на компьютере всё выглядит целым, а мобильный
+      // клиент ВК показывает такие голосовые как 0:00 — он верит объявленной
+      // длительности, а не декодирует поток. Флаг сдвигает метки к нулю.
+      args.push("-c", "copy", "-avoid_negative_ts", "make_zero", out);
       await runProcess(getFfmpegBin(), args, signal);
       outputs.push(out);
     }
