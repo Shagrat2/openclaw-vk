@@ -145,6 +145,30 @@ vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   }),
 }));
 
+// Faithful to the core (`reply-payload`): a supplement is recognised only when it
+// carries spoken text AND media, and the "already delivered" flag survives only
+// when it is literally true. A looser stub would let the tests below pass while
+// production still deleted the draft.
+vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
+  getReplyPayloadTtsSupplement: (payload: {
+    ttsSupplement?: { spokenText?: string; visibleTextAlreadyDelivered?: boolean };
+    mediaUrl?: string;
+    mediaUrls?: string[];
+  }) => {
+    const spokenText = payload?.ttsSupplement?.spokenText?.trim();
+    const hasMedia = Boolean(payload?.mediaUrl || payload?.mediaUrls?.length);
+    if (!spokenText || !hasMedia) {
+      return undefined;
+    }
+    return {
+      spokenText,
+      ...(payload.ttsSupplement?.visibleTextAlreadyDelivered === true
+        ? { visibleTextAlreadyDelivered: true }
+        : {}),
+    };
+  },
+}));
+
 vi.mock("openclaw/plugin-sdk/command-auth-native", () => ({
   resolveControlCommandGate: vi.fn(() => ({
     shouldBlock: false,
