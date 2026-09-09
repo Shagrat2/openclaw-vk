@@ -6,7 +6,7 @@ import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } from "./diagnostics.js";
-import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
+import { readVkErrorCode, readVkErrorMessage, readVkErrorSystemCode } from "./vk-errors.js";
 import {
   cleanupAudioSegments,
   getVkAudioMessageMaxMs,
@@ -230,6 +230,8 @@ function logMediaUploadOutcome(params: {
   mime?: string;
   bytes?: number;
   attempt: number;
+  /** How long this attempt ran before it finished or failed. */
+  elapsedMs?: number;
   error?: unknown;
 }): void {
   const fields = {
@@ -238,6 +240,10 @@ function logMediaUploadOutcome(params: {
     mime: params.mime,
     bytes: params.bytes,
     attempt: params.attempt,
+    elapsedMs: params.elapsedMs,
+    // Only on failure, and only the errno-shaped token: it separates a broken
+    // connection from a refusal by VK, which the numeric code cannot do.
+    errno: params.error ? readVkErrorSystemCode(params.error) : undefined,
   };
   if (params.error) {
     vkDiagFailure("vk upload failed", params.error, fields);
@@ -276,14 +282,16 @@ function retryDelayMs(attempt: number): number {
  * one was only computed for buffers, leaving a hole for on-disk files exactly
  * where the number tells an empty render from a complete one.
  *
- * The stat call happens only when diagnostics are on, and once per upload rather
- * than per attempt: with diagnostics off the send path must pay nothing.
+ * Gating lives in the caller, not here: on the happy path the size is measured only
+ * when diagnostics are on, so a successful send with `off` still touches no disk;
+ * on failure it is measured regardless, because failures are logged at every level
+ * and that is exactly where the number tells an empty render from a complete one.
  */
 async function localSourceSize(source: string | Buffer): Promise<number | undefined> {
   if (Buffer.isBuffer(source)) {
     return source.byteLength;
   }
-  if (resolveVkDiagLevel() === "off" || describeVkSourceKind(source) !== "local") {
+  if (describeVkSourceKind(source) !== "local") {
     return undefined;
   }
   try {
@@ -307,26 +315,47 @@ async function runMediaUpload<T>(params: {
     maxAttempts?: number;
   };
 }): Promise<T> {
-  const bytes = await localSourceSize(params.source);
+  // Happy path keeps its old cost: nothing is measured while diagnostics are off.
+  let bytes =
+    resolveVkDiagLevel() === "off" ? undefined : await localSourceSize(params.source);
   let attempt = 0;
   return await withVkRetry(
     async () => {
       attempt += 1;
+      // Measured per attempt, not per upload: an instant refusal and a transfer
+      // that ran for seconds and then failed look identical in the log without
+      // it, and they have opposite causes. In the 07.09 incident three attempts
+      // took 11 seconds between them, which is what showed the file was actually
+      // being sent.
+      const startedAt = Date.now();
       try {
         const result = await enqueueKeyedTask({
           tails: mediaUploadTails,
           key: params.token,
           task: params.upload,
         });
-        logMediaUploadOutcome({ kind: params.kind, source: params.source, mime: params.mime, bytes, attempt });
-        return result;
-      } catch (error) {
         logMediaUploadOutcome({
           kind: params.kind,
           source: params.source,
           mime: params.mime,
           bytes,
           attempt,
+          elapsedMs: Date.now() - startedAt,
+        });
+        return result;
+      } catch (error) {
+        // A failure is logged even at `off`, and the byte count is a safe field —
+        // measure it now if the happy path skipped it.
+        if (bytes === undefined) {
+          bytes = await localSourceSize(params.source);
+        }
+        logMediaUploadOutcome({
+          kind: params.kind,
+          source: params.source,
+          mime: params.mime,
+          bytes,
+          attempt,
+          elapsedMs: Date.now() - startedAt,
           error,
         });
         throw error;

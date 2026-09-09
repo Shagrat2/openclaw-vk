@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
+import { readVkErrorCode, readVkErrorMessage, readVkErrorSystemCode } from "./vk-errors.js";
 
 describe("readVkErrorCode", () => {
   it("reads the code vk-io puts in `code`", () => {
@@ -50,5 +50,47 @@ describe("readVkErrorMessage", () => {
     expect(readVkErrorMessage(null)).toBe("");
     expect(readVkErrorMessage("boom")).toBe("");
     expect(readVkErrorMessage({})).toBe("");
+  });
+});
+
+describe("readVkErrorSystemCode", () => {
+  it("finds the errno vk-io buried under cause", () => {
+    // The whole point: a truncated upload and a refusal by VK arrive in the same
+    // shape, and only the system code separates them.
+    const error = Object.assign(new Error("Code №100 - photo is undefined"), {
+      code: 100,
+      cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+    });
+    expect(readVkErrorSystemCode(error)).toBe("ECONNRESET");
+  });
+
+  it("reads the code on the error itself", () => {
+    expect(readVkErrorSystemCode(Object.assign(new Error("x"), { code: "EPIPE" }))).toBe("EPIPE");
+  });
+
+  it("looks inside an aggregate error from a failed connect", () => {
+    const aggregate = Object.assign(new Error("all attempts failed"), {
+      errors: [
+        Object.assign(new Error("v6"), { code: "ENETUNREACH" }),
+        Object.assign(new Error("v4"), { code: "ETIMEDOUT" }),
+      ],
+    });
+    expect(readVkErrorSystemCode(aggregate)).toBe("ENETUNREACH");
+  });
+
+  it("ignores anything that is not an errno-shaped token", () => {
+    // A numeric VK code is not a system code, and free text must never pass here:
+    // whatever this returns goes to the log at every level, including off.
+    expect(readVkErrorSystemCode({ code: 100 })).toBeUndefined();
+    expect(readVkErrorSystemCode({ code: "photo is undefined" })).toBeUndefined();
+    expect(readVkErrorSystemCode({ code: "/srv/media/a.jpg" })).toBeUndefined();
+    expect(readVkErrorSystemCode(null)).toBeUndefined();
+    expect(readVkErrorSystemCode("boom")).toBeUndefined();
+  });
+
+  it("does not follow a cycle of causes forever", () => {
+    const a: Record<string, unknown> = { message: "a" };
+    a.cause = a;
+    expect(readVkErrorSystemCode(a)).toBeUndefined();
   });
 });

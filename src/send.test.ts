@@ -616,6 +616,64 @@ describe("sendPhotoVk", () => {
     expect((meta as { source?: unknown })?.source).toBe("buffer");
   });
 
+  it("times each attempt, so a refusal is told apart from a transfer that broke", async () => {
+    // The 07.09 incident: three attempts spent 11 seconds between them, which is
+    // what showed the file was actually being sent and not rejected outright.
+    // Without a duration the log cannot make that distinction.
+    mockUploadPhoto.mockReset().mockImplementation(
+      () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("boom")), 20)),
+    );
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect((meta as { elapsedMs?: number })?.elapsedMs).toBeGreaterThanOrEqual(15);
+  });
+
+  it("names the system error behind a failure without logging its text", async () => {
+    // A truncated upload arrives from vk-io looking exactly like a refusal by VK:
+    // same shape, message buried under `cause`. The errno is the one safe field
+    // that separates them.
+    const failure = Object.assign(new Error("Code №100 - photo is undefined"), {
+      code: 100,
+      cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+    });
+    mockUploadPhoto.mockReset().mockRejectedValue(failure);
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ code: 100, errno: "ECONNRESET" }),
+    );
+  });
+
+  it("measures an on-disk file of a failed upload even with diagnostics off", async () => {
+    // Failures are logged at every level, and the byte count is a safe field: it
+    // tells an empty render from a complete one. Buffers always carried it, files
+    // on disk did not — the size was measured only when diagnostics were on, which
+    // is never in production. The happy path still touches no disk while off.
+    const dir = await mkdtemp(join(tmpdir(), "vk-send-test-"));
+    const file = join(dir, "frame.jpg");
+    await writeFile(file, Buffer.alloc(2048, 7));
+    mockUploadPhoto.mockReset().mockRejectedValue(new Error("boom"));
+
+    try {
+      await expect(sendPhotoVk("123", file, undefined, { cfg })).rejects.toThrow();
+
+      expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+        "vk upload failed",
+        expect.objectContaining({ bytes: 2048, source: "local" }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("sends empty message text when no caption", async () => {
     mockMessagesSend.mockResolvedValueOnce(1);
 
@@ -2707,8 +2765,11 @@ describe("long spoken reply continuation", () => {
    * rather than awaiting the send call itself.
    */
   async function settleContinuation(): Promise<void> {
-    for (let i = 0; i < 50; i += 1) {
-      await Promise.resolve();
+    // Macrotask ticks, not just microtasks: a failed upload measures the file size
+    // for the log, and that is real disk I/O — draining the microtask queue never
+    // reaches past it.
+    for (let i = 0; i < 20; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
 
