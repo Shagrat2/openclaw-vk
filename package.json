@@ -1,6 +1,6 @@
 {
   "name": "@openclaw-vk/vk",
-  "version": "2026.9.2",
+  "version": "2026.9.3",
   "description": "OpenClaw VK (VKontakte) channel plugin",
   "author": {
     "name": "Pavel Frankov",
@@ -9,7 +9,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=22.22.3"
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
   },
   "keywords": [
     "openclaw",

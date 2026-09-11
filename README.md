@@ -2,7 +2,7 @@
 <img width="500" src="https://github.com/user-attachments/assets/1bb97849-8aa0-46dc-b3de-90e4bcf10d38"/>
 
 Плагин [OpenClaw](https://github.com/openclaw/openclaw) для работы с ВКонтакте. Подключает AI-агента к сообществам VK через Bots Long Poll API — бот принимает и отвечает на сообщения в личных диалогах и групповых беседах.  
-Минимальная требуемая версия OpenClaw: **v2026.8.1**
+Минимальная требуемая версия OpenClaw: **v2026.8.1**. Поддерживаются те же версии Node.js, что и OpenClaw 2026.8.1: **22.22.3–22.x, 24.15.0–24.x или 25.9.0+**; Node.js 23 и 25.0–25.8 не поддерживаются.
 
 ## Быстрый старт
 
@@ -55,7 +55,7 @@ openclaw plugins update vk
 openclaw plugins update --all
 
 # Установить конкретную версию
-openclaw plugins install @openclaw-vk/vk@2026.9.2 --force --accept-capabilities
+openclaw plugins install @openclaw-vk/vk@2026.9.3 --force --accept-capabilities
 openclaw gateway restart
 openclaw channels status --json --probe
 ```
