@@ -857,7 +857,7 @@ describe("dispatch payload", () => {
     );
   });
 
-  it("forwards full reply payloads to sendPayloadVk without stripping channelData", async () => {
+  it("removes reply ids from ordinary direct replies without stripping channelData", async () => {
     const runtime = installRuntime();
     vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
       async ({ dispatcherOptions }: any) => {
@@ -884,13 +884,39 @@ describe("dispatch payload", () => {
       String(SENDER_ID),
       {
         text: "Providers:",
-        replyToId: "77",
         channelData: {
           vk: {
             buttons: [[{ text: "OpenAI", callback_data: "/models openai", style: "primary" }]],
           },
         },
       },
+      { accountId: "default" },
+    );
+  });
+
+  it("quotes the inbound message in group replies", async () => {
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "Group reply" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: GROUP_PEER_ID,
+        messageId: "group-77",
+        isGroup: true,
+      }),
+      account: makeAccount({ config: { groupPolicy: "open", requireMention: false } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      String(GROUP_PEER_ID),
+      { text: "Group reply", replyToId: "group-77" },
       { accountId: "default" },
     );
   });
@@ -924,6 +950,7 @@ describe("dispatch payload", () => {
       String(SENDER_ID),
       {
         text: "Thinking level set to high.",
+        replyToId: "msg-1",
       },
       { accountId: "default", clearKeyboard: true },
     );
@@ -964,6 +991,7 @@ describe("dispatch payload", () => {
           "Current thinking level: high.",
           "Options: off, minimal, low, medium, high, adaptive.",
         ].join("\n"),
+        replyToId: "msg-1",
       },
       { accountId: "default" },
     );

@@ -479,9 +479,21 @@ export async function handleVkInbound(params: {
             payload && typeof payload === "object" && !Array.isArray(payload)
               ? (payload as VkDispatchPayload)
               : {};
+          const replyToId = payloadCommand
+            ? (normalized.replyToId ?? message.messageId)
+            : isGroup
+              ? message.messageId
+              : undefined;
+          const outboundPayload: VkDispatchPayload = {
+            ...normalized,
+            ...(replyToId ? { replyToId } : {}),
+          };
+          if (!replyToId) {
+            delete outboundPayload.replyToId;
+          }
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
           await deliverVkReply({
-            payload: normalized,
+            payload: outboundPayload,
             peerId: message.peerId,
             accountId: account.accountId,
             statusSink,
