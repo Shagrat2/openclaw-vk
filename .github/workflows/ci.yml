@@ -38,10 +38,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        openclaw:
-          - "2026.8.1"
-          - latest
-          - beta
+        include:
+          - openclaw: "2026.8.1"
+            node: "22.22.3"
+          - openclaw: latest
+            node: "24.16.0"
+          - openclaw: beta
+            node: "24.16.0"
 
     steps:
       - name: Checkout
@@ -50,14 +53,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 22.22.3
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install plugin dependencies
         run: npm ci
 
       - name: Install OpenClaw host
-        run: npm install --no-save --package-lock=false "openclaw@${{ matrix.openclaw }}"
+        run: npm install --save-dev --package-lock=false "openclaw@${{ matrix.openclaw }}"
 
       - name: Build plugin
         run: npm run build
