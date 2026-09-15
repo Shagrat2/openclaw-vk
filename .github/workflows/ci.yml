@@ -32,12 +32,22 @@ jobs:
       - name: Run repository checks
         run: npm run check
 
+      # The host from 2026.9.3 on needs Node 24.16+; on the Node above npm skips
+      # it silently and the typecheck finds no SDK. The checks before this step
+      # stay on the oldest supported Node.
+      - name: Setup Node.js for the host SDK
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.16.0
+          cache: npm
+
       # Typechecking needs the host SDK, which is an optional peer and therefore
       # absent from `npm ci`. Installed without touching the lockfile, the same
-      # way check:runtime documents it.
+      # way the runtime job does it; `--save-dev`, because npm 11 prunes a
+      # `--no-save` package.
       - name: Typecheck against the host SDK
         run: |
-          npm install --no-save --package-lock=false openclaw@latest
+          npm install --save-dev --package-lock=false openclaw@latest
           npm run check:types
 
   runtime-compatibility:
@@ -46,10 +56,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        openclaw:
-          - "2026.8.1"
-          - latest
-          - beta
+        include:
+          - openclaw: "2026.8.1"
+            node: "22.22.3"
+          - openclaw: latest
+            node: "24.16.0"
+          - openclaw: beta
+            node: "24.16.0"
 
     steps:
       - name: Checkout
@@ -58,14 +71,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 22.22.3
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install plugin dependencies
         run: npm ci
 
       - name: Install OpenClaw host
-        run: npm install --no-save --package-lock=false "openclaw@${{ matrix.openclaw }}"
+        run: npm install --save-dev --package-lock=false "openclaw@${{ matrix.openclaw }}"
 
       - name: Build plugin
         run: npm run build
