@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from "vitest";
+import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
   loadVkOutboundMedia,
@@ -315,6 +316,128 @@ describe("resolveVkInboundReplyContext", () => {
   it("reads 'message' field as fallback for text", () => {
     const result = resolveVkInboundReplyContext({ id: 1, message: "alt text" });
     expect(result.replyToText).toBe("alt text");
+  });
+});
+
+// ── shared wall posts ───────────────────────────────────────────────────────
+
+// Real vk-io objects, not look-alikes: the fix reads their getters.
+const WALL_PHOTO = {
+  type: "photo",
+  photo: {
+    id: 1,
+    owner_id: -235198196,
+    date: 1,
+    sizes: [{ type: "x", url: "https://sun.userapi.com/p1.jpg", width: 604, height: 604 }],
+  },
+};
+
+function vkWallPost(payload: Record<string, unknown>): WallAttachment {
+  return new WallAttachment({
+    api: {},
+    payload: { date: 1, attachments: [], ...payload },
+  } as unknown as ConstructorParameters<typeof WallAttachment>[0]);
+}
+
+function vkReplyMessage(reply: Record<string, unknown>): unknown {
+  const context = new MessageContext({
+    api: {},
+    upload: {},
+    source: "polling",
+    groupId: 239104331,
+    updateType: "message_new",
+    payload: {
+      client_info: {},
+      message: {
+        id: 9537,
+        peer_id: 1,
+        from_id: 1,
+        date: 1,
+        text: "А так",
+        attachments: [],
+        reply_message: { peer_id: 1, from_id: 1, date: 1, attachments: [], ...reply },
+      },
+    },
+  } as unknown as ConstructorParameters<typeof MessageContext>[0]);
+  return context.replyMessage;
+}
+
+describe("shared wall posts", () => {
+  it("expands a post into its link, its text and its photos", () => {
+    const result = extractVkInboundAttachments([
+      vkWallPost({ id: 41941, owner_id: -235198196, text: "Промт в комментариях", attachments: [WALL_PHOTO] }),
+    ]);
+    expect(result.map((entry) => entry.type)).toEqual(["wall", "photo"]);
+    expect(result[0]).toMatchObject({
+      kind: "wall",
+      post: { url: "https://vk.com/wall-235198196_41941", text: "Промт в комментариях" },
+    });
+    expect(result[1]).toMatchObject({ kind: "image", url: "https://sun.userapi.com/p1.jpg" });
+  });
+
+  it("gives the post itself no media URL, so nothing tries to download the page", async () => {
+    const [post] = extractVkInboundAttachments([vkWallPost({ id: 2, owner_id: -1, text: "Пост" })]);
+    expect(post.url).toBeUndefined();
+    const fetchRemoteMedia = vi.fn();
+    const saveMediaBuffer = vi.fn();
+    await expect(
+      resolveVkInboundResolvedMedia({ attachments: [post], mediaRuntime: { fetchRemoteMedia, saveMediaBuffer } }),
+    ).resolves.toEqual([]);
+    expect(fetchRemoteMedia).not.toHaveBeenCalled();
+  });
+
+  it("takes the text and photos of a repost from its copy history", () => {
+    const result = extractVkInboundAttachments([
+      vkWallPost({
+        id: 7,
+        owner_id: 12,
+        text: "Смотри",
+        copy_history: [
+          { id: 41941, owner_id: -235198196, date: 1, text: "Оригинал", attachments: [WALL_PHOTO] },
+        ],
+      }),
+    ]);
+    expect(result[0].post).toEqual({ url: "https://vk.com/wall12_7", text: "Смотри\n\nОригинал" });
+    expect(result.slice(1).map((entry) => entry.url)).toEqual(["https://sun.userapi.com/p1.jpg"]);
+  });
+
+  it("shows the post in the body instead of a bare placeholder", () => {
+    const attachments = extractVkInboundAttachments([
+      vkWallPost({ id: 41941, owner_id: -235198196, text: "Промт", attachments: [WALL_PHOTO] }),
+    ]);
+    expect(resolveVkInboundBodyText({ text: "", attachments })).toBe(
+      "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+    );
+    expect(resolveVkInboundBodyText({ text: "Смотри что нашёл", attachments })).toBe(
+      "Смотри что нашёл\n\n[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+    );
+  });
+
+  it("shows the link of a post that has no text", () => {
+    const attachments = extractVkInboundAttachments([vkWallPost({ id: 2, owner_id: -1, text: "" })]);
+    expect(resolveVkInboundBodyText({ text: "", attachments })).toBe("[VK wall post https://vk.com/wall-1_2]");
+  });
+
+  it("describes a quoted post instead of passing only its id", () => {
+    const replyMessage = vkReplyMessage({
+      id: 9533,
+      text: "",
+      attachments: [
+        { type: "wall", wall: { id: 41941, owner_id: -235198196, date: 1, text: "Промт", attachments: [WALL_PHOTO] } },
+      ],
+    });
+    expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
+      replyToMessageId: "9533",
+      replyToText: "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+    });
+  });
+
+  it("marks a quoted message that has only an attachment by its kind", () => {
+    const replyMessage = vkReplyMessage({ id: 9520, text: "", attachments: [WALL_PHOTO] });
+    expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
+      replyToMessageId: "9520",
+      replyToText: "<media:image>",
+    });
   });
 });
 

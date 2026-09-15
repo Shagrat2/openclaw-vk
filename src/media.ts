@@ -405,28 +405,68 @@ function inferVkAttachmentMimeType(
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * A wall post shared into the chat (vk-io's `WallAttachment`). It has no media
+ * of its own, so the model used to get a bare `<media:wall>`: the link and the
+ * text are what it needs, and the post's photos go on as images. A repost keeps
+ * the original's text and photos in `copyHistory`.
+ */
+function readVkWallPost(record: Record<string, unknown>): {
+  post: NonNullable<VkInboundAttachment["post"]>;
+  attachments: unknown[];
+} {
+  const { ownerId, id } = record;
+  const url =
+    typeof ownerId === "number" && typeof id === "number"
+      ? `https://vk.com/wall${ownerId}_${id}`
+      : undefined;
+  const history = Array.isArray(record.copyHistory) ? record.copyHistory : [];
+  const posts = [
+    record,
+    ...history.map(asRecord).filter((entry): entry is Record<string, unknown> => Boolean(entry)),
+  ];
+  const text =
+    posts
+      .map((entry) => readString(entry, "text"))
+      .filter(Boolean)
+      .join("\n\n") || undefined;
+  const attachments = posts.flatMap((entry) =>
+    Array.isArray(entry.attachments) ? entry.attachments : [],
+  );
+  return { post: { url, text }, attachments };
+}
+
 export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundAttachment[] {
   if (!Array.isArray(rawAttachments)) {
     return [];
   }
 
-  return rawAttachments
-    .map((attachment): VkInboundAttachment | undefined => {
-      if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
-        return undefined;
-      }
-      const record = attachment as Record<string, unknown>;
-      const type = readString(record, "type") ?? "attachment";
-      const url = normalizeVkAttachmentUrl(type, record);
-      return {
-        type,
-        kind: normalizeVkAttachmentKind(type, record),
-        url,
-        title: normalizeVkAttachmentTitle(type, record),
-        mimeType: inferVkAttachmentMimeType(type, record, url),
-      };
-    })
-    .filter((attachment): attachment is VkInboundAttachment => Boolean(attachment));
+  return rawAttachments.flatMap((attachment): VkInboundAttachment[] => {
+    const record = asRecord(attachment);
+    if (!record) {
+      return [];
+    }
+    const type = readString(record, "type") ?? "attachment";
+    const url = normalizeVkAttachmentUrl(type, record);
+    const entry: VkInboundAttachment = {
+      type,
+      kind: normalizeVkAttachmentKind(type, record),
+      url,
+      title: normalizeVkAttachmentTitle(type, record),
+      mimeType: inferVkAttachmentMimeType(type, record, url),
+    };
+    if (type !== "wall") {
+      return [entry];
+    }
+    const { post, attachments } = readVkWallPost(record);
+    return [{ ...entry, post }, ...extractVkInboundAttachments(attachments)];
+  });
 }
 
 export function resolveVkInboundReplyContext(replyMessage: unknown): {
@@ -441,7 +481,13 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
     typeof record.id === "number" ? String(record.id) : undefined,
     readString(record, "id"),
   ]);
-  const replyToText = pickFirstString([readString(record, "text"), readString(record, "message")]);
+  // The quoted message is described the way an incoming one is: taking only its
+  // text left a quoted post, photo or voice message as a bare id.
+  const replyToText =
+    resolveVkInboundBodyText({
+      text: pickFirstString([readString(record, "text"), readString(record, "message")]),
+      attachments: extractVkInboundAttachments(record.attachments),
+    }) || undefined;
   return {
     replyToMessageId,
     replyToText,
@@ -600,13 +646,21 @@ export function resolveVkInboundResolvedMediaTypes(
     .filter((entry): entry is string => Boolean(entry));
 }
 
+function describeVkWallPost(post: NonNullable<VkInboundAttachment["post"]>): string {
+  const header = post.url ? `[VK wall post ${post.url}]` : "[VK wall post]";
+  return post.text ? `${header}\n${post.text}` : header;
+}
+
 export function resolveVkInboundBodyText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
 }): string {
   const trimmedText = params.text?.trim() ?? "";
-  if (trimmedText) {
-    return trimmedText;
+  const posts = (params.attachments ?? []).flatMap((attachment) =>
+    attachment.post ? [describeVkWallPost(attachment.post)] : [],
+  );
+  if (trimmedText || posts.length > 0) {
+    return [trimmedText, ...posts].filter(Boolean).join("\n\n");
   }
 
   const mediaKinds = Array.from(
