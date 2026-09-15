@@ -70,6 +70,8 @@ export type VkInboundAttachment = {
   url?: string;
   title?: string;
   mimeType?: string;
+  /** A shared wall post: its address and text. The post has no media URL. */
+  post?: { url?: string; text?: string };
 };
 
 export type VkInboundResolvedMedia = {
