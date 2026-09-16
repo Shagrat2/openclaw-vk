@@ -484,7 +484,7 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
   // The quoted message is described the way an incoming one is: taking only its
   // text left a quoted post, photo or voice message as a bare id.
   const replyToText =
-    resolveVkInboundBodyText({
+    resolveVkInboundAgentText({
       text: pickFirstString([readString(record, "text"), readString(record, "message")]),
       attachments: extractVkInboundAttachments(record.attachments),
     }) || undefined;
@@ -651,16 +651,18 @@ function describeVkWallPost(post: NonNullable<VkInboundAttachment["post"]>): str
   return post.text ? `${header}\n${post.text}` : header;
 }
 
+/**
+ * What the sender wrote, as control input: commands, directives and the mention
+ * gate must see only this. A shared post is a third party’s text, so it stays
+ * out; an attachment-only message keeps its placeholder, as before.
+ */
 export function resolveVkInboundBodyText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
 }): string {
   const trimmedText = params.text?.trim() ?? "";
-  const posts = (params.attachments ?? []).flatMap((attachment) =>
-    attachment.post ? [describeVkWallPost(attachment.post)] : [],
-  );
-  if (trimmedText || posts.length > 0) {
-    return [trimmedText, ...posts].filter(Boolean).join("\n\n");
+  if (trimmedText) {
+    return trimmedText;
   }
 
   const mediaKinds = Array.from(
@@ -675,6 +677,21 @@ export function resolveVkInboundBodyText(params: {
   }
 
   return `<media:${mediaKinds[0] ?? "attachment"}>`;
+}
+
+/** The body the agent sees: the sender’s text plus any post shared with it. */
+export function resolveVkInboundAgentText(params: {
+  text?: string | null;
+  attachments?: readonly VkInboundAttachment[];
+}): string {
+  const posts = (params.attachments ?? []).flatMap((attachment) =>
+    attachment.post ? [describeVkWallPost(attachment.post)] : [],
+  );
+  if (posts.length === 0) {
+    return resolveVkInboundBodyText(params);
+  }
+  const trimmedText = params.text?.trim() ?? "";
+  return [trimmedText, ...posts].filter(Boolean).join("\n\n");
 }
 
 function isHttpMediaUrl(value: string): boolean {

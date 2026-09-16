@@ -36,7 +36,11 @@ import {
 } from "openclaw/plugin-sdk/runtime-group-policy";
 import { redactVkId, vkDiag } from "./diagnostics.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
-import { resolveVkInboundBodyText, resolveVkInboundResolvedMedia } from "./media.js";
+import {
+  resolveVkInboundAgentText,
+  resolveVkInboundBodyText,
+  resolveVkInboundResolvedMedia,
+} from "./media.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { getVkRuntime } from "./runtime.js";
 import {
@@ -201,11 +205,17 @@ export async function handleVkInbound(params: {
   });
 
   const payloadCommand = resolveVkCommandFromPayload(message.messagePayload);
+  // Two inputs, deliberately separate. The control input is what the sender
+  // authored: it decides commands, directives and the mention gate. The agent
+  // body may carry a third party’s text (a shared post), so it reaches neither.
   const visibleBody = resolveVkInboundBodyText({
     text: message.text,
     attachments: message.attachments,
   });
-  const rawBody = payloadCommand ?? visibleBody;
+  const commandInput = payloadCommand ?? visibleBody;
+  const rawBody =
+    payloadCommand ??
+    resolveVkInboundAgentText({ text: message.text, attachments: message.attachments });
   if (!rawBody) {
     return;
   }
@@ -338,7 +348,7 @@ export async function handleVkInbound(params: {
     allowFrom: isGroup ? effectiveGroupSenderAllowFrom : effectiveAllowFrom,
     senderId: message.senderId,
   }).allowed;
-  const isControlCommand = hasControlCommand(rawBody, config as OpenClawConfig);
+  const isControlCommand = hasControlCommand(commandInput, config as OpenClawConfig);
   const commandGate = resolveControlCommandGate({
     useAccessGroups,
     authorizers: [
@@ -363,7 +373,10 @@ export async function handleVkInbound(params: {
 
   // Mention check for group chats
   const mentionRegexes = core.channel.mentions.buildMentionRegexes(config as OpenClawConfig);
-  const wasMentioned = core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes);
+  const wasMentioned = core.channel.mentions.matchesMentionPatterns(
+    commandInput,
+    mentionRegexes,
+  );
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
   if (isGroup && requireMention && !wasMentioned && !isControlCommand) {
@@ -426,8 +439,9 @@ export async function handleVkInbound(params: {
   const ctxPayload = finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
-    RawBody: visibleBody || rawBody,
-    CommandBody: rawBody,
+    RawBody: visibleBody || commandInput,
+    CommandBody: commandInput,
+    BodyForCommands: commandInput,
     From: fromLabel,
     To: `vk:${peerId}`,
     SessionKey: route.sessionKey,

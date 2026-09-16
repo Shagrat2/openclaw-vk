@@ -6,6 +6,7 @@ import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
   loadVkOutboundMedia,
+  resolveVkInboundAgentText,
   resolveVkInboundBodyText,
   resolveVkInboundResolvedMedia,
   resolveVkInboundResolvedMediaPaths,
@@ -401,21 +402,22 @@ describe("shared wall posts", () => {
     expect(result.slice(1).map((entry) => entry.url)).toEqual(["https://sun.userapi.com/p1.jpg"]);
   });
 
-  it("shows the post in the body instead of a bare placeholder", () => {
+  it("shows the post in the agent body instead of a bare placeholder", () => {
     const attachments = extractVkInboundAttachments([
       vkWallPost({ id: 41941, owner_id: -235198196, text: "Промт", attachments: [WALL_PHOTO] }),
     ]);
-    expect(resolveVkInboundBodyText({ text: "", attachments })).toBe(
+    expect(resolveVkInboundBodyText({ text: "", attachments })).toBe("<media:wall>");
+    expect(resolveVkInboundAgentText({ text: "", attachments })).toBe(
       "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
     );
-    expect(resolveVkInboundBodyText({ text: "Смотри что нашёл", attachments })).toBe(
+    expect(resolveVkInboundAgentText({ text: "Смотри что нашёл", attachments })).toBe(
       "Смотри что нашёл\n\n[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
     );
   });
 
   it("shows the link of a post that has no text", () => {
     const attachments = extractVkInboundAttachments([vkWallPost({ id: 2, owner_id: -1, text: "" })]);
-    expect(resolveVkInboundBodyText({ text: "", attachments })).toBe("[VK wall post https://vk.com/wall-1_2]");
+    expect(resolveVkInboundAgentText({ text: "", attachments })).toBe("[VK wall post https://vk.com/wall-1_2]");
   });
 
   it("describes a quoted post instead of passing only its id", () => {
