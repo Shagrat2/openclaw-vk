@@ -321,9 +321,6 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     const attachments = extractVkInboundAttachments(context.attachments);
     const replyContext = resolveVkInboundReplyContext(context.replyMessage);
     const forwards = extractVkInboundForwards(context.forwards);
-    const replyToForwards = extractVkInboundForwards(
-      (context.replyMessage as unknown as { forwards?: unknown } | undefined)?.forwards,
-    );
     const createdAtSeconds =
       typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
         ? context.createdAt
@@ -345,7 +342,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       replyToMessageId: replyContext.replyToMessageId,
       replyToText: replyContext.replyToText,
       ...(forwards.length > 0 ? { forwards } : {}),
-      ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
+      replyToForwards: replyContext.replyToForwards,
     };
 
     core.channel.activity.record({

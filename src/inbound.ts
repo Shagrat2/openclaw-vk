@@ -80,10 +80,15 @@ function filterVkForwards(
     );
 }
 
-function collectVkForwardAttachments(forwards: readonly VkInboundForward[]): VkInboundAttachment[] {
+/**
+ * Only the images of forwards are downloaded. A forwarded voice message or audio
+ * would be transcribed into the turn as if the sender had said it; those stay a
+ * placeholder inside the forward.
+ */
+function collectVkForwardImages(forwards: readonly VkInboundForward[]): VkInboundAttachment[] {
   return forwards.flatMap((forward) => [
-    ...(forward.attachments ?? []),
-    ...collectVkForwardAttachments(forward.forwards ?? []),
+    ...(forward.attachments ?? []).filter((attachment) => attachment.kind === "image"),
+    ...collectVkForwardImages(forward.forwards ?? []),
   ]);
 }
 
@@ -164,12 +169,9 @@ export async function handleVkInbound(params: {
   const visibleBody = resolveVkInboundBodyText({
     text: message.text,
     attachments: message.attachments,
+    forwards: message.forwards,
   });
-  // A message that is only a forward still gets a command input of its own: left
-  // empty, the core would fall back to the body and read the forwarded text as a
-  // command from the sender.
-  const commandInput =
-    payloadCommand ?? (visibleBody || ((message.forwards?.length ?? 0) > 0 ? "<forwarded>" : ""));
+  const commandInput = payloadCommand ?? visibleBody;
   if (!commandInput) {
     return;
   }
@@ -236,6 +238,7 @@ export async function handleVkInbound(params: {
       .include;
   };
   const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
+  const firstForward = visibleForwards[0];
   const rawBody =
     payloadCommand ??
     resolveVkInboundAgentText({
@@ -394,7 +397,7 @@ export async function handleVkInbound(params: {
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
   const resolvedMedia = await resolveVkInboundResolvedMedia({
-    attachments: [...(message.attachments ?? []), ...collectVkForwardAttachments(visibleForwards)],
+    attachments: [...(message.attachments ?? []), ...collectVkForwardImages(visibleForwards)],
     mediaRuntime: core.channel.media,
     logError: (line) => runtime.log?.(line),
   });
@@ -441,10 +444,12 @@ export async function handleVkInbound(params: {
         text: message.replyToText,
         forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
       }) || undefined,
-    ForwardedFrom: visibleForwards[0] ? `vk:${visibleForwards[0].senderId}` : undefined,
-    ForwardedFromId: visibleForwards[0] ? String(visibleForwards[0].senderId) : undefined,
-    ForwardedFromType: visibleForwards[0] ? (visibleForwards[0].senderId < 0 ? "group" : "user") : undefined,
-    ForwardedDate: visibleForwards[0]?.timestamp,
+    ...(firstForward && {
+      ForwardedFrom: `vk:${firstForward.senderId}`,
+      ForwardedFromId: String(firstForward.senderId),
+      ForwardedFromType: firstForward.senderId < 0 ? "group" : "user",
+      ForwardedDate: firstForward.timestamp,
+    }),
   });
 
   const onDispatchError = (err: unknown, info: { kind: string }) => {

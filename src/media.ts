@@ -469,33 +469,26 @@ export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundA
   });
 }
 
-const MAX_VK_FORWARD_DEPTH = 2;
-const MAX_VK_FORWARDS = 10;
+/** Forwards kept per inbound message, nested ones included. */
+export const MAX_VK_FORWARDS = 10;
 
 /**
  * Messages forwarded into this one — vk-io's `forwards`, where each forward is
- * a MessageContext of its own. At most two levels deep and ten in total: a
- * forward can carry forwards, and a chain of them is no reason to flood the
- * prompt.
+ * a MessageContext of its own — two levels deep, within `capVkForwards`.
  */
 export function extractVkInboundForwards(raw: unknown): VkInboundForward[] {
-  return readVkForwards(raw, 1, { left: MAX_VK_FORWARDS });
+  return capVkForwards(readVkForwards(raw, 2));
 }
 
-function readVkForwards(raw: unknown, depth: number, budget: { left: number }): VkInboundForward[] {
+function readVkForwards(raw: unknown, depth: number): VkInboundForward[] {
   if (!Array.isArray(raw)) {
     return [];
   }
-  const forwards: VkInboundForward[] = [];
-  for (const item of raw) {
+  return raw.flatMap((item): VkInboundForward[] => {
     const record = asRecord(item);
     if (!record) {
-      continue;
+      return [];
     }
-    if (budget.left <= 0) {
-      break;
-    }
-    budget.left -= 1;
     const { senderId, createdAt } = record;
     const forward: VkInboundForward = {
       senderId: typeof senderId === "number" ? senderId : 0,
@@ -508,20 +501,39 @@ function readVkForwards(raw: unknown, depth: number, budget: { left: number }): 
     if (attachments.length > 0) {
       forward.attachments = attachments;
     }
-    if (depth < MAX_VK_FORWARD_DEPTH) {
-      const nested = readVkForwards(record.forwards, depth + 1, budget);
-      if (nested.length > 0) {
-        forward.forwards = nested;
-      }
+    const nested = depth > 1 ? readVkForwards(record.forwards, depth - 1) : [];
+    if (nested.length > 0) {
+      forward.forwards = nested;
     }
-    forwards.push(forward);
+    return [forward];
+  });
+}
+
+/**
+ * Ten forwards in total, nested ones included: a chain of forwards is no reason
+ * to flood the prompt. Every top-level forward is kept first, then nested ones
+ * in order, so one forward full of others cannot crowd out the ones next to it.
+ */
+export function capVkForwards(forwards: readonly VkInboundForward[]): VkInboundForward[] {
+  let left = MAX_VK_FORWARDS;
+  const kept = forwards.slice(0, left).map((forward) => ({ ...forward }));
+  left -= kept.length;
+  for (const forward of kept) {
+    const nested = (forward.forwards ?? []).slice(0, left);
+    left -= nested.length;
+    if (nested.length > 0) {
+      forward.forwards = nested;
+    } else {
+      delete forward.forwards;
+    }
   }
-  return forwards;
+  return kept;
 }
 
 export function resolveVkInboundReplyContext(replyMessage: unknown): {
   replyToMessageId?: string;
   replyToText?: string;
+  replyToForwards?: VkInboundForward[];
 } {
   if (!replyMessage || typeof replyMessage !== "object" || Array.isArray(replyMessage)) {
     return {};
@@ -538,9 +550,11 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
       text: pickFirstString([readString(record, "text"), readString(record, "message")]),
       attachments: extractVkInboundAttachments(record.attachments),
     }) || undefined;
+  const replyToForwards = extractVkInboundForwards(record.forwards);
   return {
     replyToMessageId,
     replyToText,
+    ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
   };
 }
 
@@ -703,12 +717,14 @@ function describeVkWallPost(post: NonNullable<VkInboundAttachment["post"]>): str
 
 /**
  * What the sender wrote, as control input: commands, directives and the mention
- * gate must see only this. A shared post is a third party’s text, so it stays
- * out; an attachment-only message keeps its placeholder, as before.
+ * gate must see only this. A shared post or a forward is a third party’s text,
+ * so it stays out. A message without text keeps a placeholder: left empty, the
+ * core would fall back to the body and read that text as the sender’s command.
  */
 export function resolveVkInboundBodyText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
+  forwards?: readonly VkInboundForward[];
 }): string {
   const trimmedText = params.text?.trim() ?? "";
   if (trimmedText) {
@@ -723,7 +739,7 @@ export function resolveVkInboundBodyText(params: {
     ),
   );
   if (mediaKinds.length === 0) {
-    return "";
+    return (params.forwards?.length ?? 0) > 0 ? "<forwarded>" : "";
   }
 
   return `<media:${mediaKinds[0] ?? "attachment"}>`;
@@ -750,10 +766,10 @@ export function resolveVkInboundAgentText(params: {
     attachment.post ? [describeVkWallPost(attachment.post)] : [],
   );
   const forwarded = (params.forwards ?? []).map(describeVkForward);
-  if (posts.length === 0 && forwarded.length === 0) {
-    return resolveVkInboundBodyText(params);
-  }
-  const own = posts.length > 0 ? [params.text?.trim() ?? "", ...posts] : [resolveVkInboundBodyText(params)];
+  const own =
+    posts.length > 0
+      ? [params.text?.trim() ?? "", ...posts]
+      : [resolveVkInboundBodyText({ text: params.text, attachments: params.attachments })];
   return [...own, ...forwarded].filter(Boolean).join("\n\n");
 }
 

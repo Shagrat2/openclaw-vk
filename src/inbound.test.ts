@@ -2045,6 +2045,35 @@ describe("forwarded messages", () => {
     expect(ctx.CommandBody).toBe("что тут?");
   });
 
+  it("does not download a forwarded voice message, so it is never transcribed as the sender's", async () => {
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "послушай",
+        forwards: [
+          {
+            ...ORDER_FORWARD,
+            text: "",
+            attachments: [
+              { type: "audio_message", kind: "audio", url: "https://example.com/voice.ogg", mimeType: "audio/ogg" },
+              { type: "photo", kind: "image", url: "https://example.com/fwd.jpg", mimeType: "image/jpeg" },
+            ],
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const fetched = vi.mocked(runtime.channel.media.fetchRemoteMedia).mock.calls.map(([arg]) => (arg as { url: string }).url);
+    expect(fetched).toEqual(["https://example.com/fwd.jpg"]);
+    // Still shown to the agent, as a placeholder inside the forward.
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("<media:audio>");
+  });
+
   it("downloads the photo of a visible forward, and not of a stripped one", async () => {
     const photo = { type: "photo", kind: "image", url: "https://example.com/fwd.jpg", mimeType: "image/jpeg" };
     const visible = installRuntime();
