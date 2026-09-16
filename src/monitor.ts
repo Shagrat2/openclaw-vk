@@ -7,6 +7,7 @@ import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound } from "./inbound.js";
 import {
   extractVkInboundAttachments,
+  extractVkInboundForwards,
   resolveVkInboundReplyContext,
 } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
@@ -282,6 +283,10 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     const isGroup = peerId >= 2_000_000_000;
     const attachments = extractVkInboundAttachments(context.attachments);
     const replyContext = resolveVkInboundReplyContext(context.replyMessage);
+    const forwards = extractVkInboundForwards(context.forwards);
+    const replyToForwards = extractVkInboundForwards(
+      (context.replyMessage as unknown as { forwards?: unknown } | undefined)?.forwards,
+    );
     const createdAtSeconds =
       typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
         ? context.createdAt
@@ -302,6 +307,8 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       attachments,
       replyToMessageId: replyContext.replyToMessageId,
       replyToText: replyContext.replyToText,
+      ...(forwards.length > 0 ? { forwards } : {}),
+      ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
     };
 
     core.channel.activity.record({
