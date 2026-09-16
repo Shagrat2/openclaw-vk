@@ -97,6 +97,22 @@ describe.skipIf(!sdk || !diag)("VK diagnostics through the real SDK redactor", (
     expect(reason).not.toContain("sk-abcdefghijklmnopqrstuvwxyz0123456789");
     expect(reason).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789");
     expect(reason).not.toContain("/9j/4AAQ");
-    expect(reason).toContain("data:image/jpeg;base64,<16 chars>");
+    expect(reason).toMatch(/ after <data URI cut, \d+ chars>$/);
+  });
+
+  it("keeps a data URI with a percent-encoded parameter out of the log at full", () => {
+    // The review's input: the old pattern did not match this header, and the
+    // real redactor let the whole URI through.
+    process.env.VK_DIAG_LEVEL = "full";
+    const uri = "data:audio/wav;name=voice%20note.wav;base64,SGVsbG8=";
+    diag!.vkDiag("send media", { source: uri, note: `failed to read ${uri}` });
+    diag!.vkDiagFailure("tts failed", new Error(`failed to read ${uri}`), { inline: uri });
+    const calls = [...mockLogger.info.mock.calls, ...mockLogger.error.mock.calls];
+    expect(calls).toHaveLength(2);
+    expect(JSON.stringify(calls.map((call) => call[1]))).not.toContain("SGVsbG8");
+    expect(lastFields(mockLogger.info).source).toBe("data (audio/wav, name=voice%20note.wav, 8 chars)");
+    expect(lastFields(mockLogger.error).reason).toBe(
+      `failed to read <data URI cut, ${uri.length} chars>`,
+    );
   });
 });

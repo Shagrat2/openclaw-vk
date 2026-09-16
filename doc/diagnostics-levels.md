@@ -50,9 +50,21 @@ Addressed:
 
   Nothing in that table depends on recognising what a string contains, so a
   path shape the code has never seen still cannot reach the log.
-- **Attachment contents never reach the log, at `full` either.** The payload of
-  every data URI — standalone or embedded in a message — is replaced by its
-  length; the MIME type and parameters stay. The core's secret redactor runs
+- **Attachment contents do not reach the log, at `full` either.** A data URI
+  under a source field (`source`, `inline`, …) is replaced by a description of
+  it — `data (audio/wav, name=voice%20note.wav, 8 chars)`; the name is shown
+  only when it is plainly a file name. In any other text, everything from the
+  first data URI on is cut and replaced by its length:
+  `failed to read <data URI cut, 52 chars>`. The payload is not picked out of
+  the URI — its forms are too many — so the text after a data URI goes with
+  it. Which spellings start a data URI, and why prose that merely mentions
+  `data:` is left alone, is listed at `DATA_URI_START_RE` in
+  `src/diagnostics.ts`. Only the start of a text is looked at: as much as the
+  length cap lets through, plus a margin for a secret straddling it. Keys of
+  nested fields and event names are text too: at `full` they get the same
+  treatment; below it, one that does not look like a name in code becomes
+  `<key>` or `<event>`. Attachment bytes that reach a text with no data URI
+  around them are not recognised. The core's secret redactor runs
   over the rest, plus a pass of our own for what it does not cover: checked
   against the real `plugin-sdk/logging-core`, it leaves a credential in a URL's
   query string (`?access_token=…`) and a bare VK token (`vk1.a.…`) as they are,
@@ -65,9 +77,9 @@ Addressed:
   | `redacted` | the safe-field list quoted above, plus hashed identifiers for correlation |
   | `full` | the safe fields plus names: paths, URLs, peer ids |
 
-- **`redacted` is what we run day to day.** It is the level configured in our
-  own deployment; `full` is switched on for a specific investigation and off
-  again afterwards.
+- **`redacted` is the level meant for day-to-day use on a channel shared with
+  others**; `full` is for an operator looking into their own deployment, where
+  the names are theirs to see.
 - **Identifiers survive as hashes, not as names.** `redactIdentifier` gives a
   stable `sha256:…` prefix, so two failed sends to different recipients stay
   distinguishable in the timeline without naming anyone. This is the core's own
@@ -96,7 +108,7 @@ A remote attachment rejected by VK produces this at `redacted`:
 
 ```
 vk upload failed  kind=photo source=remote mime=image/jpeg bytes=182034 attempt=3
-                  code=100 reason="photo is undefined"
+                  errorName=APIError vkCode=100
 ```
 
 At least three unrelated causes produce that exact line: an expired signed URL,
@@ -145,7 +157,7 @@ state before this level existed.
   already holds the group access token, so `full` does not widen who can read
   what; it widens what an operator can see about their own traffic.
 - **Failures stay minimal.** Upload failures are logged even at `off`, but only
-  by error class and codes — `errorName=APIError code=100`, `errno=ENOENT` —
+  by error class and codes — `errorName=APIError vkCode=100`, `errno=ENOENT` —
   never by message, which is where paths and request parameters travel. So a
   channel is never silent about an error, and switching diagnostics off never
   costs an operator the error itself.

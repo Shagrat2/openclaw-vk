@@ -77,7 +77,7 @@ describe("VK diagnostics levels", () => {
     expect(lastFields(mockLogger.error)).toEqual({
       kind: "photo",
       source: "local",
-      code: 100,
+      vkCode: 100,
       errorName: "Error",
     });
   });
@@ -88,7 +88,7 @@ describe("VK diagnostics levels", () => {
       Object.assign(new Error(UNICODE_PATH_ERROR), { code: "ENOENT" }),
     );
     expect(lastFields(mockLogger.error)).toEqual({
-      code: null,
+      vkCode: null,
       errorName: "Error",
       errno: "ENOENT",
     });
@@ -99,6 +99,7 @@ describe("VK diagnostics levels", () => {
       it(`keeps a Unicode path out of a failure at ${level}`, () => {
         process.env.VK_DIAG_LEVEL = level;
         vkDiagFailure("tts failed", new Error(UNICODE_PATH_ERROR));
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
         const out = rendered(mockLogger.error);
         expect(out).not.toContain("данные");
         expect(out).not.toContain("запись");
@@ -108,6 +109,7 @@ describe("VK diagnostics levels", () => {
       it(`keeps an embedded data URI out of a failure at ${level}`, () => {
         process.env.VK_DIAG_LEVEL = level;
         vkDiagFailure("tts failed", new Error(EMBEDDED_DATA_URI));
+        expect(mockLogger.error).toHaveBeenCalledTimes(1);
         const out = rendered(mockLogger.error);
         expect(out).not.toContain("SGVsbG8");
         expect(out).not.toContain("failed to read");
@@ -117,6 +119,7 @@ describe("VK diagnostics levels", () => {
         process.env.VK_DIAG_LEVEL = level;
         vkDiagFailure("tts failed", UNICODE_PATH_ERROR);
         vkDiagFailure("tts failed", { message: EMBEDDED_DATA_URI, description: "/tmp/x y/файл.ogg" });
+        expect(mockLogger.error).toHaveBeenCalledTimes(2);
         for (const call of mockLogger.error.mock.calls) {
           const out = JSON.stringify(call[1]);
           expect(out).not.toContain("данные");
@@ -214,7 +217,10 @@ describe("VK diagnostics levels", () => {
     expect(lastFields(mockLogger.info)).toEqual({ source: "buffer", view: "buffer", raw: "buffer" });
   });
 
-  it("replaces a data URI payload by its length at full, standalone and embedded", () => {
+  /** What `full` leaves of a text from its first data URI on. */
+  const cut = (rest: string): string => `<data URI cut, ${rest.length} chars>`;
+
+  it("cuts a text at its first data URI at full, and describes one under a source field", () => {
     process.env.VK_DIAG_LEVEL = "full";
     vkDiag("send media", {
       inline: "data:audio/wav;base64,SGVsbG8=",
@@ -222,25 +228,299 @@ describe("VK diagnostics levels", () => {
       note: "two: data:image/png;base64,AAAA and data:,plain",
     });
     expect(lastFields(mockLogger.info)).toEqual({
-      inline: "data:audio/wav;base64,<8 chars>",
-      failure: "Error: failed to read data:audio/wav;base64,<8 chars>",
-      note: "two: data:image/png;base64,<4 chars> and data:,<5 chars>",
+      inline: "data (audio/wav, 8 chars)",
+      failure: `Error: failed to read ${cut("data:audio/wav;base64,SGVsbG8=")}`,
+      note: `two: ${cut("data:image/png;base64,AAAA and data:,plain")}`,
     });
-    expect(rendered(mockLogger.info)).not.toContain("SGVsbG8");
   });
 
-  it("keeps a failure's text at full, with the payload stripped and secrets redacted", () => {
+  describe("a data URI cannot carry its payload out at full, whatever its form", () => {
+    // The review's input: a percent-encoded parameter broke the old pattern, and
+    // the whole URI, payload included, reached the log.
+    const PERCENT_DATA_URI = "data:audio/wav;name=voice%20note.wav;base64,SGVsbG8=";
+    // Built from char codes: the escapes themselves are what is being tested,
+    // and a literal escape in the source is too easy to get unescaped on the way.
+    const backslash = String.fromCharCode(92);
+    const tab = String.fromCharCode(9);
+    const nbsp = String.fromCharCode(160);
+    const esc = String.fromCharCode(27);
+
+    beforeEach(() => {
+      process.env.VK_DIAG_LEVEL = "full";
+    });
+
+    /** One call, and nothing of `secret` in it — the event name included. */
+    const expectOneCallWithout = (spy: typeof mockLogger.info, secret: string): void => {
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(spy.mock.calls)).not.toContain(secret);
+    };
+
+    it("describes it under a source field and cuts it anywhere else, through vkDiag", () => {
+      vkDiag("send media", {
+        source: PERCENT_DATA_URI,
+        note: PERCENT_DATA_URI,
+        failure: new Error(`failed to read ${PERCENT_DATA_URI}`),
+        text: `failed to read ${PERCENT_DATA_URI}`,
+      });
+      expect(lastFields(mockLogger.info)).toEqual({
+        source: "data (audio/wav, name=voice%20note.wav, 8 chars)",
+        note: cut(PERCENT_DATA_URI),
+        failure: `Error: failed to read ${cut(PERCENT_DATA_URI)}`,
+        text: `failed to read ${cut(PERCENT_DATA_URI)}`,
+      });
+    });
+
+    it("cuts it from a failure's text and fields, through vkDiagFailure", () => {
+      vkDiagFailure("tts failed", new Error(`failed to read ${PERCENT_DATA_URI}`), {
+        inline: PERCENT_DATA_URI,
+        note: `retry of ${PERCENT_DATA_URI}`,
+      });
+      expect(lastFields(mockLogger.error)).toEqual({
+        inline: "data (audio/wav, name=voice%20note.wav, 8 chars)",
+        note: `retry of ${cut(PERCENT_DATA_URI)}`,
+        vkCode: null,
+        errorName: "Error",
+        reason: `failed to read ${cut(PERCENT_DATA_URI)}`,
+      });
+    });
+
+    it("describes a source-field URI by what it is, with no type, no name or no comma", () => {
+      vkDiag("send media", {
+        source: "data:;base64,SGVsbG8=",
+        inline: "data:,SGVsbG8=",
+        mediaUrl: "data:SGVsbG8=",
+      });
+      expect(lastFields(mockLogger.info)).toEqual({
+        source: "data (8 chars)",
+        inline: "data (8 chars)",
+        mediaUrl: "data",
+      });
+    });
+
+    it("shows a source's file name only when it is one, and through the redactors", () => {
+      // A parameter is written by whoever built the URI, so it gets what any
+      // text at `full` gets, and markup in it is not a file name at all.
+      vkDiag("send media", {
+        source: "data:text/plain;name=vk1.a.SECRETTOKEN12345;base64,SGVsbG8=",
+        inline: "data:image/svg+xml;name=<svg>secret</svg>,x",
+      });
+      expect(lastFields(mockLogger.info)).toEqual({
+        source: "data (text/plain, name=vk1.a.<redacted>, 8 chars)",
+        inline: "data (image/svg+xml, 1 chars)",
+      });
+    });
+
+    it("shows no part of a source's file name that runs past what a name may be", () => {
+      vkDiag("send media", {
+        source: `data:text/plain;name=${"x".repeat(129)};base64,SGVsbG8=`,
+        inline: `data:text/plain;name=${"y".repeat(200)},SGVsbG8=`,
+      });
+      expect(lastFields(mockLogger.info)).toEqual({
+        source: "data (text/plain, 8 chars)",
+        inline: "data (text/plain, 8 chars)",
+      });
+    });
+
+    it("cuts headers the old grammar never knew: spaces, quotes, upper case, no type", () => {
+      const headers = [
+        "data:audio/wav;name=voice note.wav;base64,SGVsbG8=",
+        'data:audio/wav;name="a b";base64,SGVsbG8=',
+        "DATA:AUDIO/WAV;BASE64,SGVsbG8=",
+        "data:;charset=utf-8;base64,SGVsbG8=",
+        "src=data:audio/wav;x=%E2%9C%93,SGVsbG8=",
+        "data:;name=voice note.wav;base64,SGVsbG8=",
+      ];
+      vkDiag("probe", { list: headers.map((uri) => `got ${uri} back`) });
+      vkDiagFailure("probe failed", new Error(headers.join(" | ")));
+      expectOneCallWithout(mockLogger.info, "SGVsbG8");
+      expectOneCallWithout(mockLogger.error, "SGVsbG8");
+    });
+
+    it("cuts payloads no pattern could pick out: wrapped, percent-encoded, glued, SVG, long header", () => {
+      // Real base64 of binary data carries `+` and `/`; 300 bytes wrap into
+      // lines of 76 with a short last one.
+      const payload = Buffer.from(Array.from({ length: 300 }, (_, i) => (i * 37 + 11) % 256)).toString(
+        "base64",
+      );
+      const wrapped = (payload.match(/.{1,76}/g) ?? []).join("\n");
+      const encoded = encodeURIComponent(`data:image/png;base64,${payload}`);
+      vkDiag("probe", {
+        wrapped: `read data:image/png;base64,${wrapped} failed`,
+        proxied: `GET https://proxy.example/?u=${encoded}`,
+        glued: `${esc}[32mdata:image/png;base64,${payload}${esc}[0m`,
+        svg: "failed: data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'><text>secret caption</text></svg>",
+        text: "data:text/plain;charset=utf-8,Hello (private note) from Ivan",
+        longHeader: `read data:text/plain;name=${"x".repeat(300)},secret%20message`,
+      });
+      expect(mockLogger.info).toHaveBeenCalledTimes(1);
+      const out = rendered(mockLogger.info);
+      for (const piece of payload.match(/.{12}/g) ?? []) {
+        expect(out).not.toContain(piece);
+      }
+      expect(out).not.toContain("secret caption");
+      expect(out).not.toContain("private note");
+      expect(out).not.toContain("secret%20message");
+      expect(lastFields(mockLogger.info).proxied).toBe(`GET https://proxy.example/?u=${cut(encoded)}`);
+    });
+
+    it("cuts the rarer spellings: escaped colon or slash, whitespace before the type, untyped headers", () => {
+      const inner = "data:image/png;base64,SGVsbG8=";
+      const spellings: Record<string, string> = {
+        doubleEncoded: `GET https://p.example/?u=${encodeURIComponent(encodeURIComponent(inner))}`,
+        htmlEntity: "src=data&#58;text/plain,SGVsbG8= done",
+        hexEntity: "src=data&#x3A;text/plain,SGVsbG8= done",
+        jsonEscape: `{"src":"data${backslash}u003atext/plain,SGVsbG8="}`,
+        jsEscape: `src=data${backslash}x3atext/plain,SGVsbG8= done`,
+        // PHP's JSON — and so VK's API — escapes the slash.
+        phpSlash: `{"value":"data:text${backslash}/plain;charset=utf-8,SGVsbG8="}`,
+        htmlSlash: "src=data:image&#x2F;svg+xml,SGVsbG8= done",
+        percentSlash: "src=data:image%2Fsvg+xml,SGVsbG8= done",
+        spacedType: "read data: text/plain,SGVsbG8= done",
+        tabbedType: `read data:${tab}text/plain,SGVsbG8= done`,
+        nbspType: `read data:${nbsp}text/plain,SGVsbG8= done`,
+        customType: "read data:x-custom/y;name=a b,SGVsbG8= done",
+        untypedSpaced: "read data:;name=voice note.txt,SGVsbG8= done",
+        untypedLong: `read data:;name=${"x".repeat(300)},SGVsbG8= done`,
+        untypedEmpty: "read data:,SGVsbG8= done",
+        // A text already cut short before it got here: only the marker is left.
+        fragment: "tail of an upload: …png;base64,SGVsbG8= done",
+      };
+      vkDiag("probe", spellings);
+      expect(mockLogger.info).toHaveBeenCalledTimes(1);
+      const fields = lastFields(mockLogger.info);
+      for (const key of Object.keys(spellings)) {
+        // Each is cut, not merely missing the payload by luck of another rule.
+        expect(fields[key], key).toMatch(/<data URI cut, \d+ chars>$/);
+        expect(String(fields[key]), key).not.toContain("SGVsbG8");
+      }
+    });
+
+    it("leaves prose that merely mentions data alone, and keeps the text before a URI", () => {
+      const prose = {
+        plain: "Invalid data: expected number, got string",
+        meta: "metadata: missing, retrying",
+        metaTight: "metadata:missing,retrying",
+        metaType: "metadata: image/jpeg, 1024 bytes",
+        io: "Failed to read data: I/O error",
+        na: "last data: n/a, retrying",
+        andOr: "no data: and/or attachment",
+        state: "state={data:1,size:2} failed",
+        stamp: "last data:2026-09-15T10:00:00Z, next try",
+      };
+      vkDiag("probe", {
+        ...prose,
+        json: '{"code":913,"field":"attachment","src":"data:image/png;base64,AAAA"}',
+        quoted: "read 'data:audio/wav;base64,SGVsbG8=': ENOENT",
+      });
+      expect(lastFields(mockLogger.info)).toEqual({
+        ...prose,
+        json: `{"code":913,"field":"attachment","src":"${cut('data:image/png;base64,AAAA"}')}`,
+        quoted: `read '${cut("data:audio/wav;base64,SGVsbG8=': ENOENT")}`,
+      });
+    });
+
+    it("keeps its cut mark past the length cap, and looks no further than the cap needs", () => {
+      const before = "x".repeat(2_100);
+      const uri = "data:image/png;base64,SGVsbG8=";
+      vkDiag("probe", {
+        pastCap: `${before} ${uri}`,
+        beyondScan: `${"y".repeat(5_000)} ${uri}`,
+      });
+      const fields = lastFields(mockLogger.info);
+      expect(fields.pastCap).toBe(`${before.slice(0, 2_000)}…${cut(uri)}`);
+      // A URI past what can reach the log is dropped with the rest of the text.
+      expect(fields.beyondScan).toBe(`${"y".repeat(2_000)}…`);
+    });
+
+    it("never shows a secret cut in half by the edge of what is looked at", () => {
+      // The token at the edge of the 2,000 + 2,048 characters looked at is cut
+      // to `vk1.a.ZZZ` — too short for any pattern to know it. Thirty tokens
+      // before it shrink to `vk1.a.<redacted>`, and the text shrinks so much that
+      // only the part within the margin, where the cut token sits, would be left;
+      // the margin is never shown, so nothing is.
+      const token = (c: string): string => `vk1.a.${c.repeat(80)}`;
+      const filler = Array.from({ length: 30 }, () => token("A")).join(" ");
+      const edge = 2_000 + 2_048;
+      const pad = "p".repeat(edge - 9 - filler.length - 1);
+      vkDiag("probe", { note: `${filler} ${pad}${token("Z")}` });
+      expect(mockLogger.info).toHaveBeenCalledTimes(1);
+      const note = String(lastFields(mockLogger.info).note);
+      expect(note).not.toContain("ZZZ");
+      expect(note).toBe("…");
+    });
+
+    it.each(["redacted", "full"] as const)("cuts a data URI out of nested keys and the event name at %s", (level) => {
+      process.env.VK_DIAG_LEVEL = level;
+      const uri = "data:image/png;base64,SGVsbG8=";
+      vkDiag(`send ${uri} failed`, { byUri: { [uri]: "failed" } });
+      vkDiagFailure(`read ${uri} failed`, new Error("boom"), { byUri: { [uri]: 1 } });
+      expectOneCallWithout(mockLogger.info, "SGVsbG8");
+      expectOneCallWithout(mockLogger.error, "SGVsbG8");
+    });
+
+    it("keeps nested keys and event names below full to names that look like code", () => {
+      process.env.VK_DIAG_LEVEL = "redacted";
+      vkDiag("send", { byPath: { "/Users/ivan/клиент/запись.wav": "failed", ok: 1 }, byPeer: { "12324712": 1 } });
+      vkDiagFailure("read /Users/ivan/private.jpg failed", new Error("boom"));
+      expect(mockLogger.info.mock.calls[0]?.[0]).toBe("send");
+      expect(lastFields(mockLogger.info)).toEqual({
+        byPath: { "<key>": "<text>", ok: 1 },
+        byPeer: { "<key>": 1 },
+      });
+      expect(mockLogger.error.mock.calls[0]?.[0]).toBe("<event>");
+    });
+
+    it("keeps keys that come out the same apart, even past a key already named like a copy", () => {
+      const mark = cut("data:image/png;base64,AAAA");
+      vkDiag("probe", {
+        byUri: {
+          [`${mark} #2`]: "literal",
+          "data:image/png;base64,AAAA": "ok",
+          "data:image/png;base64,BBBB": "failed",
+        },
+      });
+      expect(lastFields(mockLogger.info).byUri).toEqual({
+        [`${mark} #2`]: "literal",
+        [mark]: "ok",
+        [`${mark} #3`]: "failed",
+      });
+    });
+
+    it("stays linear on text full of data:, and on megabytes in a text, a key, an event and a source", () => {
+      const flood = `read ${"data:".repeat(40_000)}`;
+      const huge = `read ${"z".repeat(5_000_000)} data:image/png;base64,SGVsbG8=`;
+      const startedAt = performance.now();
+      vkDiag(`probe ${"e".repeat(5_000_000)}`, {
+        flood,
+        huge,
+        nested: { [`data:${"a".repeat(5_000_000)}`]: 1 },
+        inline: `data:${";x".repeat(2_500_000)},a`,
+      });
+      vkDiagFailure("probe failed", new Error(flood));
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
+      expect(mockLogger.info).toHaveBeenCalledTimes(1);
+      expect(mockLogger.error).toHaveBeenCalledTimes(1);
+    });
+
+    it("cuts a long payload before the length cap, so no prefix of it survives", () => {
+      const uri = `data:audio/wav;name=voice%20note.wav;base64,${"QUJD".repeat(2_000)}`;
+      vkDiag("probe", { note: `failed to read ${uri}` });
+      expect(lastFields(mockLogger.info).note).toBe(`failed to read ${cut(uri)}`);
+    });
+  });
+
+  it("keeps a failure's text at full up to its data URI, with secrets redacted", () => {
     process.env.VK_DIAG_LEVEL = "full";
     vkDiagFailure(
       "vk upload failed",
-      Object.assign(new Error(`${EMBEDDED_DATA_URI} token vk1.a.SECRETVALUE0123`), { code: 100 }),
+      Object.assign(new Error(`token vk1.a.SECRETVALUE0123 ${EMBEDDED_DATA_URI}`), { code: 100 }),
       { mediaUrl: "/srv/media/a.jpg" },
     );
     expect(lastFields(mockLogger.error)).toEqual({
       mediaUrl: "/srv/media/a.jpg",
-      code: 100,
+      vkCode: 100,
       errorName: "Error",
-      reason: "failed to read data:audio/wav;base64,<8 chars> token vk1.a.<redacted>",
+      reason: `token vk1.a.<redacted> failed to read ${cut("data:audio/wav;base64,SGVsbG8=")}`,
     });
   });
 
@@ -336,7 +616,7 @@ describe("VK diagnostics levels", () => {
       nested: { path: "local", peerId: "sha256:8", note: "<text>" },
       list: ["<text>", { mediaUrl: "remote" }],
       peerId: "sha256:8",
-      failure: { errorName: "Error", code: null },
+      failure: { errorName: "Error", vkCode: null },
       flag: true,
       nothing: null,
       fn: "[function]",

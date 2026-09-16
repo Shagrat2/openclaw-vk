@@ -28,9 +28,10 @@
  * enough to tell an `ENOENT` from an `APIError 100` without carrying the path
  * or the request parameters along.
  *
- * At `full`, text is kept but never attachment contents: the payload of every
- * data URI is replaced by its length, whether the URI is the whole value or
- * embedded in a message. The core's secret redactor runs over the rest, plus
+ * At `full`, text is kept but not attachment contents: a data URI under a
+ * source field is replaced by its type, name and size, and any other text is
+ * cut at its first data URI — the payload is not picked out, it goes with the
+ * rest of the text. The core's secret redactor runs over what is left, plus
  * our own pass for what it does not cover — a VK access token, bare or in a
  * URL's query string.
  *
@@ -105,12 +106,40 @@ const SOURCE_FIELDS = new Set([
 /** What replaces a string that is neither an identifier, a token nor a source. */
 const TEXT_PLACEHOLDER = "<text>";
 
+/** A slash as a URI writes it, or escaped: PHP's JSON, an HTML entity, a percent escape. */
+const SLASH = String.raw`(?:\x5c?\/|&#x0*2f;|&#0*47;|%2f)`;
+
 /**
- * A data URI, standalone or embedded in a message. The payload is everything
- * after the first comma up to whitespace or a quote — that is what must never
- * reach the log, at any level.
+ * Where a data URI begins in a text. Everything from there on is cut, not
+ * carved: picking the payload out with patterns kept missing forms —
+ * percent-encoded base64, the tail of a wrapped payload, an SVG with spaces —
+ * while the text before the URI is the part that says what went wrong.
+ *
+ * Each form is told by its first few characters, so the search is linear and
+ * there is no header to scan:
+ * - `data:` and a MIME type (`x-custom/y` included), whatever follows. The
+ *   slash may come escaped: PHP's JSON — and so VK's API — writes it as a
+ *   backslash and a slash, and HTML and URLs escape it too.
+ * - `data:`, whitespace and a registered top-level type, where `data` starts a
+ *   word: a decoder trims the whitespace, while `Failed to read data: I/O
+ *   error` or `metadata: image/jpeg` is prose.
+ * - `data:` and `;` or `,` — a URI with no type, with parameters or without.
+ * - A `;base64,` marker, whatever precedes it.
+ * - `data` with its colon escaped: percent-encoded once or more (`%3A`,
+ *   `%253A`), as an HTML entity (`&#58;`, `&#x3a;`), or as a JSON/JS escape
+ *   (a backslash and `u003a` or `x3a`).
+ * Prose such as `Invalid data: expected number` or `state={data:1}` matches
+ * none of these.
  */
-const DATA_URI_RE = /data:([\w.+-]+\/[\w.+-]+)?((?:;[\w=+.-]+)*),([^\s'"<>]+)/gi;
+const DATA_URI_START_RE = new RegExp(
+  [
+    String.raw`(?:data:[a-z][a-z0-9.+-]*|(?<![a-z0-9])data:\s{1,16}(?:application|audio|font|image|message|model|multipart|text|video|x-[a-z0-9.+-]+))${SLASH}[a-z0-9.+-]`,
+    String.raw`data:\s{0,16}[;,]`,
+    ";base64,",
+    String.raw`data(?:%(?:25)*3a|&#0*58;|&#x0*3a;|\x5c(?:u003a|x3a))`,
+  ].join("|"),
+  "i",
+);
 
 /**
  * What the core's redactor does not cover, checked against the real
@@ -187,17 +216,51 @@ export function describeVkSourceKind(
   return "local";
 }
 
+/** A parameter value that is plainly a file name. */
+const FILE_NAME_RE = /^[\w.%@+ -]{1,128}$/;
+
 /**
- * Replaces the payload of every data URI in the text by its length; the MIME
- * type and parameters stay. Idempotent: the placeholder opens with `<`, which
- * the payload pattern excludes, so a second pass leaves it alone.
+ * A data URI under a source field, at `full`: what it is, not the URI. A source
+ * field names an attachment, and for a data URI the attachment is the value
+ * itself — so it is described like a buffer would be, by type, name and size.
  */
-function stripDataUriPayloads(text: string): string {
-  return text.replace(
-    DATA_URI_RE,
-    (_match, mime: string | undefined, params: string | undefined, payload: string) =>
-      `data:${mime ?? ""}${params ?? ""},<${payload.length} chars>`,
-  );
+function describeDataSource(value: string): string {
+  // The caller has checked that the value opens with `data:`, after any whitespace.
+  const from = value.search(/data:/i) + "data:".length;
+  const comma = value.indexOf(",", from);
+  if (comma === -1) {
+    return "data";
+  }
+  // The header is read no further than a header sensibly goes: the value may be
+  // megabytes of audio, and only its length is needed from the rest.
+  const header = value.slice(from, Math.min(comma, from + 1_024));
+  const type = (header.split(";")[0] ?? "").trim();
+  const mime = MIME_RE.test(type) ? type : "";
+  // A parameter is written by whoever built the URI: only a plain file name is
+  // shown, and it goes through the same redactors as any text at `full`.
+  const rawName = /;name=([^;]{1,128})(?=;|$)/i.exec(header)?.[1];
+  const name =
+    rawName && FILE_NAME_RE.test(rawName) ? redactSecrets(rawName) : "";
+  const size = `${value.length - comma - 1} chars`;
+  return `data (${[mime, name ? `name=${name}` : "", size].filter(Boolean).join(", ")})`;
+}
+
+/** A name as code writes one: what a key or an event name may be below `full`. */
+const LABEL_RE = /^[A-Za-z][A-Za-z0-9 _.,:-]{0,79}$/;
+const KEY_PLACEHOLDER = "<key>";
+const EVENT_PLACEHOLDER = "<event>";
+
+/**
+ * A key of a nested field or an event name. Both come from code today, but reach
+ * the log as text all the same: at `full` they get what any text gets; below
+ * it, one that does not look like a name in code is replaced — a path or a peer
+ * id as a map key is exactly the free text the lower levels keep out.
+ */
+function labelFor(text: string, level: VkDiagLevel, placeholder: string): string {
+  if (level === "full") {
+    return fullText(text);
+  }
+  return LABEL_RE.test(text) ? text : placeholder;
 }
 
 /** Credentials the core's patterns leave alone; see `VK_TOKEN_RE`. */
@@ -207,10 +270,38 @@ function stripVkCredentials(text: string): string {
     .replace(VK_TOKEN_RE, "vk1.a.<redacted>");
 }
 
-/** Text at `full`: no attachment contents, no secrets, bounded length. */
+/** Secrets out of a text: what the core's redactor covers, then what it does not. */
+function redactSecrets(text: string): string {
+  return stripVkCredentials(redactSensitiveText(text));
+}
+
+/**
+ * Room past the cap for a secret that straddles it to be redacted whole. A
+ * secret cut by the edge of what is looked at is too short for any pattern to
+ * know, so the end of the redacted text within this margin is never shown.
+ */
+const FULL_TEXT_MARGIN = 2_048;
+
+/**
+ * How much of a text is looked at, at `full`: nothing past the cap reaches the
+ * log, and scanning a multi-megabyte error body would hold the send path for
+ * nothing.
+ */
+const FULL_TEXT_SCAN = MAX_FULL_TEXT + FULL_TEXT_MARGIN;
+
+/**
+ * Text at `full`: no attachment contents, no secrets, bounded length. The cut
+ * mark goes after the cap, so a long text still says that a URI was cut.
+ */
 function fullText(value: string): string {
-  const stripped = stripVkCredentials(redactSensitiveText(stripDataUriPayloads(value)));
-  return stripped.length > MAX_FULL_TEXT ? `${stripped.slice(0, MAX_FULL_TEXT)}…` : stripped;
+  const head = value.slice(0, FULL_TEXT_SCAN);
+  const start = head.search(DATA_URI_START_RE);
+  const text = redactSecrets(start === -1 ? head : head.slice(0, start));
+  // Only a text that runs past what was looked at ends at the window's edge.
+  const edge = start === -1 && value.length > head.length ? text.length - FULL_TEXT_MARGIN : text.length;
+  const shown = Math.max(0, Math.min(MAX_FULL_TEXT, edge));
+  const capped = shown < text.length ? `${text.slice(0, shown)}…` : text;
+  return start === -1 ? capped : `${capped}<data URI cut, ${value.length - start} chars>`;
 }
 
 /** Text below `full`: only what is an identifier, a token or a source kind, by field name. */
@@ -233,7 +324,9 @@ function redactedText(key: string, value: string): string {
 /** An error by class and codes only — what is safe to log at every level. */
 type VkErrorSummary = {
   errorName: string;
-  code: number | null;
+  // Not `code`: the host logger masks any field named exactly `code` as a
+  // likely auth code, so a VK error code logged under that name reads `***`.
+  vkCode: number | null;
   errno?: string;
 };
 
@@ -247,7 +340,7 @@ function summarizeError(error: unknown): VkErrorSummary {
         : typeof error;
   const summary: VkErrorSummary = {
     errorName: TOKEN_RE.test(rawName) ? rawName : "Error",
-    code: readVkErrorCode(error) ?? null,
+    vkCode: readVkErrorCode(error) ?? null,
   };
   // Node's system errors carry `code: "ENOENT"`; vk-io's carry a number, read above.
   if (record && typeof record.code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(record.code)) {
@@ -302,9 +395,23 @@ function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0)
       return `[${value.constructor.name}, ${value.size}]`;
     }
     const out: Record<string, unknown> = {};
+    const nextNumber = new Map<string, number>();
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (v !== undefined) {
-        out[k] = redactField(k, v, level, depth + 1);
+        // A key is text too: a map keyed by path, peer or source would carry
+        // exactly what the value next to it is kept from saying. Two keys that
+        // come out the same stay apart.
+        // Numbering resumes where it stopped for the label: many keys that all
+        // become `<key>` would otherwise rescan `#2…#n` each time.
+        const label = labelFor(k, level, KEY_PLACEHOLDER);
+        let n = nextNumber.get(label) ?? 1;
+        let key = n === 1 ? label : `${label} #${n}`;
+        while (Object.prototype.hasOwnProperty.call(out, key)) {
+          n += 1;
+          key = `${label} #${n}`;
+        }
+        nextNumber.set(label, n + 1);
+        out[key] = redactField(k, v, level, depth + 1);
       }
     }
     return out;
@@ -325,7 +432,14 @@ function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0)
     // Functions, symbols: nothing to log, and nothing that could leak.
     return `[${typeof value}]`;
   }
-  return level === "full" ? fullText(value) : redactedText(key, value);
+  if (level !== "full") {
+    return redactedText(key, value);
+  }
+  // A data URI under a source field is the attachment itself: describe it, do
+  // not keep it.
+  return SOURCE_FIELDS.has(key) && describeVkSourceKind(value) === "data"
+    ? describeDataSource(value)
+    : fullText(value);
 }
 
 function redactFields(
@@ -394,7 +508,7 @@ export function vkDiag(event: string, fields: Record<string, unknown> = {}): voi
   if (level === "off") {
     return;
   }
-  emit(event, redactFields(fields, level), false);
+  emit(labelFor(event, level, EVENT_PLACEHOLDER), redactFields(fields, level), false);
 }
 
 /**
@@ -412,7 +526,7 @@ export function vkDiagFailure(
   const effective: VkDiagLevel = level === "off" ? "redacted" : level;
   const summary = summarizeError(error);
   emit(
-    event,
+    labelFor(event, effective, EVENT_PLACEHOLDER),
     redactFields(
       {
         ...fields,
