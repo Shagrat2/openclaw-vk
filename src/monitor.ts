@@ -11,6 +11,7 @@ import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound, type VkTurnAdoptionLifecycle } from "./inbound.js";
 import {
   extractVkInboundAttachments,
+  capVkForwards,
   extractVkInboundForwards,
   resolveVkInboundReplyContext,
 } from "./media.js";
@@ -52,8 +53,9 @@ export function combineVkInboundMessages(
     .map((m) => m.text)
     .filter((t) => t.length > 0)
     .join("\n");
-  // Forwards are content, not identity: each message of the burst keeps its own.
-  const forwards = items.flatMap((m) => m.forwards ?? []);
+  // Forwards are content, not identity: each message of the burst keeps its own,
+  // within the same limit one message has.
+  const forwards = capVkForwards(items.flatMap((m) => m.forwards ?? []));
   return { ...last, text: combinedText, ...(forwards.length > 0 ? { forwards } : {}) };
 }
 
@@ -466,9 +468,6 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
     const attachments = extractVkInboundAttachments(context.attachments);
     const replyContext = resolveVkInboundReplyContext(context.replyMessage);
     const forwards = extractVkInboundForwards(context.forwards);
-    const replyToForwards = extractVkInboundForwards(
-      (context.replyMessage as unknown as { forwards?: unknown } | undefined)?.forwards,
-    );
     const createdAtSeconds =
       typeof context.createdAt === "number" && Number.isFinite(context.createdAt)
         ? context.createdAt
@@ -490,7 +489,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       replyToMessageId: replyContext.replyToMessageId,
       replyToText: replyContext.replyToText,
       ...(forwards.length > 0 ? { forwards } : {}),
-      ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
+      replyToForwards: replyContext.replyToForwards,
     };
 
     core.channel.activity.record({

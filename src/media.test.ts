@@ -1071,3 +1071,18 @@ describe("forwarded messages", () => {
     );
   });
 });
+
+describe("forwarded messages — the limit", () => {
+  it("spends the limit on every top-level forward before any nested one", () => {
+    const nested = Array.from({ length: 9 }, (_, i) => ({ from_id: 100 + i, date: 1, text: `вложенное ${i}`, attachments: [] }));
+    const result = extractVkInboundForwards(
+      vkForwards([
+        { from_id: 1, date: 1, text: "первое", attachments: [], fwd_messages: nested },
+        { from_id: 2, date: 1, text: "второе", attachments: [] },
+        { from_id: 3, date: 1, text: "третье", attachments: [] },
+      ]),
+    );
+    expect(result.map((forward) => forward.senderId)).toEqual([1, 2, 3]);
+    expect(result[0].forwards).toHaveLength(7);
+  });
+});

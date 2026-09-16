@@ -813,6 +813,14 @@ describe("combineVkInboundMessages", () => {
     attachments: [],
   };
 
+  it("keeps at most ten forwards across a batch", () => {
+    const ten = Array.from({ length: 10 }, (_, i) => ({ senderId: -(i + 1), text: `№${i + 1}` }));
+    const combined = combineVkInboundMessages(
+      Array.from({ length: 5 }, (_, i) => ({ ...base, messageId: String(i), text: "", forwards: ten })),
+    );
+    expect(combined?.forwards).toHaveLength(10);
+  });
+
   it("keeps the forwards of every message in the batch", () => {
     const combined = combineVkInboundMessages([
       { ...base, messageId: "1", text: "смотри", forwards: [{ senderId: -1, text: "первое" }] },
