@@ -158,6 +158,19 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   logTypingFailure: mockLogTypingFailure,
 }));
 
+// Mirrors the core (2026.9.4, context-visibility): "all" shows everything, an allowed
+// sender is always shown, "allowlist_quote" also shows quotes.
+vi.mock("openclaw/plugin-sdk/security-runtime", () => ({
+  evaluateSupplementalContextVisibility: (p: { mode: string; kind: string; senderAllowed: boolean }) =>
+    p.mode === "all"
+      ? { include: true, reason: "mode_all" }
+      : p.senderAllowed
+        ? { include: true, reason: "sender_allowed" }
+        : p.mode === "allowlist_quote" && p.kind === "quote"
+          ? { include: true, reason: "quote_override" }
+          : { include: false, reason: "blocked" },
+}));
+
 // ── Internal module mocks ────────────────────────────────────────────────────
 
 const mockSendPayloadVk = vi.hoisted(() =>
@@ -1883,5 +1896,193 @@ describe("shared wall posts vs control input", () => {
     const ctx = lastInboundContext(runtime);
     expect(ctx.CommandBody).toBe("/think high");
     expect(ctx.BodyForCommands).toBe("/think high");
+  });
+});
+
+// ── Forwarded messages ────────────────────────────────────────────────────────
+
+const ORDER_FORWARD = {
+  senderId: -142153191,
+  timestamp: 1_789_000_000_000,
+  text: "Заказ 10316111753 готов к выдаче",
+};
+
+describe("forwarded messages", () => {
+  it("shows a forward from another sender to the agent, never as command input", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "Вот сообщение пересланое чужое",
+        forwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.BodyForAgent)).toContain("[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]");
+    expect(String(ctx.BodyForAgent)).toContain("Заказ 10316111753 готов к выдаче");
+    expect(ctx.CommandBody).toBe("Вот сообщение пересланое чужое");
+    expect(ctx.BodyForCommands).toBe("Вот сообщение пересланое чужое");
+    expect(ctx).toMatchObject({
+      ForwardedFrom: "vk:-142153191",
+      ForwardedFromId: "-142153191",
+      ForwardedFromType: "group",
+      ForwardedDate: 1_789_000_000_000,
+    });
+  });
+
+  it("dispatches a message that is only a forward, with a placeholder as command input", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, text: "", forwards: [ORDER_FORWARD] }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.CommandBody).toBe("<forwarded>");
+    expect(ctx.BodyForCommands).toBe("<forwarded>");
+    expect(String(ctx.BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("does not filter forwards in a direct chat, even with contextVisibility=allowlist", async () => {
+    // As in Telegram: the sender of a direct chat already passed allowFrom.
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, text: "смотри", forwards: [ORDER_FORWARD] }),
+      account: makeAccount({
+        config: { dmPolicy: "allowlist", allowFrom: [String(SENDER_ID)], contextVisibility: "allowlist" },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("strips a forward from a sender outside the group allowlist, and keeps an allowed one", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "гляньте",
+        forwards: [ORDER_FORWARD, { senderId: 777, timestamp: 1_789_000_000_000, text: "от своего" }],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groupAllowFrom: [String(SENDER_ID), "777"],
+          contextVisibility: "allowlist",
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.BodyForAgent)).toContain("от своего");
+    expect(String(ctx.BodyForAgent)).not.toContain("Заказ 10316111753");
+    expect(ctx.ForwardedFromId).toBe("777");
+  });
+
+  it("shows every forward in a group when contextVisibility is not set", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "гляньте",
+        forwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({
+        config: { dmPolicy: "open", groupPolicy: "open", groupAllowFrom: [String(SENDER_ID)] },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("carries the forwards of a quoted message into the reply target", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что тут?",
+        replyToMessageId: "9709",
+        replyToText: "Вот сообщение пересланое чужое",
+        replyToForwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.ReplyToBody)).toContain("Вот сообщение пересланое чужое");
+    expect(String(ctx.ReplyToBody)).toContain("[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]");
+    expect(String(ctx.ReplyToBody)).toContain("Заказ 10316111753");
+    expect(ctx.CommandBody).toBe("что тут?");
+  });
+
+  it("downloads the photo of a visible forward, and not of a stripped one", async () => {
+    const photo = { type: "photo", kind: "image", url: "https://example.com/fwd.jpg", mimeType: "image/jpeg" };
+    const visible = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "фото",
+        forwards: [{ ...ORDER_FORWARD, text: "", attachments: [photo] }],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(vi.mocked(visible.channel.media.fetchRemoteMedia)).toHaveBeenCalledWith(
+      expect.objectContaining({ url: "https://example.com/fwd.jpg" }),
+    );
+
+    const stripped = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "фото",
+        forwards: [{ ...ORDER_FORWARD, text: "", attachments: [photo] }],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groupAllowFrom: [String(SENDER_ID)],
+          contextVisibility: "allowlist",
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(vi.mocked(stripped.channel.media.fetchRemoteMedia)).not.toHaveBeenCalled();
   });
 });

@@ -5,6 +5,7 @@ import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from "vites
 import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
+  extractVkInboundForwards,
   loadVkOutboundMedia,
   resolveVkInboundAgentText,
   resolveVkInboundBodyText,
@@ -900,5 +901,101 @@ describe("loadVkOutboundMedia", () => {
         loadVkOutboundMedia({ mediaUrl: join(tempDir, "missing.png") }),
       ).rejects.toThrow();
     });
+  });
+});
+// ── forwarded messages ──────────────────────────────────────────────────────
+
+// Real vk-io objects: each forward is a MessageContext built from fwd_messages.
+function vkForwards(fwd_messages: Array<Record<string, unknown>>): unknown {
+  const context = new MessageContext({
+    api: {},
+    upload: {},
+    source: "polling",
+    groupId: 239104331,
+    updateType: "message_new",
+    payload: {
+      client_info: {},
+      message: { id: 9709, peer_id: 1, from_id: 12324712, date: 1, text: "Вот", attachments: [], fwd_messages },
+    },
+  } as unknown as ConstructorParameters<typeof MessageContext>[0]);
+  return context.forwards;
+}
+
+const ORDER_FORWARD = {
+  from_id: -142153191,
+  date: 1_789_000_000,
+  text: "Заказ 10316111753 готов к выдаче",
+  attachments: [],
+};
+
+describe("forwarded messages", () => {
+  it("reads the author, date, text, photos and nested forwards", () => {
+    const result = extractVkInboundForwards(
+      vkForwards([
+        { ...ORDER_FORWARD, fwd_messages: [{ from_id: 7, date: 1_789_000_001, text: "вложенное", attachments: [] }] },
+        { from_id: 12324712, date: 1_789_000_002, text: "", attachments: [WALL_PHOTO] },
+      ]),
+    );
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({
+      senderId: -142153191,
+      timestamp: 1_789_000_000_000,
+      text: "Заказ 10316111753 готов к выдаче",
+      forwards: [{ senderId: 7, timestamp: 1_789_000_001_000, text: "вложенное" }],
+    });
+    expect(result[1]).toMatchObject({ senderId: 12324712, text: "" });
+    expect(result[1].attachments).toMatchObject([{ kind: "image", url: "https://sun.userapi.com/p1.jpg" }]);
+  });
+
+  it("keeps at most two levels of nesting", () => {
+    const deep = { from_id: 3, date: 1, text: "третий", attachments: [] };
+    const middle = { from_id: 2, date: 1, text: "второй", attachments: [], fwd_messages: [deep] };
+    const result = extractVkInboundForwards(
+      vkForwards([{ from_id: 1, date: 1, text: "первый", attachments: [], fwd_messages: [middle] }]),
+    );
+    expect(result[0].forwards?.[0]).toMatchObject({ senderId: 2, text: "второй" });
+    expect(result[0].forwards?.[0].forwards ?? []).toEqual([]);
+  });
+
+  it("keeps at most ten forwards in total", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ from_id: i + 1, date: 1, text: `№${i + 1}`, attachments: [] }));
+    expect(extractVkInboundForwards(vkForwards(many))).toHaveLength(10);
+  });
+
+  it("returns nothing for input that is not a list of forwards", () => {
+    expect(extractVkInboundForwards(undefined)).toEqual([]);
+    expect(extractVkInboundForwards(null)).toEqual([]);
+    expect(extractVkInboundForwards("text")).toEqual([]);
+  });
+
+  it("shows a forward to the agent under its author and date, after the sender's text", () => {
+    const forwards = extractVkInboundForwards(vkForwards([ORDER_FORWARD]));
+    expect(resolveVkInboundAgentText({ text: "Вот сообщение пересланое чужое", forwards })).toBe(
+      "Вот сообщение пересланое чужое\n\n[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]\nЗаказ 10316111753 готов к выдаче",
+    );
+  });
+
+  it("shows nested forwards and a forwarded wall post", () => {
+    const forwards = extractVkInboundForwards(
+      vkForwards([
+        {
+          from_id: 5,
+          date: 1_789_000_000,
+          text: "",
+          attachments: [{ type: "wall", wall: { id: 2, owner_id: -1, date: 1, text: "Пост", attachments: [] } }],
+          fwd_messages: [{ from_id: 6, date: 1_789_000_000, text: "глубже", attachments: [] }],
+        },
+      ]),
+    );
+    expect(resolveVkInboundAgentText({ text: "", forwards })).toBe(
+      [
+        "[Forwarded from vk:5 at 2026-09-10T00:26:40.000Z]",
+        "[VK wall post https://vk.com/wall-1_2]",
+        "Пост",
+        "",
+        "[Forwarded from vk:6 at 2026-09-10T00:26:40.000Z]",
+        "глубже",
+      ].join("\n"),
+    );
   });
 });
