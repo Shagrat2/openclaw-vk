@@ -178,11 +178,15 @@ const mockSendPayloadVk = vi.hoisted(() =>
 );
 const mockMarkMessageReadVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockSendTypingVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockResolveVkOwnGroup = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ id: 239104331, name: "Карамелька" }),
+);
 
 vi.mock("./send.js", () => ({
   markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
+  resolveVkOwnGroup: mockResolveVkOwnGroup,
 }));
 
 import { handleVkInbound } from "./inbound.js";
@@ -1268,6 +1272,30 @@ describe("dispatch payload", () => {
         ReplyToBody: "quoted reply",
       }),
     );
+  });
+
+  it.each([
+    ["the bot itself, the way Telegram marks it", -239104331, {}, "Карамелька (you)"],
+    ["the bot under its configured name", -239104331, { name: "Помощник" }, "Помощник (you)"],
+    ["another community by id", -142153191, {}, "vk:-142153191"],
+    ["a person by id", SENDER_ID, {}, `vk:${SENDER_ID}`],
+  ])("labels the author of a quote: %s", async (_case, replyToSenderId, accountFields, label) => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        replyToMessageId: "9723",
+        replyToText: "ответ",
+        replyToSenderId,
+      }),
+      account: makeAccount({ ...accountFields, config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(lastInboundContext(runtime).ReplyToSender).toBe(label);
   });
 
   it("sets ChatType=direct for DM messages", async () => {

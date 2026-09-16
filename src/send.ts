@@ -61,6 +61,7 @@ type VkOutboundMediaReference = {
 type VkClientState = {
   vk: VK;
   groupId?: number;
+  groupName?: string;
   groupIdPromise?: Promise<number | undefined>;
 };
 
@@ -428,6 +429,7 @@ async function resolveVkGroupId(state: VkClientState): Promise<number | undefine
       .then(({ groups }) => {
         const groupId = groups[0]?.id;
         state.groupId = typeof groupId === "number" ? groupId : undefined;
+        state.groupName = groups[0]?.name?.trim() || undefined;
         return state.groupId;
       })
       .catch(() => undefined);
@@ -435,14 +437,28 @@ async function resolveVkGroupId(state: VkClientState): Promise<number | undefine
   return await state.groupIdPromise;
 }
 
-export function primeVkGroupId(token: string, groupId: number): void {
+export function primeVkGroupId(token: string, groupId: number, groupName?: string): void {
   const trimmedToken = token.trim();
   if (!trimmedToken || !Number.isInteger(groupId) || groupId <= 0) {
     return;
   }
   const state = getOrCreateVkState(trimmedToken);
   state.groupId = groupId;
+  state.groupName = groupName?.trim() || undefined;
   state.groupIdPromise = Promise.resolve(groupId);
+}
+
+/** The community this token speaks for, if it is a community token. */
+export async function resolveVkOwnGroup(
+  token: string,
+): Promise<{ id: number; name?: string } | undefined> {
+  const trimmedToken = token.trim();
+  if (!trimmedToken) {
+    return undefined;
+  }
+  const state = getOrCreateVkState(trimmedToken);
+  const id = await resolveVkGroupId(state);
+  return id === undefined ? undefined : { id, name: state.groupName };
 }
 
 export async function sendMessageVk(
