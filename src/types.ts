@@ -74,6 +74,8 @@ export type VkInboundMessage = {
   attachments?: VkInboundAttachment[];
   replyToMessageId?: string;
   replyToText?: string;
+  /** Author of the quoted message; negative for a community. */
+  replyToSenderId?: number;
   /** Messages forwarded into this one. */
   forwards?: VkInboundForward[];
   /** Messages forwarded into the quoted one. */

@@ -14,6 +14,7 @@ import {
   normalizeVkSenderAllowEntry,
   normalizeVkTargetId,
   primeVkGroupId,
+  resolveVkOwnGroup,
   readVkAllowlistConfig,
   resolveVkDirectoryGroups,
   resolveVkDirectoryPeers,
@@ -2988,6 +2989,24 @@ describe("primeVkGroupId", () => {
     expect(mockSetActivity).toHaveBeenCalledWith(
       expect.objectContaining({ group_id: 12345678 }),
     );
+  });
+
+  it("gives back the community it was primed with, name included", async () => {
+    primeVkGroupId("test-token", 12345678, " Карамелька ");
+
+    await expect(resolveVkOwnGroup("test-token")).resolves.toEqual({
+      id: 12345678,
+      name: "Карамелька",
+    });
+    expect(mockGroupsGetById).not.toHaveBeenCalled();
+  });
+
+  it("looks the community up once when nothing primed it", async () => {
+    mockGroupsGetById.mockClear().mockResolvedValueOnce({ groups: [{ id: 777, name: "Группа" }] });
+
+    await expect(resolveVkOwnGroup("test-token")).resolves.toEqual({ id: 777, name: "Группа" });
+    await resolveVkOwnGroup("test-token");
+    expect(mockGroupsGetById).toHaveBeenCalledOnce();
   });
 
   it("does not prime group ID for empty token", async () => {
