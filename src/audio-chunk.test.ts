@@ -56,12 +56,24 @@ function stubExecFileError(message: string, stderr = ""): void {
   });
 }
 
+/**
+ * The splitter's own temp dirs: `mkdtemp` appends six characters to "vk-voice-".
+ * Matched exactly, not by prefix: send.test.ts, in a parallel worker, creates
+ * real "vk-voice-src-*" dirs in the same tmpdir, and a prefix match would race
+ * the before/after comparison with them.
+ */
+async function vkVoiceDirs(): Promise<string[]> {
+  const entries = await readdir(tmpdir());
+  return entries.filter((e) => /^vk-voice-[A-Za-z0-9]{6}$/.test(e)).sort();
+}
+
 beforeEach(() => {
   mockExecFile.mockReset();
   delete process.env.VK_AUDIO_MESSAGE_MAX_MS;
   delete process.env.FFPROBE_BIN;
   delete process.env.FFMPEG_BIN;
   delete process.env.VK_AUDIO_SPLIT_MAX_INPUT_BYTES;
+  delete process.env.VK_AUDIO_SPLIT_DEADLINE_MS;
 });
 
 describe("getVkAudioMessageMaxMs", () => {
@@ -150,11 +162,6 @@ describe("selectCutPointsMs", () => {
 });
 
 describe("splitAudioAtSilence temp dir cleanup", () => {
-  async function vkVoiceDirs(): Promise<string[]> {
-    const entries = await readdir(tmpdir());
-    return entries.filter((e) => e.startsWith("vk-voice-")).sort();
-  }
-
   it("removes the temp dir when the first ffmpeg extraction fails", async () => {
     // Regression guard for finding #3: on the first-segment failure `outputs`
     // is empty, so cleanupAudioSegments can't derive the mkdtemp dir — it must
@@ -309,6 +316,85 @@ describe("splitAudioAtSilence — full extraction path", () => {
     await expect(
       splitAudioAtSilence("/tmp/voice.ogg", 30_000, { signal: controller.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  describe("its own deadline versus the caller's stop", () => {
+    const STAGES = ["duration probe", "silence search", "extraction", "segment probe"] as const;
+    type Stage = (typeof STAGES)[number];
+
+    function stageOf(args: string[]): Stage {
+      const line = args.join(" ");
+      if (line.includes("format=duration")) {
+        return (args[args.length - 1] as string).includes("part-") ? "segment probe" : "duration probe";
+      }
+      return line.includes("silencedetect") ? "silence search" : "extraction";
+    }
+
+    /** What execFile reports when its signal fires, whichever signal it was. */
+    function nodeAbortError(signal: AbortSignal): Error {
+      return Object.assign(new Error("The operation was aborted", { cause: signal.reason }), {
+        name: "AbortError",
+        code: "ABORT_ERR",
+      });
+    }
+
+    /**
+     * The tools answer normally, except at `stuck`, where the process runs until
+     * its signal fires — the deadline, or the caller's stop.
+     */
+    function stubStuckAt(stuck: Stage, onStuck?: () => void): void {
+      mockExecFile.mockImplementation(
+        (
+          _bin: string,
+          args: string[],
+          opts: { signal?: AbortSignal },
+          cb: (e: Error | null, stdout: string, stderr: string) => void,
+        ) => {
+          const stage = stageOf(args);
+          if (stage === stuck) {
+            const signal = opts.signal as AbortSignal;
+            signal.addEventListener("abort", () => cb(nodeAbortError(signal), "", ""), { once: true });
+            onStuck?.();
+            return;
+          }
+          cb(null, stage === "duration probe" ? "100.0\n" : stage === "segment probe" ? "20.0\n" : "", "");
+        },
+      );
+    }
+
+    it.each(STAGES)(
+      "treats running out of its deadline during the %s as a failed split, not a stop",
+      async (stage) => {
+        // Node reports the private deadline as an `AbortError` too. Rethrown, it
+        // read as the gateway's stop, and the caller skipped the document it
+        // sends when a split fails — so exhausting the budget lost the reply.
+        process.env.VK_AUDIO_SPLIT_DEADLINE_MS = "30";
+        const caller = new AbortController();
+        stubStuckAt(stage);
+        const before = await vkVoiceDirs();
+
+        await expect(
+          splitAudioAtSilence("/tmp/voice.ogg", 30_000, { signal: caller.signal }),
+        ).resolves.toEqual([]);
+        expect(caller.signal.aborted).toBe(false);
+        // What the extraction had written is not left behind.
+        expect(await vkVoiceDirs()).toEqual(before);
+      },
+    );
+
+    it.each(STAGES)(
+      "rethrows the caller's stop that arrives during the %s, and removes its output",
+      async (stage) => {
+        const caller = new AbortController();
+        stubStuckAt(stage, () => setTimeout(() => caller.abort(), 0));
+        const before = await vkVoiceDirs();
+
+        await expect(
+          splitAudioAtSilence("/tmp/voice.ogg", 30_000, { signal: caller.signal }),
+        ).rejects.toMatchObject({ name: "AbortError" });
+        expect(await vkVoiceDirs()).toEqual(before);
+      },
+    );
   });
 
   it("gives up when the source is longer than the segment ceiling allows", async () => {

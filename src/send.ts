@@ -87,9 +87,51 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
-/** A stop must end the media path, never be swallowed into a fallback. */
+/**
+ * A voice message went to `messages.send` and failed without an answer from VK:
+ * a timeout, a dropped connection. VK may still have accepted it — the retries
+ * reuse one `random_id`, so the attempt reported as failed may be the one that
+ * went through — and a fallback on top would reach the recipient twice. A
+ * failure with a VK error code is VK's definite refusal and keeps its fallback.
+ */
+export class VkSendOutcomeUnknownError extends Error {
+  constructor(override readonly cause: unknown) {
+    super("VK voice message outcome unknown: the send failed without an answer from VK");
+    this.name = "VkSendOutcomeUnknownError";
+  }
+}
+
+/**
+ * What a failed voice send means for the fallback. Only a numeric VK error code
+ * is an answer: a DOMException carries a numeric `code` of its own (20 for
+ * `AbortError`), a legacy DOM code that says nothing about what VK did. A stop
+ * is reported as a stop — the send may never have been tried.
+ */
+function voiceSendFailure(error: unknown, signal?: AbortSignal): unknown {
+  if (signal?.aborted) {
+    return error;
+  }
+  const answeredByVk = !(error instanceof DOMException) && readVkErrorCode(error) !== undefined;
+  return answeredByVk ? error : new VkSendOutcomeUnknownError(error);
+}
+
+/**
+ * A failure that must end the media path, never be swallowed into a fallback:
+ * a stop, a reply that reached the recipient in part, and a voice message VK
+ * may already have accepted. A fallback after either of the last two would put
+ * a duplicate in front of the recipient.
+ *
+ * The stop is the gateway's signal, not the error's name: the splitter's private
+ * deadline and vk-io's own request timeout both surface as `AbortError` too, and
+ * those are ordinary failures with a fallback — unless the timeout hit a voice
+ * send, which makes its outcome unknown.
+ */
 function isDeliveryStop(error: unknown, signal?: AbortSignal): boolean {
-  return isAbortError(error) || error instanceof VkPartialDeliveryError || signal?.aborted === true;
+  return (
+    error instanceof VkPartialDeliveryError ||
+    error instanceof VkSendOutcomeUnknownError ||
+    signal?.aborted === true
+  );
 }
 
 export type SendVkOptions = {
@@ -150,9 +192,23 @@ function getOrCreateVk(token: string): VK {
   return getOrCreateVkState(token).vk;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+/**
+ * Pause that a stop cuts short. The caller has already checked the signal, so
+ * this only has to notice a stop that arrives during the pause. The listener is
+ * removed when the pause ends: the account's stop signal lives as long as the
+ * gateway, and every retry would otherwise leave one behind on it.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -343,6 +399,8 @@ async function runMediaUpload<T>(params: {
     extraRetryablePredicate?: (error: unknown) => boolean;
     maxAttempts?: number;
   };
+  /** Gateway stop: no queued transfer and no retry starts after it. */
+  signal?: AbortSignal;
 }): Promise<T> {
   const bytes = await localSourceSize(params.source);
   let attempt = 0;
@@ -353,7 +411,13 @@ async function runMediaUpload<T>(params: {
         const result = await enqueueKeyedTask({
           tails: mediaUploadTails,
           key: params.token,
-          task: params.upload,
+          // Checked again when the queue reaches this transfer: the stop
+          // may have arrived while it waited behind an earlier upload on
+          // the same token.
+          task: async () => {
+            params.signal?.throwIfAborted();
+            return await params.upload();
+          },
         });
         logMediaUploadOutcome({ kind: params.kind, source: params.source, mime: params.mime, bytes, attempt });
         return result;
@@ -369,7 +433,10 @@ async function runMediaUpload<T>(params: {
         throw error;
       }
     },
-    params.retry ?? { extraRetryablePredicate: isVkTransientFileUndefinedError },
+    {
+      ...(params.retry ?? { extraRetryablePredicate: isVkTransientFileUndefinedError }),
+      signal: params.signal,
+    },
   );
 }
 
@@ -379,11 +446,18 @@ async function withVkRetry<T>(
     extraRetryableCodes?: readonly number[];
     extraRetryablePredicate?: (error: unknown) => boolean;
     maxAttempts?: number;
+    /**
+     * Gateway stop, checked before every attempt and cutting the pause short.
+     * Without it a retry went out after the stop: "abort" is in the retryable
+     * set, so even the stop's own error was replayed.
+     */
+    signal?: AbortSignal;
   },
 ): Promise<T> {
   const maxAttempts = opts?.maxAttempts ?? VK_TRANSIENT_RETRY_ATTEMPTS;
   let attempt = 0;
   while (true) {
+    opts?.signal?.throwIfAborted();
     try {
       return await operation();
     } catch (error) {
@@ -393,10 +467,10 @@ async function withVkRetry<T>(
         isRetryableVkError(error) ||
         (code !== undefined && (opts?.extraRetryableCodes?.includes(code) ?? false)) ||
         (opts?.extraRetryablePredicate?.(error) ?? false);
-      if (attempt >= maxAttempts || !retryable) {
+      if (attempt >= maxAttempts || !retryable || opts?.signal?.aborted) {
         throw error;
       }
-      await sleep(retryDelayMs(attempt));
+      await sleep(retryDelayMs(attempt), opts?.signal);
     }
   }
 }
@@ -641,17 +715,22 @@ async function sendVkApiMessage(params: {
       ? JSON.stringify(params.formatted.formatData)
       : undefined;
   const randomId = getRandomId();
-  const messageId = await withVkRetry(async () => {
-    return await vk.api.messages.send({
-      peer_id: params.peerId,
-      message: params.formatted.text,
-      random_id: randomId,
-      ...(params.attachment ? { attachment: params.attachment } : {}),
-      ...(keyboard ? { keyboard } : {}),
-      ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
-      ...(formatData ? { format_data: formatData } : {}),
-    });
-  });
+  // Every message of every path goes out through here, so this is where a stop
+  // is honoured per message: after an upload, between chunks, before a retry.
+  const messageId = await withVkRetry(
+    async () => {
+      return await vk.api.messages.send({
+        peer_id: params.peerId,
+        message: params.formatted.text,
+        random_id: randomId,
+        ...(params.attachment ? { attachment: params.attachment } : {}),
+        ...(keyboard ? { keyboard } : {}),
+        ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
+        ...(formatData ? { format_data: formatData } : {}),
+      });
+    },
+    { signal: params.opts?.abortSignal },
+  );
 
   recordOutboundActivity(params.account.accountId);
   return { messageId: String(messageId), chatId: params.to };
@@ -782,6 +861,7 @@ export async function sendPhotoVk(
       uploadMeta?.retryTransientPhotoErrors === true
         ? { extraRetryablePredicate: isVkRetryablePhotoUploadError }
         : undefined,
+    signal: opts.abortSignal,
     upload: () =>
       vk.upload.messagePhoto({
         peer_id: peerId,
@@ -821,6 +901,7 @@ export async function sendDocumentVk(
     source: docSource,
     mime: uploadMeta?.contentType,
     token: account.token,
+    signal: opts.abortSignal,
     upload: () =>
       vk.upload.messageDocument({
         peer_id: peerId,
@@ -1014,6 +1095,7 @@ async function uploadVkAudioMessage(params: {
   source: string | Buffer;
   filename: string;
   contentType?: string;
+  signal?: AbortSignal;
 }): Promise<string> {
   // Guard against an invalid peer_id (would surface from VK as a misleading
   // error 15 "access denied … with current scopes", even though the token's
@@ -1058,7 +1140,7 @@ async function uploadVkAudioMessage(params: {
         }
         return server.upload_url;
       },
-      { extraRetryableCodes: [15] },
+      { extraRetryableCodes: [15], signal: params.signal },
     );
 
   const attachment = await runMediaUpload({
@@ -1066,11 +1148,15 @@ async function uploadVkAudioMessage(params: {
     source: params.source,
     mime: params.contentType,
     token: params.token,
-    upload: async () =>
-      await params.vk.upload.audioMessage({
+    upload: async () => {
+      const uploadUrl = await requestUploadUrl();
+      // The address request is a round trip of its own; a stop during it must
+      // not be followed by the transfer.
+      params.signal?.throwIfAborted();
+      return await params.vk.upload.audioMessage({
         peer_id: params.peerId,
         source: {
-          uploadUrl: await requestUploadUrl(),
+          uploadUrl,
           values: [
             buildVkUploadSource({
               source: params.source,
@@ -1080,10 +1166,12 @@ async function uploadVkAudioMessage(params: {
           ],
         },
         title: params.filename,
-      }),
+      });
+    },
     // A truncated multipart transfer (code=100 "file is undefined") is retried:
     // the file never reached VK, so there can be no duplicate.
     retry: { extraRetryablePredicate: isVkTransientFileUndefinedError },
+    signal: params.signal,
   });
   return String(attachment);
 }
@@ -1132,11 +1220,8 @@ async function sendOverLimitAudio(params: {
       knownDurationMs: params.measuredMs,
       signal,
     });
-  } catch (error) {
-    if (isAbortError(error)) {
-      throw error;
-    }
-    segments = [];
+  } catch {
+    // A failed split; whether it was a stop is checked below.
   }
   if (signal?.aborted) {
     // The stop arrived while ffmpeg was cutting: nothing is uploaded, and what
@@ -1162,9 +1247,10 @@ async function sendOverLimitAudio(params: {
       if (isDeliveryStop(error, signal)) {
         throw error;
       }
-      // Every upload happens before the first send, so a failure here means
-      // nothing has reached the recipient yet — the document below is a
-      // replacement, not a duplicate.
+      // Every upload happens before the first send, and a send VK may have
+      // accepted does not get here, so a failure here means nothing has
+      // reached the recipient — the document below is a replacement, not a
+      // duplicate.
       vkDiagFailure("voice segments failed before delivery", error, {
         segments: segments.length,
       });
@@ -1251,6 +1337,7 @@ export async function sendAudioMessageVk(
   }
 
   // ── Single-message path (short audio, or a source we neither copy nor measure) ─
+  // A stop during the upload is honoured by the send below.
   const attachment = await uploadVkAudioMessage({
     vk,
     token: account.token,
@@ -1258,9 +1345,11 @@ export async function sendAudioMessageVk(
     source: uploadSource,
     filename: title,
     contentType: uploadMeta?.contentType,
+    signal,
   }).finally(async () => {
     await uploadCleanup?.();
   });
+  // No fallback after a send with no answer from VK: see VkSendOutcomeUnknownError.
   const firstResult = await sendVkApiMessage({
     to: normalizedTo,
     peerId,
@@ -1272,6 +1361,8 @@ export async function sendAudioMessageVk(
       buttons: tailChunks.length === 0 ? opts.buttons : undefined,
       clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
     },
+  }).catch((error: unknown) => {
+    throw voiceSendFailure(error, signal);
   });
 
   if (tailChunks.length === 0) {
@@ -1334,6 +1425,7 @@ async function sendVkAudioSegments(params: {
         // would lie to VK about the format.
         filename: `voice-${String(index + 1).padStart(2, "0")}${audioFileExtension(segment)}`,
         contentType: params.contentType,
+        signal,
       }),
     );
   }
@@ -1375,23 +1467,28 @@ async function sendVkAudioSegments(params: {
         }),
       );
     } catch (error) {
-      throw partial(error);
+      // Partial delivery wins when something already went out; otherwise a
+      // send with no answer from VK still keeps the document fallback away.
+      throw partial(voiceSendFailure(error, signal));
     }
   }
 
   if (hasTail) {
     stopIfAborted();
     try {
-      results.push(
-        ...(await sendMessageChunksVk({
-          to: params.to,
-          chunks: tailChunks,
-          opts: {
-            ...opts,
-            replyTo: undefined,
-          },
-        })),
-      );
+      // Counted per chunk, not on return: a stop between tail chunks must
+      // report the chunks that already went out as delivered.
+      await sendMessageChunksVk({
+        to: params.to,
+        chunks: tailChunks,
+        opts: {
+          ...opts,
+          replyTo: undefined,
+        },
+        onSent: (result) => {
+          results.push(result);
+        },
+      });
     } catch (error) {
       throw partial(error);
     }
@@ -1563,6 +1660,8 @@ async function sendMessageChunksVk(params: {
   to: string;
   chunks: VkPreparedFormattedMessage[];
   opts: SendVkOptions;
+  /** Called after each delivered chunk, for callers that report partial delivery. */
+  onSent?: (result: SendVkResult) => void;
 }): Promise<SendVkResult[]> {
   const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: params.opts.cfg,
@@ -1590,6 +1689,7 @@ async function sendMessageChunksVk(params: {
       },
     });
     results.push(result);
+    params.onSent?.(result);
   }
   return results;
 }
@@ -1674,8 +1774,9 @@ async function sendResolvedMediaVk(params: {
       });
     } catch (audioError) {
       if (isDeliveryStop(audioError, params.opts.abortSignal)) {
-        // A stop ends the path with nothing more sent, and a reply that
-        // reached the recipient in part is not re-sent as text on top of it.
+        // A stop ends the path with nothing more sent, and neither a reply
+        // that reached the recipient in part nor a voice message VK may
+        // already have accepted is re-sent as text on top of it.
         throw audioError;
       }
       // Voice is best-effort: log the *real* VK error (code/message) for
