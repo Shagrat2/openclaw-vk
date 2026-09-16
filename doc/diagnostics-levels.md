@@ -23,26 +23,63 @@ Addressed:
   longer the transport. Diagnostics now go through
   `runtime.logging.getChildLogger()`, so they inherit the gateway's levels,
   formatting, and rotation.
-- **`appendFileSync` is gone from the send path.** An optional secondary file
-  sink remains for operators whose gateway log is too noisy to read, but it
-  writes asynchronously and is never awaited by a send.
+- **No file of its own.** The previous revision kept an optional secondary
+  file sink; it is gone. A plugin-owned file has none of the gateway log's
+  safeguards — no rotation, no size limit, no restricted permissions on
+  creation — and an unbounded write queue behind it is a memory leak waiting
+  for a slow disk. Operators who find the gateway feed too noisy filter it by
+  the `vk-diag` module binding instead.
 - **Redaction is a property of the channel, not caller discipline.** Every field
   passes through one redactor, so a new call site cannot forget to sanitise its
-  own value. Names are replaced by their source kind (`local`/`remote`/`data`),
-  identifiers by `redactIdentifier` from the SDK, and free text — including
-  error messages, which is where paths leak most often — has embedded paths and
-  URLs stripped before truncation.
+  own value.
+- **Below `full`, nothing free-form survives.** The previous revision tried to
+  recognise paths and addresses inside text and strip them. That is a losing
+  game — a Unicode path, a path with spaces, a relative one, a data URI in the
+  middle of an error message: each escaped one pattern or another. The rule is
+  now an allowlist, by field name and value type:
+
+  | what | at `off` / `redacted` |
+  |---|---|
+  | identifier fields (`to`, `peerId`, `messageId`, …) | hashed with `redactIdentifier` from the SDK |
+  | numbers, booleans | as they are |
+  | token fields (`kind`, `mime`, `stage`, `errorName`, `errno`) | kept only if the value looks like a token |
+  | source fields (`source`, `mediaUrl`, `url`, `path`, …) | replaced by the kind: `local` / `remote` / `data` |
+  | any other string, error messages included | the constant `<text>` |
+  | an `Error` | its class, numeric code and `errno`-style code; never its message |
+  | buffers and typed arrays | the constant `buffer` |
+
+  Nothing in that table depends on recognising what a string contains, so a
+  path shape the code has never seen still cannot reach the log.
+- **Attachment contents do not reach the log, at `full` either.** A data URI
+  under a source field (`source`, `inline`, …) is replaced by a description of
+  it — `data (audio/wav, name=voice%20note.wav, 8 chars)`; the name is shown
+  only when it is plainly a file name. In any other text, everything from the
+  first data URI on is cut and replaced by its length:
+  `failed to read <data URI cut, 52 chars>`. The payload is not picked out of
+  the URI — its forms are too many — so the text after a data URI goes with
+  it. Which spellings start a data URI, and why prose that merely mentions
+  `data:` is left alone, is listed at `DATA_URI_START_RE` in
+  `src/diagnostics.ts`. Only the start of a text is looked at: as much as the
+  length cap lets through, plus a margin for a secret straddling it. Keys of
+  nested fields and event names are text too: at `full` they get the same
+  treatment; below it, one that does not look like a name in code becomes
+  `<key>` or `<event>`. Attachment bytes that reach a text with no data URI
+  around them are not recognised. The core's secret redactor runs
+  over the rest, plus a pass of our own for what it does not cover: checked
+  against the real `plugin-sdk/logging-core`, it leaves a credential in a URL's
+  query string (`?access_token=…`) and a bare VK token (`vk1.a.…`) as they are,
+  and both can appear in an error thrown by vk-io. Text is capped.
 - **Levels instead of a single toggle**, defaulting to silent:
 
   | level | contents |
   |---|---|
   | `off` (default) | nothing |
-  | `redacted` | the safe-field list quoted above, plus a hashed message id for correlation |
+  | `redacted` | the safe-field list quoted above, plus hashed identifiers for correlation |
   | `full` | the safe fields plus names: paths, URLs, peer ids |
 
-- **`redacted` is what we run day to day.** It is the level configured in our
-  own deployment; `full` is switched on for a specific investigation and off
-  again afterwards.
+- **`redacted` is the level meant for day-to-day use on a channel shared with
+  others**; `full` is for an operator looking into their own deployment, where
+  the names are theirs to see.
 - **Identifiers survive as hashes, not as names.** `redactIdentifier` gives a
   stable `sha256:…` prefix, so two failed sends to different recipients stay
   distinguishable in the timeline without naming anyone. This is the core's own
@@ -54,8 +91,10 @@ Configuration is native to OpenClaw and hot-reloaded:
 { "channels": { "vk": { "diagnostics": { "level": "redacted" } } } }
 ```
 
-An unrecognised value resolves to `off` rather than to something more verbose;
-this is unit-tested, so a typo cannot silently widen what is logged.
+An unrecognised value resolves to `off` rather than to something more verbose.
+This holds for the environment override too: a set but invalid `VK_DIAG_LEVEL`
+is `off`, and does *not* fall through to a `full` configured in the file. Both
+are unit-tested, so a typo cannot silently widen what is logged.
 
 ## Why `full` is kept
 
@@ -69,7 +108,7 @@ A remote attachment rejected by VK produces this at `redacted`:
 
 ```
 vk upload failed  kind=photo source=remote mime=image/jpeg bytes=182034 attempt=3
-                  code=100 reason="photo is undefined"
+                  errorName=APIError vkCode=100
 ```
 
 At least three unrelated causes produce that exact line: an expired signed URL,
@@ -118,8 +157,14 @@ state before this level existed.
   already holds the group access token, so `full` does not widen who can read
   what; it widens what an operator can see about their own traffic.
 - **Failures stay minimal.** Upload failures are logged even at `off`, but only
-  with safe fields — so a channel is never silent about an error, and switching
-  diagnostics off never costs an operator the error itself.
+  by error class and codes — `errorName=APIError vkCode=100`, `errno=ENOENT` —
+  never by message, which is where paths and request parameters travel. So a
+  channel is never silent about an error, and switching diagnostics off never
+  costs an operator the error itself.
+- **Tested against the real redactor.** `src/diagnostics.test.ts` runs with a
+  test double for the SDK, because the `openclaw` peer is optional;
+  `src/diagnostics.sdk.test.ts` repeats the contract through the real
+  `plugin-sdk/logging-core` and runs in the CI job that installs the host.
 - **Not for shared or hosted deployments.** `full` is documented as a local
   investigation switch. An operator running the gateway on behalf of other
   people should leave the default.
@@ -129,6 +174,5 @@ state before this level existed.
 We would rather keep `full` behind the explicit switch described here, and we
 have stated it openly instead of shipping it quietly. If the maintainer prefers
 the strict reading, the level is a single branch in
-[`src/diagnostics.ts`](../src/diagnostics.ts) and the file sink is a single
-function: both can be dropped from this PR without touching anything else, and
-carried as a fork-local patch instead.
+[`src/diagnostics.ts`](../src/diagnostics.ts): it can be dropped from this PR
+without touching anything else, and carried as a fork-local patch instead.

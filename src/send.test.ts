@@ -609,7 +609,7 @@ describe("sendPhotoVk", () => {
 
     expect(mockUploadLogger.error).toHaveBeenCalledWith(
       "vk upload failed",
-      expect.objectContaining({ kind: "photo", code: 100, bytes: 3 }),
+      expect.objectContaining({ kind: "photo", vkCode: 100, bytes: 3 }),
     );
     // Attachment content is never logged — a Buffer becomes the source kind.
     const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
@@ -648,7 +648,7 @@ describe("sendPhotoVk", () => {
 
     expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
       "vk upload failed",
-      expect.objectContaining({ code: 100, errno: "ECONNRESET" }),
+      expect.objectContaining({ vkCode: 100, errno: "ECONNRESET" }),
     );
   });
 
