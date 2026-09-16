@@ -616,6 +616,30 @@ describe("message_new handler", () => {
     });
   });
 
+  it("propagates forwarded messages and those inside the quoted message", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(
+      makeCtx({
+        forwards: [{ senderId: -142153191, createdAt: 1_789_000_000, text: "Заказ готов", attachments: [] }],
+        replyMessage: {
+          id: 9707,
+          text: "",
+          forwards: [{ senderId: 12_324_712, createdAt: 1_789_000_001, text: "моё", attachments: [] }],
+        },
+      }),
+    );
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.forwards).toMatchObject([
+      { senderId: -142153191, timestamp: 1_789_000_000_000, text: "Заказ готов" },
+    ]);
+    expect(message.replyToForwards).toMatchObject([
+      { senderId: 12_324_712, timestamp: 1_789_000_001_000, text: "моё" },
+    ]);
+  });
+
   it("normalizes vk-io style document image attachments from preview photos", async () => {
     activeMonitor = startMonitor();
     await flush();
@@ -788,6 +812,14 @@ describe("combineVkInboundMessages", () => {
     isGroup: false,
     attachments: [],
   };
+
+  it("keeps the forwards of every message in the batch", () => {
+    const combined = combineVkInboundMessages([
+      { ...base, messageId: "1", text: "смотри", forwards: [{ senderId: -1, text: "первое" }] },
+      { ...base, messageId: "2", text: "", forwards: [{ senderId: -2, text: "второе" }] },
+    ]);
+    expect(combined?.forwards).toMatchObject([{ senderId: -1 }, { senderId: -2 }]);
+  });
 
   it("returns null for an empty batch", () => {
     expect(combineVkInboundMessages([])).toBeNull();

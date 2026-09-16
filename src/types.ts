@@ -5,6 +5,10 @@ export type VkDiagLevel = (typeof VK_DIAG_LEVELS)[number];
 export type DmPolicy = "pairing" | "allowlist" | "open" | "disabled";
 type GroupPolicy = "open" | "disabled" | "allowlist";
 
+/** The core's supplemental context visibility modes (`channels.<id>.contextVisibility`). */
+export const VK_CONTEXT_VISIBILITY_MODES = ["all", "allowlist", "allowlist_quote"] as const;
+export type VkContextVisibility = (typeof VK_CONTEXT_VISIBILITY_MODES)[number];
+
 export type VkAccountConfig = {
   name?: string;
   enabled?: boolean;
@@ -16,6 +20,8 @@ export type VkAccountConfig = {
   defaultTo?: string;
   groupPolicy?: GroupPolicy;
   groupAllowFrom?: Array<string | number>;
+  /** Which forwards reach the agent in groups; see `VK_CONTEXT_VISIBILITY_MODES`. */
+  contextVisibility?: VkContextVisibility;
   groups?: Record<
     string,
     {
@@ -45,6 +51,17 @@ export type ResolvedVkAccount = {
   config: VkAccountConfig;
 };
 
+/** A message forwarded into an inbound one, as VK delivers it. */
+export type VkInboundForward = {
+  /** Author of the forwarded message; negative for a community. */
+  senderId: number;
+  /** When it was originally sent, in milliseconds. */
+  timestamp?: number;
+  text: string;
+  attachments?: VkInboundAttachment[];
+  forwards?: VkInboundForward[];
+};
+
 export type VkInboundMessage = {
   messageId: string;
   conversationMessageId?: number;
@@ -57,6 +74,10 @@ export type VkInboundMessage = {
   attachments?: VkInboundAttachment[];
   replyToMessageId?: string;
   replyToText?: string;
+  /** Messages forwarded into this one. */
+  forwards?: VkInboundForward[];
+  /** Messages forwarded into the quoted one. */
+  replyToForwards?: VkInboundForward[];
 };
 
 export type VkButtonStyle = "primary" | "secondary" | "success" | "danger";

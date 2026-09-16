@@ -34,6 +34,7 @@ import {
   resolveDefaultGroupPolicy,
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/runtime-group-policy";
+import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
 import { redactVkId, vkDiag } from "./diagnostics.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
@@ -72,7 +73,14 @@ import {
   resolveStorePath,
 } from "openclaw/plugin-sdk/session-store-runtime";
 import type { ResolvedVkAccount } from "./types.js";
-import type { CoreConfig, VkInboundMessage } from "./types.js";
+import type {
+  CoreConfig,
+  VkAccountConfig,
+  VkContextVisibility,
+  VkInboundAttachment,
+  VkInboundForward,
+  VkInboundMessage,
+} from "./types.js";
 
 const CHANNEL_ID = "vk" as const;
 
@@ -88,6 +96,31 @@ function normalizeVkAllowlist(allowFrom: Array<string | number> | undefined): st
     return [];
   }
   return allowFrom.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean);
+}
+
+/** The core's precedence: account, then channel (merged into the account), then channel defaults. */
+function resolveVkContextVisibility(accountConfig: VkAccountConfig, config: unknown): VkContextVisibility {
+  const defaults = (config as { channels?: { defaults?: { contextVisibility?: VkContextVisibility } } })
+    ?.channels?.defaults;
+  return accountConfig.contextVisibility ?? defaults?.contextVisibility ?? "all";
+}
+
+function filterVkForwards(
+  forwards: readonly VkInboundForward[] | undefined,
+  isVisible: (forward: VkInboundForward) => boolean,
+): VkInboundForward[] {
+  return (forwards ?? [])
+    .filter(isVisible)
+    .map((forward) =>
+      forward.forwards ? { ...forward, forwards: filterVkForwards(forward.forwards, isVisible) } : forward,
+    );
+}
+
+function collectVkForwardAttachments(forwards: readonly VkInboundForward[]): VkInboundAttachment[] {
+  return forwards.flatMap((forward) => [
+    ...(forward.attachments ?? []),
+    ...collectVkForwardAttachments(forward.forwards ?? []),
+  ]);
 }
 
 function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number }): {
@@ -212,11 +245,12 @@ export async function handleVkInbound(params: {
     text: message.text,
     attachments: message.attachments,
   });
-  const commandInput = payloadCommand ?? visibleBody;
-  const rawBody =
-    payloadCommand ??
-    resolveVkInboundAgentText({ text: message.text, attachments: message.attachments });
-  if (!rawBody) {
+  // A message that is only a forward still gets a command input of its own: left
+  // empty, the core would fall back to the body and read the forwarded text as a
+  // command from the sender.
+  const commandInput =
+    payloadCommand ?? (visibleBody || ((message.forwards?.length ?? 0) > 0 ? "<forwarded>" : ""));
+  if (!commandInput) {
     return;
   }
 
@@ -272,6 +306,32 @@ export async function handleVkInbound(params: {
       ? normalizeVkAllowlist(groupConfig.allowFrom)
       : undefined;
   const effectiveGroupSenderAllowFrom = groupAllowOverride ?? effectiveGroupAllowFrom;
+
+  // Forwards follow the core's supplemental context visibility, as in Telegram:
+  // filtered in groups only — in a direct chat the sender already passed allowFrom,
+  // and an empty group allowlist lets every author through.
+  const contextVisibility = resolveVkContextVisibility(account.config, config);
+  const isForwardVisible = (forward: VkInboundForward): boolean => {
+    if (!isGroup) {
+      return true;
+    }
+    const senderAllowed =
+      effectiveGroupSenderAllowFrom.length === 0 ||
+      resolveVkAllowlistMatch({ allowFrom: effectiveGroupSenderAllowFrom, senderId: forward.senderId }).allowed;
+    return evaluateSupplementalContextVisibility({ mode: contextVisibility, kind: "forwarded", senderAllowed })
+      .include;
+  };
+  const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
+  const rawBody =
+    payloadCommand ??
+    resolveVkInboundAgentText({
+      text: message.text,
+      attachments: message.attachments,
+      forwards: visibleForwards,
+    });
+  if (!rawBody) {
+    return;
+  }
 
   // Group access check
   if (isGroup) {
@@ -421,7 +481,7 @@ export async function handleVkInbound(params: {
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
   const resolvedMedia = await resolveVkInboundResolvedMedia({
-    attachments: message.attachments,
+    attachments: [...(message.attachments ?? []), ...collectVkForwardAttachments(visibleForwards)],
     mediaRuntime: core.channel.media,
     logError: (line) => runtime.log?.(line),
   });
@@ -463,7 +523,15 @@ export async function handleVkInbound(params: {
     media: media.length > 0 ? media : undefined,
     ReplyToId: message.replyToMessageId,
     ReplyToIdFull: message.replyToMessageId,
-    ReplyToBody: message.replyToText,
+    ReplyToBody:
+      resolveVkInboundAgentText({
+        text: message.replyToText,
+        forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
+      }) || undefined,
+    ForwardedFrom: visibleForwards[0] ? `vk:${visibleForwards[0].senderId}` : undefined,
+    ForwardedFromId: visibleForwards[0] ? String(visibleForwards[0].senderId) : undefined,
+    ForwardedFromType: visibleForwards[0] ? (visibleForwards[0].senderId < 0 ? "group" : "user") : undefined,
+    ForwardedDate: visibleForwards[0]?.timestamp,
   });
 
   const onDispatchError = (err: unknown, info: { kind: string }) => {

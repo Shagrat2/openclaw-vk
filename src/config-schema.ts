@@ -3,7 +3,7 @@ import {
   DmPolicySchema,
   GroupPolicySchema,
 } from "openclaw/plugin-sdk/channel-config-schema";
-import { VK_DIAG_LEVELS } from "./types.js";
+import { VK_CONTEXT_VISIBILITY_MODES, VK_DIAG_LEVELS } from "./types.js";
 import { z } from "zod";
 
 function requireOpenAllowFrom(params: {
@@ -128,6 +128,7 @@ const VkAccountSchemaBase = z
     defaultTo: z.string().optional(),
     groupPolicy: GroupPolicySchema.optional(),
     groupAllowFrom: z.array(z.union([z.string(), z.number()])).optional(),
+    contextVisibility: z.enum(VK_CONTEXT_VISIBILITY_MODES).optional(),
     groups: z.record(z.string(), VkGroupConfigSchema).optional(),
     streaming: VkStreamingSchema,
     diagnostics: VkDiagnosticsSchema,

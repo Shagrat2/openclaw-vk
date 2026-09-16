@@ -24,6 +24,13 @@ import { VkAccountSchema, VkConfigSchema } from "./config-schema.js";
 // ── VkAccountSchema ──────────────────────────────────────────────────────────
 
 describe("VkAccountSchema", () => {
+  it("accepts the core context visibility modes and rejects anything else", () => {
+    for (const mode of ["all", "allowlist", "allowlist_quote"]) {
+      expect(VkAccountSchema.safeParse({ contextVisibility: mode }).success).toBe(true);
+    }
+    expect(VkAccountSchema.safeParse({ contextVisibility: "everyone" }).success).toBe(false);
+  });
+
   it("accepts minimal valid config", () => {
     const result = VkAccountSchema.safeParse({});
     expect(result.success).toBe(true);

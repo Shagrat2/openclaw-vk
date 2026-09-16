@@ -2,7 +2,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PluginRuntime } from "openclaw/plugin-sdk/core";
-import type { VkInboundAttachment, VkInboundResolvedMedia } from "./types.js";
+import type { VkInboundAttachment, VkInboundForward, VkInboundResolvedMedia } from "./types.js";
 
 const IMAGE_EXTENSIONS = new Set([
   ".apng",
@@ -469,6 +469,56 @@ export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundA
   });
 }
 
+const MAX_VK_FORWARD_DEPTH = 2;
+const MAX_VK_FORWARDS = 10;
+
+/**
+ * Messages forwarded into this one — vk-io's `forwards`, where each forward is
+ * a MessageContext of its own. At most two levels deep and ten in total: a
+ * forward can carry forwards, and a chain of them is no reason to flood the
+ * prompt.
+ */
+export function extractVkInboundForwards(raw: unknown): VkInboundForward[] {
+  return readVkForwards(raw, 1, { left: MAX_VK_FORWARDS });
+}
+
+function readVkForwards(raw: unknown, depth: number, budget: { left: number }): VkInboundForward[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const forwards: VkInboundForward[] = [];
+  for (const item of raw) {
+    const record = asRecord(item);
+    if (!record) {
+      continue;
+    }
+    if (budget.left <= 0) {
+      break;
+    }
+    budget.left -= 1;
+    const { senderId, createdAt } = record;
+    const forward: VkInboundForward = {
+      senderId: typeof senderId === "number" ? senderId : 0,
+      text: readString(record, "text") ?? "",
+    };
+    if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
+      forward.timestamp = createdAt * 1000;
+    }
+    const attachments = extractVkInboundAttachments(record.attachments);
+    if (attachments.length > 0) {
+      forward.attachments = attachments;
+    }
+    if (depth < MAX_VK_FORWARD_DEPTH) {
+      const nested = readVkForwards(record.forwards, depth + 1, budget);
+      if (nested.length > 0) {
+        forward.forwards = nested;
+      }
+    }
+    forwards.push(forward);
+  }
+  return forwards;
+}
+
 export function resolveVkInboundReplyContext(replyMessage: unknown): {
   replyToMessageId?: string;
   replyToText?: string;
@@ -679,19 +729,32 @@ export function resolveVkInboundBodyText(params: {
   return `<media:${mediaKinds[0] ?? "attachment"}>`;
 }
 
-/** The body the agent sees: the sender’s text plus any post shared with it. */
+/** A forward as the agent sees it: author and date, then its own body. */
+function describeVkForward(forward: VkInboundForward): string {
+  const at = forward.timestamp !== undefined ? ` at ${new Date(forward.timestamp).toISOString()}` : "";
+  const body = resolveVkInboundAgentText({ text: forward.text, attachments: forward.attachments });
+  const own = [`[Forwarded from vk:${forward.senderId}${at}]`, body].filter(Boolean).join("\n");
+  return [own, ...(forward.forwards ?? []).map(describeVkForward)].join("\n\n");
+}
+
+/**
+ * The body the agent sees: the sender’s text plus any post shared with it and
+ * any messages forwarded into it. The caller decides which forwards are visible.
+ */
 export function resolveVkInboundAgentText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
+  forwards?: readonly VkInboundForward[];
 }): string {
   const posts = (params.attachments ?? []).flatMap((attachment) =>
     attachment.post ? [describeVkWallPost(attachment.post)] : [],
   );
-  if (posts.length === 0) {
+  const forwarded = (params.forwards ?? []).map(describeVkForward);
+  if (posts.length === 0 && forwarded.length === 0) {
     return resolveVkInboundBodyText(params);
   }
-  const trimmedText = params.text?.trim() ?? "";
-  return [trimmedText, ...posts].filter(Boolean).join("\n\n");
+  const own = posts.length > 0 ? [params.text?.trim() ?? "", ...posts] : [resolveVkInboundBodyText(params)];
+  return [...own, ...forwarded].filter(Boolean).join("\n\n");
 }
 
 function isHttpMediaUrl(value: string): boolean {
