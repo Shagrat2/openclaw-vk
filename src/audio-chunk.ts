@@ -235,9 +235,10 @@ export function audioFileExtension(file: string): string {
 /**
  * Splits `file` at silence into ≤ maxMs segments. Returns absolute paths of the
  * produced temp files (in os.tmpdir()), or an empty array on any failure / when
- * no split is needed; a cancellation is rethrown instead, so the caller stops
- * rather than falls back. The caller is responsible for deleting the returned
- * files AND their parent directory (use `cleanupAudioSegments`).
+ * no split is needed — its own deadline included; a cancellation through
+ * `opts.signal` is rethrown instead, so the caller stops rather than falls
+ * back. The caller is responsible for deleting the returned files AND their
+ * parent directory (use `cleanupAudioSegments`).
  *
  * Segments keep the input container/codec via `-c copy` (stream copy). Stream
  * copy can only cut on keyframes, so the actual boundaries may drift slightly
@@ -264,6 +265,28 @@ export async function splitAudioAtSilence(
     ? AbortSignal.any([opts.signal, deadline])
     : deadline;
 
+  try {
+    return await splitUnderSignal(file, maxMs, opts, signal);
+  } catch (error) {
+    // The one place that tells the two aborts apart. Node reports the split's
+    // own deadline as an `AbortError` too (`cause: TimeoutError`), and running
+    // out of splitting budget is a failed split — the caller sends the original
+    // as a document — so only the caller's signal makes an abort a stop. Every
+    // stage below removes what it wrote before an abort escapes it.
+    if (isAbortError(error) && opts.signal?.aborted !== true) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+/** The split itself, under the combined signal: an abort escapes to the boundary above. */
+async function splitUnderSignal(
+  file: string,
+  maxMs: number,
+  opts: { knownDurationMs?: number | null },
+  signal: AbortSignal,
+): Promise<string[]> {
   // Input size ceiling: a gigabyte recording is not worth opening at all.
   // Failing to learn the size is no reason to refuse the split: ffmpeg will
   // stumble on a bad file anyway and the caller falls back normally.
