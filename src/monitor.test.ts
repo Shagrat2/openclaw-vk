@@ -246,7 +246,7 @@ describe("Long Poll mode selection", () => {
     await flush();
 
     expect(mockGroupsGetById).toHaveBeenCalled();
-    expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678);
+    expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678, "Test Group");
     expect(mockGroupsGetLongPollServer).toHaveBeenCalledWith({
       group_id: 12345678,
     });
@@ -268,7 +268,7 @@ describe("Long Poll mode selection", () => {
     activeMonitor = startMonitor();
     await flush();
 
-    expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678);
+    expect(mockPrimeVkGroupId).toHaveBeenCalledWith("test-token", 12345678, "Test Group");
     expect(mockPollingTransportOptions).toHaveBeenCalledWith(
       expect.not.objectContaining({ pollingGroupId: expect.anything() }),
     );
@@ -603,6 +603,18 @@ describe("message_new handler", () => {
     expect(message.replyToForwards).toMatchObject([
       { senderId: 12_324_712, timestamp: 1_789_000_001_000, text: "моё" },
     ]);
+  });
+
+  it("passes on who wrote the quoted message", async () => {
+    activeMonitor = startMonitor();
+    await flush();
+
+    await getMessageHandler()(
+      makeCtx({ replyMessage: { id: 9723, senderId: -12345678, text: "ответ" } }),
+    );
+
+    const { message } = mockHandleVkInbound.mock.calls[0][0];
+    expect(message.replyToSenderId).toBe(-12345678);
   });
 
   it("normalizes vk-io style document image attachments from preview photos", async () => {

@@ -534,6 +534,8 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
   replyToMessageId?: string;
   replyToText?: string;
   replyToForwards?: VkInboundForward[];
+  /** Author of the quoted message; negative for a community. */
+  replyToSenderId?: number;
 } {
   if (!replyMessage || typeof replyMessage !== "object" || Array.isArray(replyMessage)) {
     return {};
@@ -551,10 +553,13 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
       attachments: extractVkInboundAttachments(record.attachments),
     }) || undefined;
   const replyToForwards = extractVkInboundForwards(record.forwards);
+  const replyToSenderId =
+    typeof record.senderId === "number" && record.senderId !== 0 ? record.senderId : undefined;
   return {
     replyToMessageId,
     replyToText,
     ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
+    ...(replyToSenderId !== undefined ? { replyToSenderId } : {}),
   };
 }
 

@@ -35,7 +35,12 @@ import {
 } from "./media.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { getVkRuntime } from "./runtime.js";
-import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
+import {
+  markMessageReadVk,
+  resolveVkOwnGroup,
+  sendPayloadVk,
+  sendTypingVk,
+} from "./send.js";
 import type { ResolvedVkAccount } from "./types.js";
 import type {
   CoreConfig,
@@ -129,6 +134,21 @@ type VkDispatchPayload = {
   replyToId?: string;
   channelData?: Record<string, unknown>;
 };
+
+/**
+ * Who wrote a message, labelled the way the core's Telegram labels senders: the
+ * bot itself by name with " (you)", so the agent knows it is quoting itself;
+ * anyone else by VK id, as in `ForwardedFrom`.
+ */
+async function resolveVkSenderLabel(account: ResolvedVkAccount, senderId: number): Promise<string> {
+  if (senderId < 0) {
+    const ownGroup = await resolveVkOwnGroup(account.token);
+    if (ownGroup && senderId === -ownGroup.id) {
+      return `${account.name ?? ownGroup.name ?? "OpenClaw"} (you)`;
+    }
+  }
+  return `vk:${senderId}`;
+}
 
 async function deliverVkReply(params: {
   payload: VkDispatchPayload;
@@ -412,6 +432,11 @@ export async function handleVkInbound(params: {
     { messageId: message.messageId },
   );
 
+  const replyToSender =
+    message.replyToSenderId === undefined
+      ? undefined
+      : await resolveVkSenderLabel(account, message.replyToSenderId);
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
@@ -439,6 +464,7 @@ export async function handleVkInbound(params: {
     media: media.length > 0 ? media : undefined,
     ReplyToId: message.replyToMessageId,
     ReplyToIdFull: message.replyToMessageId,
+    ReplyToSender: replyToSender,
     ReplyToBody:
       resolveVkInboundAgentText({
         text: message.replyToText,

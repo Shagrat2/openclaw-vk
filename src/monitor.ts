@@ -196,19 +196,22 @@ export type VkMonitorOptions = {
  * Check whether the Bots Long Poll API is accessible for this token.
  * Requires the `manage` scope; tokens with only `messages` scope will fail.
  */
-async function canUseBotsLongPoll(vk: VK): Promise<{ ok: boolean; groupId?: number }> {
+async function canUseBotsLongPoll(
+  vk: VK,
+): Promise<{ ok: boolean; groupId?: number; groupName?: string }> {
   try {
     const { groups } = await vk.api.groups.getById({});
     const groupId = groups[0]?.id;
     if (!groupId) {
       return { ok: false };
     }
+    const groupName = groups[0]?.name;
     try {
       // Verify the token can actually start Bots LP
       await vk.api.groups.getLongPollServer({ group_id: groupId });
-      return { ok: true, groupId };
+      return { ok: true, groupId, groupName };
     } catch {
-      return { ok: false, groupId };
+      return { ok: false, groupId, groupName };
     }
   } catch {
     return { ok: false };
@@ -304,6 +307,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       attachments,
       replyToMessageId: replyContext.replyToMessageId,
       replyToText: replyContext.replyToText,
+      replyToSenderId: replyContext.replyToSenderId,
       ...(forwards.length > 0 ? { forwards } : {}),
       replyToForwards: replyContext.replyToForwards,
     };
@@ -342,7 +346,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       return;
     }
     if (botsLp.groupId !== undefined) {
-      primeVkGroupId(opts.token, botsLp.groupId);
+      primeVkGroupId(opts.token, botsLp.groupId, botsLp.groupName);
     }
     const useBotsLongPoll = botsLp.ok && botsLp.groupId !== undefined;
     pollingTransport = new ReadinessPollingTransport(

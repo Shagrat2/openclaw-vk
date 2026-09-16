@@ -319,6 +319,7 @@ describe("resolveVkInboundReplyContext", () => {
     const result = resolveVkInboundReplyContext({ id: 1, message: "alt text" });
     expect(result.replyToText).toBe("alt text");
   });
+
 });
 
 // ── shared wall posts ───────────────────────────────────────────────────────
@@ -432,6 +433,7 @@ describe("shared wall posts", () => {
     expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
       replyToMessageId: "9533",
       replyToText: "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+      replyToSenderId: 1,
     });
   });
 
@@ -440,7 +442,13 @@ describe("shared wall posts", () => {
     expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
       replyToMessageId: "9520",
       replyToText: "<media:image>",
+      replyToSenderId: 1,
     });
+  });
+
+  it("reads the author of a quote from vk-io, a community as a negative id", () => {
+    const replyMessage = vkReplyMessage({ id: 9723, text: "ответ", from_id: -239104331 });
+    expect(resolveVkInboundReplyContext(replyMessage).replyToSenderId).toBe(-239104331);
   });
 });
 
