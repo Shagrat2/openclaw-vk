@@ -62,11 +62,23 @@ type ExecResult = { stdout: string; stderr: string };
  * Without `signal` a gateway stop left ffmpeg running: the process lives on,
  * writes into /tmp and holds disk, with nobody left to collect its result.
  */
+function isAbortError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    ((error as { name?: unknown }).name === "AbortError" ||
+      (error as { code?: unknown }).code === "ABORT_ERR")
+  );
+}
+
 function runProcess(
   bin: string,
   args: string[],
   signal?: AbortSignal,
 ): Promise<ExecResult> {
+  // Checked up front: `execFile` only honours a signal that fires while the
+  // process runs, and a signal that is already aborted must not start one.
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     execFile(
       bin,
@@ -89,7 +101,9 @@ function runProcess(
 
 /**
  * Returns container duration in milliseconds, or null if it could not be
- * determined (missing ffprobe, unreadable file, etc.). Never throws.
+ * determined (missing ffprobe, unreadable file, etc.). Never throws — except
+ * when cancelled: an abort is not a measurement failure, and swallowing it
+ * would let the caller carry on and upload after a stop.
  */
 export async function probeAudioDurationMs(
   file: string,
@@ -110,7 +124,10 @@ export async function probeAudioDurationMs(
       return null;
     }
     return Math.round(seconds * 1000);
-  } catch {
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     return null;
   }
 }
@@ -218,8 +235,10 @@ export function audioFileExtension(file: string): string {
 /**
  * Splits `file` at silence into ≤ maxMs segments. Returns absolute paths of the
  * produced temp files (in os.tmpdir()), or an empty array on any failure / when
- * no split is needed. The caller is responsible for deleting the returned files
- * AND their parent directory (use `cleanupAudioSegments`).
+ * no split is needed — its own deadline included; a cancellation through
+ * `opts.signal` is rethrown instead, so the caller stops rather than falls
+ * back. The caller is responsible for deleting the returned files AND their
+ * parent directory (use `cleanupAudioSegments`).
  *
  * Segments keep the input container/codec via `-c copy` (stream copy). Stream
  * copy can only cut on keyframes, so the actual boundaries may drift slightly
@@ -246,6 +265,28 @@ export async function splitAudioAtSilence(
     ? AbortSignal.any([opts.signal, deadline])
     : deadline;
 
+  try {
+    return await splitUnderSignal(file, maxMs, opts, signal);
+  } catch (error) {
+    // The one place that tells the two aborts apart. Node reports the split's
+    // own deadline as an `AbortError` too (`cause: TimeoutError`), and running
+    // out of splitting budget is a failed split — the caller sends the original
+    // as a document — so only the caller's signal makes an abort a stop. Every
+    // stage below removes what it wrote before an abort escapes it.
+    if (isAbortError(error) && opts.signal?.aborted !== true) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+/** The split itself, under the combined signal: an abort escapes to the boundary above. */
+async function splitUnderSignal(
+  file: string,
+  maxMs: number,
+  opts: { knownDurationMs?: number | null },
+  signal: AbortSignal,
+): Promise<string[]> {
   // Input size ceiling: a gigabyte recording is not worth opening at all.
   // Failing to learn the size is no reason to refuse the split: ffmpeg will
   // stumble on a bad file anyway and the caller falls back normally.
@@ -261,11 +302,8 @@ export async function splitAudioAtSilence(
   if (typeof opts.knownDurationMs === "number" && opts.knownDurationMs > 0) {
     totalMs = opts.knownDurationMs;
   } else {
-    try {
-      totalMs = await probeAudioDurationMs(file, signal);
-    } catch {
-      return [];
-    }
+    // Only an abort escapes the probe, and it must escape here too.
+    totalMs = await probeAudioDurationMs(file, signal);
   }
   if (totalMs === null || totalMs <= maxMs) {
     return [];
@@ -294,6 +332,9 @@ export async function splitAudioAtSilence(
     ], signal);
     silenceStderr = result.stderr;
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     silenceStderr = String((error as { stderr?: string }).stderr ?? "");
   }
 
@@ -356,10 +397,13 @@ export async function splitAudioAtSilence(
       await runProcess(getFfmpegBin(), args, signal);
       outputs.push(out);
     }
-  } catch {
+  } catch (error) {
     // Any extraction failure drops the whole directory: every segment lives
     // inside it, so cleaning files separately was redundant.
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+    if (isAbortError(error)) {
+      throw error;
+    }
     return [];
   }
 
@@ -369,11 +413,17 @@ export async function splitAudioAtSilence(
   // is known to be unusable is worse than not splitting at all: at least the
   // caller falls back to sending a document.
   // Independent probes: awaiting them in turn added (N-1) round trips for
-  // nothing. An unreadable segment stays `null` and is not held against the split.
-  const actualDurations = await Promise.all(
-    outputs.map((out) => probeAudioDurationMs(out, signal).catch(() => null)),
-  );
-  if (actualDurations.some((actual) => actual !== null && actual > maxMs)) {
+  // nothing. A segment whose duration cannot be read is unverified, and an
+  // unverified segment is not a bounded one: the split is discarded and the
+  // caller sends a document instead of gambling on a voice message.
+  let actualDurations: Array<number | null>;
+  try {
+    actualDurations = await Promise.all(outputs.map((out) => probeAudioDurationMs(out, signal)));
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+  if (actualDurations.some((actual) => actual === null || actual > maxMs)) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     return [];
   }

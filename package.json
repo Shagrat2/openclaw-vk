@@ -54,7 +54,8 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "check:types": "node scripts/check-types.mjs",
-    "check:test-isolation": "node scripts/check-test-isolation.mjs"
+    "check:test-isolation": "node scripts/check-test-isolation.mjs",
+    "test:sdk": "vitest run src/diagnostics.sdk.test.ts"
   },
   "dependencies": {
     "markdown-to-vk": "^0.3.2",

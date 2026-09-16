@@ -55,6 +55,91 @@ const VK_MEDIA_SCOPE_FALLBACK_NOTICE =
 
 const MARKDOWN_LINK_RE = /(!?)\[([^\]\n]*)\]\(([^)\n]+)\)/g;
 
+/**
+ * A remote media source refused by policy — too large, wrong type, unreachable
+ * within the deadline. The refusal ends that media path: the URL is never handed
+ * to vk-io, which would fetch the very bytes the ceiling just refused.
+ */
+export class VkMediaRejectedError extends Error {
+  constructor(readonly reason: VkRemoteMediaRejection) {
+    super(`VK media source rejected: ${reason}`);
+    this.name = "VkMediaRejectedError";
+  }
+}
+
+/**
+ * Some messages of a split voice reply reached the recipient and a later one
+ * did not. Pre-uploading makes the uploads atomic, not the sends: this is
+ * reported as what it is, never replayed as text on top of what was delivered
+ * and never counted as a full delivery.
+ */
+export class VkPartialDeliveryError extends Error {
+  constructor(
+    readonly delivered: number,
+    readonly total: number,
+    override readonly cause: unknown,
+  ) {
+    super(`VK voice reply partially delivered: ${delivered} of ${total} messages`);
+    this.name = "VkPartialDeliveryError";
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    ((error as { name?: unknown }).name === "AbortError" ||
+      (error as { code?: unknown }).code === "ABORT_ERR")
+  );
+}
+
+/**
+ * A voice message went to `messages.send` and failed without an answer from VK:
+ * a timeout, a dropped connection. VK may still have accepted it — the retries
+ * reuse one `random_id`, so the attempt reported as failed may be the one that
+ * went through — and a fallback on top would reach the recipient twice. A
+ * failure with a VK error code is VK's definite refusal and keeps its fallback.
+ */
+export class VkSendOutcomeUnknownError extends Error {
+  constructor(override readonly cause: unknown) {
+    super("VK voice message outcome unknown: the send failed without an answer from VK");
+    this.name = "VkSendOutcomeUnknownError";
+  }
+}
+
+/**
+ * What a failed voice send means for the fallback. Only a numeric VK error code
+ * is an answer: a DOMException carries a numeric `code` of its own (20 for
+ * `AbortError`), a legacy DOM code that says nothing about what VK did. A stop
+ * is reported as a stop — the send may never have been tried.
+ */
+function voiceSendFailure(error: unknown, signal?: AbortSignal): unknown {
+  if (signal?.aborted) {
+    return error;
+  }
+  const answeredByVk = !(error instanceof DOMException) && readVkErrorCode(error) !== undefined;
+  return answeredByVk ? error : new VkSendOutcomeUnknownError(error);
+}
+
+/**
+ * A failure that must end the media path, never be swallowed into a fallback:
+ * a stop, a reply that reached the recipient in part, and a voice message VK
+ * may already have accepted. A fallback after either of the last two would put
+ * a duplicate in front of the recipient.
+ *
+ * The stop is the gateway's signal, not the error's name: the splitter's private
+ * deadline and vk-io's own request timeout both surface as `AbortError` too, and
+ * those are ordinary failures with a fallback — unless the timeout hit a voice
+ * send, which makes its outcome unknown.
+ */
+function isDeliveryStop(error: unknown, signal?: AbortSignal): boolean {
+  return (
+    error instanceof VkPartialDeliveryError ||
+    error instanceof VkSendOutcomeUnknownError ||
+    signal?.aborted === true
+  );
+}
+
 export type SendVkOptions = {
   /**
    * Gateway stop. Reaches external processes (ffmpeg while splitting voice
@@ -113,9 +198,23 @@ function getOrCreateVk(token: string): VK {
   return getOrCreateVkState(token).vk;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+/**
+ * Pause that a stop cuts short. The caller has already checked the signal, so
+ * this only has to notice a stop that arrives during the pause. The listener is
+ * removed when the pause ends: the account's stop signal lives as long as the
+ * gateway, and every retry would otherwise leave one behind on it.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -186,14 +285,14 @@ async function materializeRemoteVkPhotoSource(sourceUrl: string): Promise<Buffer
     return null;
   }
   const chunks: Buffer[] = [];
-  const total = await streamBoundedRemoteMedia(
+  const read = await streamBoundedRemoteMedia(
     sourceUrl,
     { maxBytes: getVkRemoteMediaMaxBytes(), contentTypePrefix: "image/" },
     (chunk) => {
       chunks.push(chunk);
     },
   );
-  return total === null ? null : Buffer.concat(chunks, total);
+  return read.ok ? Buffer.concat(chunks, read.bytes) : null;
 }
 
 function isRetryableVkError(error: unknown): boolean {
@@ -314,6 +413,8 @@ async function runMediaUpload<T>(params: {
     extraRetryablePredicate?: (error: unknown) => boolean;
     maxAttempts?: number;
   };
+  /** Gateway stop: no queued transfer and no retry starts after it. */
+  signal?: AbortSignal;
 }): Promise<T> {
   // Happy path keeps its old cost: nothing is measured while diagnostics are off.
   let bytes =
@@ -332,7 +433,13 @@ async function runMediaUpload<T>(params: {
         const result = await enqueueKeyedTask({
           tails: mediaUploadTails,
           key: params.token,
-          task: params.upload,
+          // Checked again when the queue reaches this transfer: the stop
+          // may have arrived while it waited behind an earlier upload on
+          // the same token.
+          task: async () => {
+            params.signal?.throwIfAborted();
+            return await params.upload();
+          },
         });
         logMediaUploadOutcome({
           kind: params.kind,
@@ -361,7 +468,10 @@ async function runMediaUpload<T>(params: {
         throw error;
       }
     },
-    params.retry ?? { extraRetryablePredicate: isVkTransientFileUndefinedError },
+    {
+      ...(params.retry ?? { extraRetryablePredicate: isVkTransientFileUndefinedError }),
+      signal: params.signal,
+    },
   );
 }
 
@@ -371,11 +481,18 @@ async function withVkRetry<T>(
     extraRetryableCodes?: readonly number[];
     extraRetryablePredicate?: (error: unknown) => boolean;
     maxAttempts?: number;
+    /**
+     * Gateway stop, checked before every attempt and cutting the pause short.
+     * Without it a retry went out after the stop: "abort" is in the retryable
+     * set, so even the stop's own error was replayed.
+     */
+    signal?: AbortSignal;
   },
 ): Promise<T> {
   const maxAttempts = opts?.maxAttempts ?? VK_TRANSIENT_RETRY_ATTEMPTS;
   let attempt = 0;
   while (true) {
+    opts?.signal?.throwIfAborted();
     try {
       return await operation();
     } catch (error) {
@@ -385,10 +502,10 @@ async function withVkRetry<T>(
         isRetryableVkError(error) ||
         (code !== undefined && (opts?.extraRetryableCodes?.includes(code) ?? false)) ||
         (opts?.extraRetryablePredicate?.(error) ?? false);
-      if (attempt >= maxAttempts || !retryable) {
+      if (attempt >= maxAttempts || !retryable || opts?.signal?.aborted) {
         throw error;
       }
-      await sleep(retryDelayMs(attempt));
+      await sleep(retryDelayMs(attempt), opts?.signal);
     }
   }
 }
@@ -633,17 +750,22 @@ async function sendVkApiMessage(params: {
       ? JSON.stringify(params.formatted.formatData)
       : undefined;
   const randomId = getRandomId();
-  const messageId = await withVkRetry(async () => {
-    return await vk.api.messages.send({
-      peer_id: params.peerId,
-      message: params.formatted.text,
-      random_id: randomId,
-      ...(params.attachment ? { attachment: params.attachment } : {}),
-      ...(keyboard ? { keyboard } : {}),
-      ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
-      ...(formatData ? { format_data: formatData } : {}),
-    });
-  });
+  // Every message of every path goes out through here, so this is where a stop
+  // is honoured per message: after an upload, between chunks, before a retry.
+  const messageId = await withVkRetry(
+    async () => {
+      return await vk.api.messages.send({
+        peer_id: params.peerId,
+        message: params.formatted.text,
+        random_id: randomId,
+        ...(params.attachment ? { attachment: params.attachment } : {}),
+        ...(keyboard ? { keyboard } : {}),
+        ...(params.opts?.replyTo ? { reply_to: Number(params.opts.replyTo) } : {}),
+        ...(formatData ? { format_data: formatData } : {}),
+      });
+    },
+    { signal: params.opts?.abortSignal },
+  );
 
   recordOutboundActivity(params.account.accountId);
   return { messageId: String(messageId), chatId: params.to };
@@ -774,6 +896,7 @@ export async function sendPhotoVk(
       uploadMeta?.retryTransientPhotoErrors === true
         ? { extraRetryablePredicate: isVkRetryablePhotoUploadError }
         : undefined,
+    signal: opts.abortSignal,
     upload: () =>
       vk.upload.messagePhoto({
         peer_id: peerId,
@@ -813,6 +936,7 @@ export async function sendDocumentVk(
     source: docSource,
     mime: uploadMeta?.contentType,
     token: account.token,
+    signal: opts.abortSignal,
     upload: () =>
       vk.upload.messageDocument({
         peer_id: peerId,
@@ -834,18 +958,17 @@ export async function sendDocumentVk(
   });
 }
 
-/**
- * Returns a local filesystem path usable by ffmpeg for `audioSource`, plus a
- * cleanup callback. Buffers are written to a temp file. Non-local strings
- * (http/data/file:// etc.) yield `null` so the caller skips splitting.
- */
-/**
- * Downloads remote audio with a size ceiling.
- *
- * The ceiling is mandatory: the URL comes from a model reply, so the source is
- * untrusted, and without a limit an unbounded body could be pulled into memory.
- * We read as a stream and abort as soon as the limit is exceeded.
- */
+/** Why a remote download was refused; logged as a token, never with the URL. */
+type VkRemoteMediaRejection = "unavailable" | "content-type" | "too-large" | "empty" | "timeout";
+
+type VkRemoteMediaRead = { ok: true; bytes: number } | { ok: false; reason: VkRemoteMediaRejection };
+
+function readRejection(read: VkRemoteMediaRead): VkRemoteMediaRejection | null {
+  // Narrowed by the field, not by `ok`: the test build runs without strictNullChecks,
+  // where a boolean discriminant does not narrow.
+  return "reason" in read ? read.reason : null;
+}
+
 /**
  * Streams a remote media body with a byte ceiling, handing chunks to `sink`.
  *
@@ -855,68 +978,88 @@ export async function sendDocumentVk(
  * lets the audio path write straight to disk instead of holding the whole file
  * in memory and then writing it, which peaked at twice the file size.
  *
- * Returns the number of bytes read, or null when the fetch failed, the ceiling
- * was exceeded, or the content type did not match.
+ * A refusal says why, because the caller must tell a policy refusal apart from
+ * "not a remote source": the former ends the media path, and the URL is never
+ * handed to vk-io afterwards. A cancellation through `opts.signal` is rethrown.
  */
 async function streamBoundedRemoteMedia(
   url: string,
-  opts: { maxBytes: number; contentTypePrefix?: string },
+  opts: { maxBytes: number; contentTypePrefix?: string; signal?: AbortSignal },
   sink: (chunk: Buffer) => Promise<void> | void,
-): Promise<number | null> {
+): Promise<VkRemoteMediaRead> {
   if (typeof fetch !== "function") {
-    return null;
+    return { ok: false, reason: "unavailable" };
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
+  opts.signal?.throwIfAborted();
+  const timeout = AbortSignal.timeout(VK_REMOTE_MEDIA_FETCH_TIMEOUT_MS);
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
   try {
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetch(url, { signal });
     if (!response.ok || !response.body) {
-      return null;
+      return { ok: false, reason: "unavailable" };
     }
     if (opts.contentTypePrefix) {
       const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
       if (contentType && !contentType.startsWith(opts.contentTypePrefix)) {
-        return null;
+        return { ok: false, reason: "content-type" };
       }
     }
     // The declared size is a cheap early exit; the counter below is what
     // actually enforces the ceiling, since the header can lie or be absent.
     const declared = Number(response.headers.get("content-length") ?? "");
     if (Number.isFinite(declared) && declared > opts.maxBytes) {
-      return null;
+      return { ok: false, reason: "too-large" };
     }
     let total = 0;
     for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
       total += chunk.byteLength;
       if (total > opts.maxBytes) {
-        return null;
+        return { ok: false, reason: "too-large" };
       }
       await sink(Buffer.from(chunk));
     }
-    return total > 0 ? total : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
+    return total > 0 ? { ok: true, bytes: total } : { ok: false, reason: "empty" };
+  } catch (error) {
+    if (opts.signal?.aborted) {
+      throw error;
+    }
+    return { ok: false, reason: timeout.aborted ? "timeout" : "unavailable" };
   }
 }
+
+/**
+ * A local file ffmpeg can open for `audioSource`, with its cleanup.
+ *
+ * Three outcomes, and the caller must tell them apart:
+ * - `local`: a path to measure and, if needed, split;
+ * - `unsupported`: not something we download or copy (a data URI, `file://`, or
+ *   a buffer we could not spill to disk) — the source itself goes to vk-io;
+ * - `rejected`: a remote download refused by policy. This one ends the media
+ *   path: handing the URL to vk-io would fetch the very bytes just refused.
+ */
+type VkLocalAudioFile =
+  | { kind: "local"; path: string; cleanup: () => Promise<void> }
+  | { kind: "unsupported" }
+  | { kind: "rejected"; reason: VkRemoteMediaRejection };
 
 async function materializeLocalAudioFile(
   audioSource: string | Buffer,
   title: string,
-): Promise<{ path: string; cleanup: () => Promise<void> } | null> {
+  signal?: AbortSignal,
+): Promise<VkLocalAudioFile> {
   if (Buffer.isBuffer(audioSource)) {
     let dir: string;
     try {
       dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
     } catch {
-      return null;
+      return { kind: "unsupported" };
     }
     try {
       const safeName = title.replace(/[\\/]/g, "_") || "voice.ogg";
       const path = join(dir, safeName);
       await writeFile(path, audioSource);
       return {
+        kind: "local",
         path,
         cleanup: async () => {
           await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -927,7 +1070,7 @@ async function materializeLocalAudioFile(
       // ourselves. This path used to leave an empty directory in /tmp per
       // failure.
       await rm(dir, { recursive: true, force: true }).catch(() => {});
-      return null;
+      return { kind: "unsupported" };
     }
   }
 
@@ -942,7 +1085,7 @@ async function materializeLocalAudioFile(
     try {
       dir = await mkdtemp(join(tmpdir(), "vk-voice-src-"));
     } catch {
-      return null;
+      return { kind: "rejected", reason: "unavailable" };
     }
     const path = join(dir, title.replace(/[\\/]/g, "_") || "voice.ogg");
     const cleanup = async () => {
@@ -951,35 +1094,35 @@ async function materializeLocalAudioFile(
     const handle = await open(path, "w").catch(() => null);
     if (!handle) {
       await cleanup();
-      return null;
+      return { kind: "rejected", reason: "unavailable" };
     }
-    try {
-      const total = await streamBoundedRemoteMedia(
-        audioSource,
-        { maxBytes: getVkRemoteMediaMaxBytes() },
-        async (chunk) => {
-          await handle.write(chunk);
-        },
-      );
-      if (total === null) {
-        await cleanup();
-        return null;
-      }
-      return { path, cleanup };
-    } catch {
-      await cleanup();
-      return null;
-    } finally {
+    const read: VkRemoteMediaRead = await streamBoundedRemoteMedia(
+      audioSource,
+      { maxBytes: getVkRemoteMediaMaxBytes(), signal },
+      async (chunk) => {
+        await handle.write(chunk);
+      },
+    ).catch(async (error: unknown) => {
+      // Only a cancellation escapes the reader; the file it was writing goes too.
       await handle.close().catch(() => {});
+      await cleanup();
+      throw error;
+    });
+    await handle.close().catch(() => {});
+    const rejection = readRejection(read);
+    if (rejection) {
+      await cleanup();
+      return { kind: "rejected", reason: rejection };
     }
+    return { kind: "local", path, cleanup };
   }
 
   // data: and file:// are left alone: the first is already in memory and arrives
   // as a buffer, the second the core expands into a plain path before us.
   if (/^data:/i.test(audioSource) || audioSource.startsWith("file://")) {
-    return null;
+    return { kind: "unsupported" };
   }
-  return { path: audioSource, cleanup: async () => {} };
+  return { kind: "local", path: audioSource, cleanup: async () => {} };
 }
 
 async function uploadVkAudioMessage(params: {
@@ -989,6 +1132,7 @@ async function uploadVkAudioMessage(params: {
   source: string | Buffer;
   filename: string;
   contentType?: string;
+  signal?: AbortSignal;
 }): Promise<string> {
   // Guard against an invalid peer_id (would surface from VK as a misleading
   // error 15 "access denied … with current scopes", even though the token's
@@ -1033,7 +1177,7 @@ async function uploadVkAudioMessage(params: {
         }
         return server.upload_url;
       },
-      { extraRetryableCodes: [15] },
+      { extraRetryableCodes: [15], signal: params.signal },
     );
 
   const attachment = await runMediaUpload({
@@ -1041,11 +1185,15 @@ async function uploadVkAudioMessage(params: {
     source: params.source,
     mime: params.contentType,
     token: params.token,
-    upload: async () =>
-      await params.vk.upload.audioMessage({
+    upload: async () => {
+      const uploadUrl = await requestUploadUrl();
+      // The address request is a round trip of its own; a stop during it must
+      // not be followed by the transfer.
+      params.signal?.throwIfAborted();
+      return await params.vk.upload.audioMessage({
         peer_id: params.peerId,
         source: {
-          uploadUrl: await requestUploadUrl(),
+          uploadUrl,
           values: [
             buildVkUploadSource({
               source: params.source,
@@ -1055,10 +1203,12 @@ async function uploadVkAudioMessage(params: {
           ],
         },
         title: params.filename,
-      }),
+      });
+    },
     // A truncated multipart transfer (code=100 "file is undefined") is retried:
     // the file never reached VK, so there can be no duplicate.
     retry: { extraRetryablePredicate: isVkTransientFileUndefinedError },
+    signal: params.signal,
   });
   return String(attachment);
 }
@@ -1196,6 +1346,100 @@ function startTtsContinuation(params: {
   });
 }
 
+/** Duration, or null when it cannot be measured; a cancellation is rethrown. */
+async function measureAudioMs(path: string, signal?: AbortSignal): Promise<number | null> {
+  try {
+    return await probeAudioDurationMs(path, signal);
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    return null;
+  }
+}
+
+/**
+ * A source measured over the voice limit never goes out as a single voice
+ * message again: VK would reject it exactly as it rejected the original. Either
+ * a fully validated split is delivered, or the original goes as a document.
+ *
+ * The two outcomes that are neither: a cancellation, which ends the path with
+ * nothing sent, and a failure after the first voice message reached the
+ * recipient, which is reported as a partial delivery rather than papered over
+ * with a document on top.
+ */
+async function sendOverLimitAudio(params: {
+  to: string;
+  peerId: number;
+  account: ResolvedVkAccount;
+  vk: VK;
+  path: string;
+  measuredMs: number;
+  maxMs: number;
+  title: string;
+  contentType?: string;
+  text?: string | VkPreparedFormattedMessage;
+  firstChunk?: VkPreparedFormattedMessage;
+  tailChunks: VkPreparedFormattedMessage[];
+  opts: SendVkOptions;
+}): Promise<SendVkResult> {
+  const signal = params.opts.abortSignal;
+  let segments: string[] = [];
+  try {
+    segments = await splitAudioAtSilence(params.path, params.maxMs, {
+      knownDurationMs: params.measuredMs,
+      signal,
+    });
+  } catch {
+    // A failed split; whether it was a stop is checked below.
+  }
+  if (signal?.aborted) {
+    // The stop arrived while ffmpeg was cutting: nothing is uploaded, and what
+    // it produced is not left behind in the temp dir.
+    await cleanupAudioSegments(segments);
+    signal.throwIfAborted();
+  }
+
+  if (segments.length >= 2) {
+    try {
+      return await sendVkAudioSegments({
+        to: params.to,
+        peerId: params.peerId,
+        account: params.account,
+        vk: params.vk,
+        segments,
+        contentType: params.contentType,
+        firstChunk: params.firstChunk,
+        tailChunks: params.tailChunks,
+        opts: params.opts,
+      });
+    } catch (error) {
+      if (isDeliveryStop(error, signal)) {
+        throw error;
+      }
+      // Every upload happens before the first send, and a send VK may have
+      // accepted does not get here, so a failure here means nothing has
+      // reached the recipient — the document below is a replacement, not a
+      // duplicate.
+      vkDiagFailure("voice segments failed before delivery", error, {
+        segments: segments.length,
+      });
+    } finally {
+      await cleanupAudioSegments(segments);
+    }
+  }
+
+  signal?.throwIfAborted();
+  vkDiag("voice over limit, sending document", {
+    measuredMs: params.measuredMs,
+    maxMs: params.maxMs,
+    segments: segments.length,
+  });
+  return await sendDocumentVk(params.to, params.path, params.title, params.text, params.opts, {
+    contentType: params.contentType,
+  });
+}
+
 export async function sendAudioMessageVk(
   to: string,
   audioSource: string | Buffer,
@@ -1212,8 +1456,15 @@ export async function sendAudioMessageVk(
   const vk = getOrCreateVk(account.token);
   const [firstChunk, ...tailChunks] = toPreparedVkMessages(text);
 
-  // ── Attempt silence-based split for over-limit local audio ────────────────
-  const local = await materializeLocalAudioFile(audioSource, title);
+  // ── Measure, and take an over-limit source off the voice path ─────────────
+  const signal = opts.abortSignal;
+  const local = await materializeLocalAudioFile(audioSource, title, signal);
+  if (local.kind === "rejected") {
+    // The refusal is the end of this media path. The URL is not handed to
+    // vk-io: that would fetch the very bytes the ceiling just refused.
+    vkDiagFailure("audio source rejected", null, { source: audioSource, reason: local.reason });
+    throw new VkMediaRejectedError(local.reason);
+  }
   // Source for a single send. For a URL this is the file we downloaded, not the
   // URL itself: otherwise vk-io would pull the same bytes a second time — we
   // already fetched them to measure the duration.
@@ -1221,58 +1472,57 @@ export async function sendAudioMessageVk(
   let uploadCleanup: (() => Promise<void>) | null = null;
   // Head duration doubles as the key that claims this reply's continuation parts.
   let headDurationMs: number | null = null;
-  if (local) {
-    const maxMs = getVkAudioMessageMaxMs();
-    let segments: string[] = [];
+  if (local.kind === "local") {
+    let handedOver = false;
     try {
-      headDurationMs = await probeAudioDurationMs(local.path);
-      if (headDurationMs !== null && headDurationMs > maxMs) {
-        segments = await splitAudioAtSilence(local.path, maxMs, {
-          knownDurationMs: headDurationMs,
-          signal: opts.abortSignal,
-        });
-      }
-    } catch {
-      segments = [];
-    }
-
-    if (segments.length >= 2) {
-      try {
-        const result = await sendVkAudioSegments({
+      const maxMs = getVkAudioMessageMaxMs();
+      const measuredMs = await measureAudioMs(local.path, signal);
+      headDurationMs = measuredMs;
+      signal?.throwIfAborted();
+      if (measuredMs !== null && measuredMs > maxMs) {
+        const result = await sendOverLimitAudio({
           to: normalizedTo,
           peerId,
           account,
           vk,
-          segments,
+          path: local.path,
+          measuredMs,
+          maxMs,
+          title,
           contentType: uploadMeta?.contentType,
+          text,
           firstChunk,
           tailChunks,
           opts,
         });
+        // Continuation parts follow the head however it went out — split into
+        // voice messages or sent as a document — but never after a stop or a
+        // failure, which leave `sendOverLimitAudio` by throwing.
         await startTtsContinuationForHead({
           vk,
           peerId,
           to: normalizedTo,
           account,
-          headDurationMs,
+          headDurationMs: measuredMs,
           opts,
         });
         return result;
-      } finally {
-        await cleanupAudioSegments(segments);
+      }
+      if (typeof audioSource === "string" && isHttpUrl(audioSource)) {
+        // Keep the download until the send finishes, then clean it up.
+        uploadSource = local.path;
+        uploadCleanup = local.cleanup;
+        handedOver = true;
+      }
+    } finally {
+      if (!handedOver) {
         await local.cleanup();
       }
     }
-    if (typeof audioSource === "string" && isHttpUrl(audioSource)) {
-      // Keep the download until the send finishes, then clean it up.
-      uploadSource = local.path;
-      uploadCleanup = local.cleanup;
-    } else {
-      await local.cleanup();
-    }
   }
 
-  // ── Single-message path (short audio / split unavailable) ─────────────────
+  // ── Single-message path (short audio, or a source we neither copy nor measure) ─
+  // A stop during the upload is honoured by the send below.
   const attachment = await uploadVkAudioMessage({
     vk,
     token: account.token,
@@ -1280,9 +1530,11 @@ export async function sendAudioMessageVk(
     source: uploadSource,
     filename: title,
     contentType: uploadMeta?.contentType,
+    signal,
   }).finally(async () => {
     await uploadCleanup?.();
   });
+  // No fallback after a send with no answer from VK: see VkSendOutcomeUnknownError.
   const firstResult = await sendVkApiMessage({
     to: normalizedTo,
     peerId,
@@ -1294,6 +1546,8 @@ export async function sendAudioMessageVk(
       buttons: tailChunks.length === 0 ? opts.buttons : undefined,
       clearKeyboard: tailChunks.length === 0 ? opts.clearKeyboard : undefined,
     },
+  }).catch((error: unknown) => {
+    throw voiceSendFailure(error, signal);
   });
 
   await startTtsContinuationForHead({
@@ -1349,9 +1603,11 @@ async function sendVkAudioSegments(params: {
   // phrase delivered, the second never coming. Uploading shows the recipient
   // nothing, so its failure can be handled as a whole — and the caller then
   // falls back to sending a single file.
+  const signal = opts.abortSignal;
   const attachments: string[] = [];
   for (let index = 0; index < segments.length; index += 1) {
     const segment = segments[index] as string;
+    signal?.throwIfAborted();
     attachments.push(
       await uploadVkAudioMessage({
         vk: params.vk,
@@ -1363,9 +1619,23 @@ async function sendVkAudioSegments(params: {
         // would lie to VK about the format.
         filename: `voice-${String(index + 1).padStart(2, "0")}${audioFileExtension(segment)}`,
         contentType: params.contentType,
+        signal,
       }),
     );
   }
+
+  // From the first send on, a failure is a partial delivery: the uploads were
+  // atomic as a group, the sends are not, and a reply that reached the
+  // recipient in part must be reported as such — not replayed, not counted
+  // as delivered.
+  const total = segments.length + tailChunks.length;
+  const partial = (error: unknown): Error =>
+    results.length > 0 ? new VkPartialDeliveryError(results.length, total, error) : (error as Error);
+  const stopIfAborted = (): void => {
+    if (signal?.aborted) {
+      throw partial(signal.reason ?? new DOMException("aborted", "AbortError"));
+    }
+  };
 
   for (let index = 0; index < segments.length; index += 1) {
     const isFirst = index === 0;
@@ -1373,32 +1643,49 @@ async function sendVkAudioSegments(params: {
     const applyKeyboard = isLastSegment && !hasTail;
     const attachment = attachments[index] as string;
 
-    const result = await sendVkApiMessage({
-      to: params.to,
-      peerId: params.peerId,
-      account: params.account,
-      formatted: isFirst ? params.firstChunk ?? { text: "" } : { text: "" },
-      attachment,
-      opts: {
-        ...opts,
-        replyTo: isFirst ? opts.replyTo : undefined,
-        buttons: applyKeyboard ? opts.buttons : undefined,
-        clearKeyboard: applyKeyboard ? opts.clearKeyboard : undefined,
-      },
-    });
-    results.push(result);
+    stopIfAborted();
+    try {
+      results.push(
+        await sendVkApiMessage({
+          to: params.to,
+          peerId: params.peerId,
+          account: params.account,
+          formatted: isFirst ? params.firstChunk ?? { text: "" } : { text: "" },
+          attachment,
+          opts: {
+            ...opts,
+            replyTo: isFirst ? opts.replyTo : undefined,
+            buttons: applyKeyboard ? opts.buttons : undefined,
+            clearKeyboard: applyKeyboard ? opts.clearKeyboard : undefined,
+          },
+        }),
+      );
+    } catch (error) {
+      // Partial delivery wins when something already went out; otherwise a
+      // send with no answer from VK still keeps the document fallback away.
+      throw partial(voiceSendFailure(error, signal));
+    }
   }
 
   if (hasTail) {
-    const tailResults = await sendMessageChunksVk({
-      to: params.to,
-      chunks: tailChunks,
-      opts: {
-        ...opts,
-        replyTo: undefined,
-      },
-    });
-    results.push(...tailResults);
+    stopIfAborted();
+    try {
+      // Counted per chunk, not on return: a stop between tail chunks must
+      // report the chunks that already went out as delivered.
+      await sendMessageChunksVk({
+        to: params.to,
+        chunks: tailChunks,
+        opts: {
+          ...opts,
+          replyTo: undefined,
+        },
+        onSent: (result) => {
+          results.push(result);
+        },
+      });
+    } catch (error) {
+      throw partial(error);
+    }
   }
 
   return getLastSendResult(results) ?? { messageId: "", chatId: params.to };
@@ -1636,6 +1923,8 @@ async function sendMessageChunksVk(params: {
   to: string;
   chunks: VkPreparedFormattedMessage[];
   opts: SendVkOptions;
+  /** Called after each delivered chunk, for callers that report partial delivery. */
+  onSent?: (result: SendVkResult) => void;
 }): Promise<SendVkResult[]> {
   const { account, peerId, to: normalizedTo } = await resolveSendTarget({
     cfg: params.opts.cfg,
@@ -1663,6 +1952,7 @@ async function sendMessageChunksVk(params: {
       },
     });
     results.push(result);
+    params.onSent?.(result);
   }
   return results;
 }
@@ -1746,6 +2036,12 @@ async function sendResolvedMediaVk(params: {
         contentType: media.mimeType,
       });
     } catch (audioError) {
+      if (isDeliveryStop(audioError, params.opts.abortSignal)) {
+        // A stop ends the path with nothing more sent, and neither a reply
+        // that reached the recipient in part nor a voice message VK may
+        // already have accepted is re-sent as text on top of it.
+        throw audioError;
+      }
       // Voice is best-effort: log the *real* VK error (code/message) for
       // diagnosis, then fall back to text rather than dropping the reply or
       // mislabelling it as a scopes problem.
