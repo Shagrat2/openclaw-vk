@@ -134,6 +134,8 @@ vi.mock("./send.js", () => ({
 
 const mockMonitorVkProvider = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock("./monitor.js", () => ({ monitorVkProvider: mockMonitorVkProvider }));
+const mockVkDiag = vi.hoisted(() => vi.fn());
+vi.mock("./diagnostics.js", () => ({ vkDiag: mockVkDiag }));
 
 const mockProbeVkBot = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ ok: true, groupName: "TestBot", groupId: 1 }),
@@ -848,6 +850,26 @@ describe("outbound", () => {
       replyTo: "55",
     });
     expect(result).toEqual({ channel: "vk", messageId: "1", chatId: "0" });
+  });
+
+  it("leaves a diagnostic line for a core-routed send", async () => {
+    // A queued follow-up's reply comes through here, not the inbound dispatcher's
+    // `deliver`; on 17.09 its silence was read as a lost reply.
+    mockVkDiag.mockClear();
+    await vkPlugin.outbound!.sendText({
+      cfg: {},
+      to: "123",
+      text: "hello",
+      accountId: "default",
+    } as never);
+
+    expect(mockVkDiag).toHaveBeenCalledWith("outbound sent", {
+      stage: "sendText",
+      to: "123",
+      textLen: 5,
+      media: false,
+      messageId: "1",
+    });
   });
 
   it("sendMedia delegates formatted media delivery directly to VK", async () => {

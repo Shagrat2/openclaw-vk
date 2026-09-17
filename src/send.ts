@@ -324,6 +324,80 @@ function isRetryableVkError(error: unknown): boolean {
  */
 type MediaUploadKind = "photo" | "document" | "audio";
 
+type VkUploader = VK["upload"];
+
+/**
+ * What the upload server answered during one attempt.
+ *
+ * vk-io posts the file, parses the JSON and spreads it straight into the save
+ * call, so all that reaches us is the save call's "file is undefined" or "photo
+ * is undefined": the answer that lacked the field is gone. Without it a refusal
+ * by VK, a file VK did not like and a cut transfer read the same, and any retry
+ * policy for them is a guess. On 17.09 three attempts in a row failed on one
+ * 116 KB voice message, which does not look like the cut transfer the retry was
+ * written for.
+ */
+type VkUploadServerTrace = { answered: boolean; response?: unknown };
+
+/**
+ * The uploader for one attempt, with the upload server's answer recorded.
+ *
+ * Only the POST to the upload server is wrapped, and only on an object made for
+ * this call: vk-io is not patched, and every other step runs through the real
+ * instance, reached through the prototype.
+ */
+function traceVkUploadServer(upload: VkUploader, trace: VkUploadServerTrace): VkUploader {
+  return Object.create(upload, {
+    upload: {
+      value: async (...args: Parameters<VkUploader["upload"]>) => {
+        const response = await upload.upload(...args);
+        trace.answered = true;
+        trace.response = response;
+        return response;
+      },
+    },
+  }) as VkUploader;
+}
+
+/** Longer values in the upload server's answer are logged by length: a file token is one of them. */
+const UPLOAD_ANSWER_VALUE_SHOWN = 64;
+
+/**
+ * The upload server's answer as log fields. `payloadField` is what the save call
+ * needs from it: `file` for documents and voice messages, `photo` for photos.
+ * Keys, the presence of the payload and a token-shaped error pass at every
+ * level; the answer's text is kept at `full` only, as any other text.
+ */
+function describeVkUploadServerAnswer(
+  trace: VkUploadServerTrace,
+  payloadField: "file" | "photo",
+): Record<string, unknown> {
+  if (!trace.answered) {
+    return { uploadAnswered: false };
+  }
+  const response = trace.response;
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    return {
+      uploadAnswered: true,
+      uploadAnswerType: Array.isArray(response) ? "array" : typeof response,
+      uploadAnswer: typeof response === "string" ? response : undefined,
+    };
+  }
+  const record = response as Record<string, unknown>;
+  const payload = record[payloadField];
+  return {
+    uploadAnswered: true,
+    uploadKeys: Object.keys(record).slice(0, 16),
+    uploadHasPayload: payload !== undefined && payload !== null && payload !== "",
+    uploadError: typeof record.error === "string" ? record.error : undefined,
+    uploadAnswer: JSON.stringify(record, (_key, value: unknown) =>
+      typeof value === "string" && value.length > UPLOAD_ANSWER_VALUE_SHOWN
+        ? `<${value.length} chars>`
+        : value,
+    ),
+  };
+}
+
 function logMediaUploadOutcome(params: {
   kind: MediaUploadKind;
   source: string | Buffer;
@@ -333,6 +407,8 @@ function logMediaUploadOutcome(params: {
   /** How long this attempt ran before it finished or failed. */
   elapsedMs?: number;
   error?: unknown;
+  /** Failure-only fields from the caller, such as the upload server's answer. */
+  failureFields?: Record<string, unknown>;
 }): void {
   const fields = {
     kind: params.kind,
@@ -344,6 +420,7 @@ function logMediaUploadOutcome(params: {
     // Only on failure, and only the errno-shaped token: it separates a broken
     // connection from a refusal by VK, which the numeric code cannot do.
     errno: params.error ? readVkErrorSystemCode(params.error) : undefined,
+    ...(params.error ? params.failureFields : undefined),
   };
   if (params.error) {
     vkDiagFailure("vk upload failed", params.error, fields);
@@ -408,6 +485,8 @@ async function runMediaUpload<T>(params: {
   mime?: string;
   token: string;
   upload: () => Promise<T>;
+  /** Extra fields for a failed attempt's log line, read when the attempt fails. */
+  describeFailure?: () => Record<string, unknown>;
   /** Per-kind retry policy, when this attachment kind differs from the default. */
   retry?: {
     extraRetryableCodes?: readonly number[];
@@ -465,6 +544,7 @@ async function runMediaUpload<T>(params: {
           attempt,
           elapsedMs: Date.now() - startedAt,
           error,
+          failureFields: params.describeFailure?.(),
         });
         throw error;
       }
@@ -903,6 +983,7 @@ export async function sendPhotoVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
+  let uploadTrace: VkUploadServerTrace = { answered: false };
   const attachment = await runMediaUpload({
     kind: "photo",
     source: photoSource,
@@ -913,8 +994,9 @@ export async function sendPhotoVk(
         ? { extraRetryablePredicate: isVkRetryablePhotoUploadError }
         : undefined,
     signal: opts.abortSignal,
+    describeFailure: () => describeVkUploadServerAnswer(uploadTrace, "photo"),
     upload: () =>
-      vk.upload.messagePhoto({
+      traceVkUploadServer(vk.upload, (uploadTrace = { answered: false })).messagePhoto({
         peer_id: peerId,
         source: buildVkUploadSource({
           source: photoSource,
@@ -947,14 +1029,16 @@ export async function sendDocumentVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
+  let uploadTrace: VkUploadServerTrace = { answered: false };
   const attachment = await runMediaUpload({
     kind: "document",
     source: docSource,
     mime: uploadMeta?.contentType,
     token: account.token,
     signal: opts.abortSignal,
+    describeFailure: () => describeVkUploadServerAnswer(uploadTrace, "file"),
     upload: () =>
-      vk.upload.messageDocument({
+      traceVkUploadServer(vk.upload, (uploadTrace = { answered: false })).messageDocument({
         peer_id: peerId,
         source: buildVkUploadSource({
           source: docSource,
@@ -1196,17 +1280,20 @@ async function uploadVkAudioMessage(params: {
       { extraRetryableCodes: [15], signal: params.signal },
     );
 
+  let uploadTrace: VkUploadServerTrace = { answered: false };
   const attachment = await runMediaUpload({
     kind: "audio",
     source: params.source,
     mime: params.contentType,
     token: params.token,
+    describeFailure: () => describeVkUploadServerAnswer(uploadTrace, "file"),
     upload: async () => {
+      uploadTrace = { answered: false };
       const uploadUrl = await requestUploadUrl();
       // The address request is a round trip of its own; a stop during it must
       // not be followed by the transfer.
       params.signal?.throwIfAborted();
-      return await params.vk.upload.audioMessage({
+      return await traceVkUploadServer(params.vk.upload, uploadTrace).audioMessage({
         peer_id: params.peerId,
         source: {
           uploadUrl,

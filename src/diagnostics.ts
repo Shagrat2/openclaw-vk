@@ -86,6 +86,11 @@ const TOKEN_FIELDS = new Set([
   "status",
   "errorName",
   "errno",
+  // The upload server's answer to a failed upload: its keys and a code-shaped
+  // error such as `ERR_UPLOAD_FILE_EMPTY`. Free text in `error` stays `<text>`.
+  "uploadKeys",
+  "uploadError",
+  "uploadAnswerType",
 ]);
 const TOKEN_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MIME_RE = /^[a-z]+\/[a-z0-9.+-]{1,63}$/i;
