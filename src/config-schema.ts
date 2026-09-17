@@ -116,6 +116,8 @@ export const VkAccountSchema = VkAccountSchemaBase.superRefine((value, ctx) => {
 export const VkConfigSchema = VkAccountSchemaBase.extend({
   // Channel-wide only: every account shares one level (see resolveVkDiagLevel).
   diagnostics: VkDiagnosticsSchema,
+  // Channel-wide only: settings.ts reads channels.vk.audio for every account.
+  audio: VkAudioSchema,
   accounts: z.record(z.string(), VkAccountSchema).optional(),
 }).superRefine((value, ctx) => {
   requireOpenAllowFrom({
