@@ -148,6 +148,79 @@ describe("VK diagnostics levels", () => {
     });
   });
 
+  it("hides numeric identifiers under any id-shaped name, not only the listed ones", () => {
+    // VK hands ids out in snake_case (`peer_id`, `from_id`), and a caller may
+    // write `userId` or `groupId`. A number is text-free, but a number can still
+    // name a person: failures log at `off`, so this is the default level.
+    delete process.env.VK_DIAG_LEVEL;
+    vkDiagFailure("send failed", Object.assign(new Error("x"), { code: 901 }), {
+      peer_id: 2000000001,
+      userId: 12324712,
+      from_id: 777,
+      ownerId: -142153191,
+    });
+    const out = rendered(mockLogger.error);
+    for (const raw of ["2000000001", "12324712", "777", "142153191"]) {
+      expect(out).not.toContain(raw);
+    }
+    // Hashed, not dropped: two sends to different people stay distinguishable.
+    expect(lastFields(mockLogger.error)).toMatchObject({
+      peer_id: "sha256:10",
+      userId: "sha256:8",
+      from_id: "sha256:3",
+      ownerId: "sha256:10",
+      vkCode: 901,
+    });
+  });
+
+  it("hashes an id-shaped name that arrives as a string too", () => {
+    process.env.VK_DIAG_LEVEL = "redacted";
+    vkDiag("probe", { peer_id: "2000000001", groupId: "239104331" });
+    expect(lastFields(mockLogger.info)).toEqual({ peer_id: "sha256:10", groupId: "sha256:9" });
+  });
+
+  it("keeps the numeric fields the send path logs", () => {
+    // The field set of the vkDiag calls in the voice and media delivery path:
+    // none of them may turn into a placeholder below full.
+    process.env.VK_DIAG_LEVEL = "redacted";
+    const fields = { textLen: 3, media: 1, index: 1, total: 2, bytes: 4096, attempt: 2, segments: 3, measuredMs: 61000, maxMs: 240000 };
+    vkDiag("send payload", fields);
+    expect(lastFields(mockLogger.info)).toEqual(fields);
+  });
+
+  it("keeps counters and replaces any other number below full", () => {
+    process.env.VK_DIAG_LEVEL = "redacted";
+    vkDiag("send voice", {
+      textLen: 3,
+      index: 1,
+      total: 2,
+      bytes: 4096,
+      attempt: 2,
+      measuredMs: 61000,
+      maxMs: 240000,
+      balance: 12324712,
+    });
+    expect(lastFields(mockLogger.info)).toEqual({
+      textLen: 3,
+      index: 1,
+      total: 2,
+      bytes: 4096,
+      attempt: 2,
+      measuredMs: 61000,
+      maxMs: 240000,
+      balance: "<number>",
+    });
+  });
+
+  it("never writes the bytes of a buffer that arrives serialized", () => {
+    // JSON.parse(JSON.stringify(buffer)) is `{ type: "Buffer", data: [...] }`:
+    // no longer a Buffer, but still the attachment.
+    process.env.VK_DIAG_LEVEL = "full";
+    vkDiag("inbound", { data: { type: "Buffer", data: [82, 73, 70, 70] } });
+    expect(rendered(mockLogger.info)).not.toContain("82");
+    expect(lastFields(mockLogger.info)).toEqual({ data: "buffer" });
+  });
+
   it("turns any string that is not an identifier, a token or a source into a placeholder", () => {
     // Paths in every shape the previous scrubber missed: Unicode, spaces,
     // relative, Windows, UNC, a bare file name, and a URL that does not start
@@ -464,8 +537,9 @@ describe("VK diagnostics levels", () => {
       vkDiagFailure("read /Users/ivan/private.jpg failed", new Error("boom"));
       expect(mockLogger.info.mock.calls[0]?.[0]).toBe("send");
       expect(lastFields(mockLogger.info)).toEqual({
-        byPath: { "<key>": "<text>", ok: 1 },
-        byPeer: { "<key>": 1 },
+        // A number under a name that does not say "counter" is replaced like text.
+        byPath: { "<key>": "<text>", ok: "<number>" },
+        byPeer: { "<key>": "<number>" },
       });
       expect(mockLogger.error.mock.calls[0]?.[0]).toBe("<event>");
     });
@@ -620,9 +694,12 @@ describe("VK diagnostics levels", () => {
       flag: true,
       nothing: null,
       fn: "[function]",
-      big: "10",
+      big: "<number>",
       seen: "[Set, 2]",
     });
+    process.env.VK_DIAG_LEVEL = "full";
+    vkDiag("probe", { big: 10n, balance: 7 });
+    expect(lastFields(mockLogger.info)).toEqual({ big: "10", balance: 7 });
   });
 
   it("does not throw on a cyclic array", () => {

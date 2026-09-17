@@ -8,7 +8,6 @@ type GroupPolicy = "open" | "disabled" | "allowlist";
 export type VkAccountConfig = {
   name?: string;
   enabled?: boolean;
-  diagnostics?: { level?: VkDiagLevel };
   token?: string;
   tokenFile?: string;
   dmPolicy?: DmPolicy;
@@ -33,6 +32,8 @@ export type VkAccountConfig = {
 };
 
 export type VkConfig = VkAccountConfig & {
+  /** Channel-wide: one level for every account. */
+  diagnostics?: { level?: VkDiagLevel };
   accounts?: Record<string, VkAccountConfig>;
 };
 

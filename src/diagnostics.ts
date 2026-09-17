@@ -20,7 +20,8 @@
  * recognise paths and addresses inside text and strip them, and that is a losing
  * game: a Unicode path, a relative one, a data URI in the middle of an error
  * message — each escaped one pattern or another. So the rule is an allowlist:
- * identifiers are hashed, numbers and booleans pass, a handful of named fields
+ * identifiers are hashed (by name, numbers and strings alike), counters and
+ * booleans pass, any other number becomes `<number>`, a handful of named fields
  * may carry a short token (`kind=photo`, `mime=image/jpeg`), a source field is
  * replaced by its kind (`local` / `remote` / `data`), and any other string —
  * an error message included — becomes the constant `<text>`. An error is
@@ -70,6 +71,37 @@ const IDENTIFIER_FIELDS = new Set([
   "cmid",
   "accountId",
 ]);
+
+/**
+ * A name that says "this is an id", whatever the casing: VK hands ids out in
+ * snake_case (`peer_id`, `from_id`), callers write `userId` or `groupId`. Such a
+ * number is hashed like the listed identifiers — the list alone let them through.
+ */
+const IDENTIFIER_KEY_RE = /(?:^id|_id|[a-z0-9]Id|ID)$/;
+
+/**
+ * Numbers that are measurements, not names: sizes, counts, positions, durations,
+ * codes. Below `full` only these pass as they are; any other number is replaced,
+ * the same allowlist rule strings follow.
+ */
+const COUNTER_FIELDS = new Set([
+  "vkCode",
+  "attempt",
+  "attempts",
+  "index",
+  "total",
+  "count",
+  "media",
+  "bytes",
+  "size",
+  "length",
+  "limit",
+  "segments",
+  "chunks",
+  "items",
+]);
+const COUNTER_KEY_RE = /(?:Len|Length|Count|Bytes|Size|Ms|Index|Total|Attempts?)$/;
+const NUMBER_PLACEHOLDER = "<number>";
 
 /**
  * Fields that may carry a short token below `full`: an attachment kind, a MIME
@@ -168,9 +200,9 @@ function isVkDiagLevel(value: unknown): value is VkDiagLevel {
  * fall through to whatever the config says, so a typo in the override can never
  * widen what is logged.
  *
- * Only `channels.vk.diagnostics` is read, with no per-account split — the same
- * way `streaming` works next to it. On a multi-account gateway the level is
- * shared.
+ * Only `channels.vk.diagnostics` is read: the level is channel-wide, and the
+ * config schema accepts it at channel level only, so an account cannot ask for a
+ * level it would not get.
  */
 export function resolveVkDiagLevel(): VkDiagLevel {
   const rawEnv = process.env.VK_DIAG_LEVEL;
@@ -306,7 +338,7 @@ function fullText(value: string): string {
 
 /** Text below `full`: only what is an identifier, a token or a source kind, by field name. */
 function redactedText(key: string, value: string): string {
-  if (IDENTIFIER_FIELDS.has(key)) {
+  if (IDENTIFIER_FIELDS.has(key) || IDENTIFIER_KEY_RE.test(key)) {
     return redactIdentifier(value);
   }
   if (SOURCE_FIELDS.has(key)) {
@@ -391,6 +423,12 @@ function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0)
     // Nested objects used to reach the log AS IS, bypassing redaction: any
     // object field holding a path or a peer id was a leak. We walk them
     // recursively and cap the depth so a cycle cannot run away.
+    // `JSON.parse(JSON.stringify(buffer))` is `{ type: "Buffer", data: [...] }`:
+    // no longer a Buffer, still the attachment.
+    const record = value as { type?: unknown; data?: unknown };
+    if (record.type === "Buffer" && Array.isArray(record.data)) {
+      return "buffer";
+    }
     if (value instanceof Map || value instanceof Set) {
       return `[${value.constructor.name}, ${value.size}]`;
     }
@@ -419,14 +457,20 @@ function redactField(key: string, value: unknown, level: VkDiagLevel, depth = 0)
   // Identifiers also arrive as numbers (`peerId: 12324712`), not only strings,
   // so they must be checked BEFORE non-strings are returned early — otherwise a
   // peer id reaches the log raw.
-  if ((typeof value === "number" || typeof value === "bigint") && IDENTIFIER_FIELDS.has(key)) {
-    return level === "full" ? value : redactIdentifier(String(value));
+  if (typeof value === "number" || typeof value === "bigint") {
+    if (level === "full") {
+      return typeof value === "bigint" ? value.toString() : value;
+    }
+    if (IDENTIFIER_FIELDS.has(key) || IDENTIFIER_KEY_RE.test(key)) {
+      return redactIdentifier(String(value));
+    }
+    if (COUNTER_FIELDS.has(key) || COUNTER_KEY_RE.test(key)) {
+      return typeof value === "bigint" ? value.toString() : value;
+    }
+    return NUMBER_PLACEHOLDER;
   }
-  if (typeof value === "number" || typeof value === "boolean" || value === null) {
+  if (typeof value === "boolean" || value === null) {
     return value;
-  }
-  if (typeof value === "bigint") {
-    return value.toString();
   }
   if (typeof value !== "string") {
     // Functions, symbols: nothing to log, and nothing that could leak.

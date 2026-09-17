@@ -2,10 +2,9 @@
  * Reading VK API failures.
  *
  * A module of its own because two callers need it: the send path (to decide
- * whether to retry) and diagnostics (what to write to the log). While these were
- * local helpers in `send.ts`, diagnostics extracted the code and message its own
- * way — and the voice branch read only `message`, losing `description`, which is
- * exactly where vk-io keeps permission failure text.
+ * whether to retry) and diagnostics (what to write to the log). One reading keeps
+ * them from disagreeing — e.g. on `description`, which is where vk-io keeps
+ * permission failure text.
  */
 
 /** Failure code: vk-io puts it either in `code` or in `error_code`. */

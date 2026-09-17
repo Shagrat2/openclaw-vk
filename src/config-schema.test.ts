@@ -206,4 +206,21 @@ describe("VkConfigSchema", () => {
     const result = VkConfigSchema.safeParse({});
     expect(result.success).toBe(true);
   });
+
+  // The diagnostics level is read from channels.vk.diagnostics only, for every
+  // account. Accepting it under an account would be a setting that silently does
+  // nothing — worst when an account asks for "off" and still logs at "full".
+  it("accepts the diagnostics level at channel level", () => {
+    const result = VkConfigSchema.safeParse({ diagnostics: { level: "full" } });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a diagnostics level under an account", () => {
+    const result = VkConfigSchema.safeParse({
+      diagnostics: { level: "full" },
+      accounts: { work: { token: "tok", diagnostics: { level: "off" } } },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain("accounts.work");
+  });
 });

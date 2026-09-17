@@ -1,6 +1,8 @@
 {
   "id": "vk",
-  "channels": ["vk"],
+  "channels": [
+    "vk"
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -13,7 +15,20 @@
       "schema": {
         "type": "object",
         "additionalProperties": true,
-        "properties": {}
+        "properties": {
+          "accounts": {
+            "type": "object",
+            "description": "Per-account overrides. The diagnostics level is channel-wide and is not accepted here.",
+            "additionalProperties": {
+              "type": "object",
+              "not": {
+                "required": [
+                  "diagnostics"
+                ]
+              }
+            }
+          }
+        }
       }
     }
   }

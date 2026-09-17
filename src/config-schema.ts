@@ -59,7 +59,6 @@ const VkAccountSchemaBase = z
     token: z.string().optional(),
     tokenFile: z.string().optional(),
     dmPolicy: DmPolicySchema.optional(),
-    diagnostics: VkDiagnosticsSchema,
     allowFrom: z.array(z.union([z.string(), z.number()])).optional(),
     defaultTo: z.string().optional(),
     groupPolicy: GroupPolicySchema.optional(),
@@ -79,6 +78,8 @@ export const VkAccountSchema = VkAccountSchemaBase.superRefine((value, ctx) => {
 });
 
 export const VkConfigSchema = VkAccountSchemaBase.extend({
+  // Channel-wide only: every account shares one level (see resolveVkDiagLevel).
+  diagnostics: VkDiagnosticsSchema,
   accounts: z.record(z.string(), VkAccountSchema).optional(),
 }).superRefine((value, ctx) => {
   requireOpenAllowFrom({

@@ -9,6 +9,7 @@ import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
+import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
 export {
   applyVkAllowlistConfigEdit,
   isVkGroupPeerId,
@@ -84,34 +85,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-function readVkErrorCode(error: unknown): number | undefined {
-  if (!error || typeof error !== "object") {
-    return undefined;
-  }
-  const record = error as Record<string, unknown>;
-  if (typeof record.code === "number") {
-    return record.code;
-  }
-  if (typeof record.error_code === "number") {
-    return record.error_code;
-  }
-  return undefined;
-}
-
-function readVkErrorMessage(error: unknown): string {
-  if (!error || typeof error !== "object") {
-    return "";
-  }
-  const record = error as Record<string, unknown>;
-  return [
-    typeof record.message === "string" ? record.message : "",
-    typeof record.name === "string" ? record.name : "",
-    typeof record.description === "string" ? record.description : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
 }
 
 function isVkScopeDeniedError(error: unknown): boolean {
