@@ -189,6 +189,7 @@ vi.mock("./send.js", () => ({
   resolveVkOwnGroup: mockResolveVkOwnGroup,
 }));
 
+import { resolveVkAccount } from "./accounts.js";
 import { handleVkInbound } from "./inbound.js";
 import { setVkRuntime } from "./runtime.js";
 import {
@@ -2141,5 +2142,175 @@ describe("forwarded messages", () => {
       runtime: createVkRuntimeEnv(),
     });
     expect(vi.mocked(stripped.channel.media.fetchRemoteMedia)).not.toHaveBeenCalled();
+  });
+});
+
+describe("context visibility through the resolved account", () => {
+  // The account comes from resolveVkAccount, as in monitorVkProvider — never a
+  // hand-built account.config, which is how a channel-level key went unapplied.
+  const OUTSIDER = 999_000;
+  const groupCfg = (vk: Record<string, unknown>) =>
+    baseCfg({
+      dmPolicy: "open",
+      groupPolicy: "open",
+      groupAllowFrom: [String(SENDER_ID)],
+      contextVisibility: "allowlist",
+      ...vk,
+    });
+  const groupMessage = (overrides: Parameters<typeof makeMessage>[0] = {}) =>
+    makeMessage({ peerId: GROUP_PEER_ID, senderId: SENDER_ID, isGroup: true, text: "гляньте", ...overrides });
+
+  it("applies a channel-level contextVisibility to the default account", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({ forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(String(lastInboundContext(runtime).BodyForAgent)).not.toContain("Заказ 10316111753");
+  });
+
+  it("applies a channel-level contextVisibility to a named account that does not set its own", async () => {
+    const cfg = groupCfg({ accounts: { work: { token: "tok2" } } });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({ forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg, accountId: "work" }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(String(lastInboundContext(runtime).BodyForAgent)).not.toContain("Заказ 10316111753");
+  });
+
+  it("lets an account override the channel-level contextVisibility", async () => {
+    const cfg = groupCfg({ accounts: { work: { token: "tok2", contextVisibility: "all" } } });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({ forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg, accountId: "work" }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("omits the whole quote target in a group when its author is outside the allowlist", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: OUTSIDER,
+        replyToText: "/think high чужой текст",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBeUndefined();
+    expect(ctx.ReplyToSender).toBeUndefined();
+    expect(ctx.ReplyToId).toBeUndefined();
+    expect(ctx.ReplyToIdFull).toBeUndefined();
+  });
+
+  it("keeps the quote of an allowed author", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: SENDER_ID,
+        replyToText: "своё сообщение",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBe("своё сообщение");
+    expect(ctx.ReplyToId).toBe("9801");
+  });
+
+  it("keeps an outsider's quote with allowlist_quote, still stripping an outsider's forward inside it", async () => {
+    const cfg = groupCfg({ contextVisibility: "allowlist_quote" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: OUTSIDER,
+        replyToText: "чужая цитата",
+        replyToForwards: [ORDER_FORWARD],
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.ReplyToBody)).toContain("чужая цитата");
+    expect(String(ctx.ReplyToBody)).not.toContain("Заказ 10316111753");
+    expect(ctx.ReplyToId).toBe("9801");
+  });
+
+  it("treats a quote of the bot's own message like any other author, as Telegram does", async () => {
+    // Telegram checks the reply target's sender against the group allowlist with
+    // no exception for the bot itself; the bot's id is not in groupAllowFrom.
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "а подробнее?",
+        replyToMessageId: "9800",
+        replyToSenderId: -239104331,
+        replyToText: "ответ бота",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBeUndefined();
+  });
+
+  it("does not filter quotes in a direct chat", async () => {
+    const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: OUTSIDER,
+        replyToText: "чужая цитата",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBe("чужая цитата");
+  });
+
+  it("logs why a group message made only of hidden forwards is not answered", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    const env = { ...createVkRuntimeEnv(), log: vi.fn() };
+    await handleVkInbound({
+      message: groupMessage({ text: "", forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: env,
+    });
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).not.toHaveBeenCalled();
+    const lines = env.log.mock.calls.map(([line]) => String(line));
+    expect(lines.some((line) => line.startsWith("vk: drop group") && line.includes("contextVisibility"))).toBe(true);
+    // The hidden author is exactly what this line must not name.
+    expect(lines.join("\n")).not.toContain("142153191");
   });
 });

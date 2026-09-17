@@ -18,6 +18,7 @@ function mergeVkAccountConfig(cfg: CoreConfig, accountId: string): VkAccountConf
     defaultTo: vkConfig.defaultTo,
     groupPolicy: vkConfig.groupPolicy,
     groupAllowFrom: vkConfig.groupAllowFrom,
+    contextVisibility: vkConfig.contextVisibility,
     groups: vkConfig.groups,
   };
 
