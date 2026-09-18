@@ -36,6 +36,20 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     ).toBe(false);
   });
 
+  // `openclaw config validate` reads this schema, so a level it accepts and the
+  // runtime then fails closed on reports success while diagnostics stay off.
+  it("rejects an unknown diagnostics level", () => {
+    expect(validate({ diagnostics: { level: "verbose" } })).toBe(false);
+  });
+
+  it("rejects a diagnostics value that is not an object", () => {
+    expect(validate({ diagnostics: "oops" })).toBe(false);
+  });
+
+  it("rejects an unknown key inside diagnostics", () => {
+    expect(validate({ diagnostics: { level: "redacted", extra: true } })).toBe(false);
+  });
+
   it("still accepts an ordinary account and keys it does not describe", () => {
     // The root stays open: tightening it would fail existing configs on keys the
     // manifest has never listed.

@@ -16,6 +16,21 @@
         "type": "object",
         "additionalProperties": true,
         "properties": {
+          "diagnostics": {
+            "type": "object",
+            "description": "Channel-wide diagnostics level. `openclaw config validate` reads this schema, so the level is typed here as well as in the zod schema.",
+            "additionalProperties": false,
+            "properties": {
+              "level": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "redacted",
+                  "full"
+                ]
+              }
+            }
+          },
           "accounts": {
             "type": "object",
             "description": "Per-account overrides. The diagnostics level is channel-wide and is not accepted here.",
