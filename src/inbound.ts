@@ -247,13 +247,21 @@ export async function handleVkInbound(params: {
   // filtered in groups only — in a direct chat the sender already passed allowFrom,
   // and an empty group allowlist lets every author through.
   const contextVisibility = resolveVkContextVisibility(account.config, config);
-  const isSupplementalVisible = (kind: "quote" | "forwarded", senderId: number): boolean => {
+  // An author VK did not give us is NOT an allowed author while the allowlist is
+  // non-empty — the core's isSenderIdAllowed says the same, and the mode then
+  // decides: "allowlist" hides such a quote, "allowlist_quote" may keep it. An
+  // empty allowlist still lets every author through, known or not.
+  const isSupplementalVisible = (
+    kind: "quote" | "forwarded",
+    senderId: number | undefined,
+  ): boolean => {
     if (!isGroup) {
       return true;
     }
     const senderAllowed =
       effectiveGroupSenderAllowFrom.length === 0 ||
-      resolveVkAllowlistMatch({ allowFrom: effectiveGroupSenderAllowFrom, senderId }).allowed;
+      (senderId !== undefined &&
+        resolveVkAllowlistMatch({ allowFrom: effectiveGroupSenderAllowFrom, senderId }).allowed);
     return evaluateSupplementalContextVisibility({ mode: contextVisibility, kind, senderAllowed }).include;
   };
   const isForwardVisible = (forward: VkInboundForward): boolean =>
@@ -261,8 +269,7 @@ export async function handleVkInbound(params: {
   // The quote target is judged by its own author first, as Telegram's
   // resolveVisibleReplyTarget does: hidden means the whole target — text, author
   // and ids — and only a visible quote has its forwards filtered on their own.
-  const isQuoteVisible =
-    message.replyToSenderId === undefined || isSupplementalVisible("quote", message.replyToSenderId);
+  const isQuoteVisible = isSupplementalVisible("quote", message.replyToSenderId);
   const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
   const firstForward = visibleForwards[0];
   const rawBody =

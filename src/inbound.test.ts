@@ -2276,6 +2276,83 @@ describe("context visibility through the resolved account", () => {
     expect(lastInboundContext(runtime).ReplyToBody).toBeUndefined();
   });
 
+  it("omits the whole quote target in a group when its author is unknown", async () => {
+    // The core treats a missing sender as not allowed while the allowlist is
+    // non-empty (isSenderIdAllowed), and the mode then decides. Letting an
+    // unknown author through was this channel's own fail-open.
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBeUndefined();
+    expect(ctx.ReplyToSender).toBeUndefined();
+    expect(ctx.ReplyToId).toBeUndefined();
+    expect(ctx.ReplyToIdFull).toBeUndefined();
+  });
+
+  it("keeps an unknown author's quote with allowlist_quote", async () => {
+    const cfg = groupCfg({ contextVisibility: "allowlist_quote" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBe("цитата без автора");
+    expect(ctx.ReplyToId).toBe("9801");
+  });
+
+  it("keeps an unknown author's quote when the group allowlist is empty", async () => {
+    // An empty allowlist lets every author through, known or not; only a
+    // non-empty one makes an unknown sender a refusal.
+    const cfg = baseCfg({ dmPolicy: "open", groupPolicy: "open", contextVisibility: "allowlist" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBe("цитата без автора");
+  });
+
+  it("does not filter an unknown author's quote in a direct chat", async () => {
+    const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBe("цитата без автора");
+  });
+
   it("does not filter quotes in a direct chat", async () => {
     const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
     const runtime = installRuntime();
