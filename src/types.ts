@@ -103,6 +103,12 @@ export type VkInboundAttachment = {
   mimeType?: string;
   /** A shared wall post: its address and text. The post has no media URL. */
   post?: { url?: string; text?: string };
+  /**
+   * The attachment belongs to a shared wall post, not to the sender. Only its
+   * images are downloaded: post audio would be transcribed into the turn as if
+   * the sender had said it. See `collectVkOwnMedia`.
+   */
+  fromPost?: boolean;
 };
 
 export type VkInboundResolvedMedia = {

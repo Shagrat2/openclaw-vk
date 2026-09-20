@@ -34,15 +34,35 @@
               }
             }
           },
+          "contextVisibility": {
+            "type": "string",
+            "description": "Which shared context reaches the agent in groups: every forward and quote (`all`), only those from allowlisted authors (`allowlist`), or the same plus a quote of the bot's own message (`allowlist_quote`). Accepted per account too.",
+            "enum": [
+              "all",
+              "allowlist",
+              "allowlist_quote"
+            ]
+          },
           "accounts": {
             "type": "object",
-            "description": "Per-account overrides. The diagnostics level is channel-wide and is not accepted here.",
+            "description": "Per-account overrides. The diagnostics level is channel-wide and is not accepted here; contextVisibility is.",
             "additionalProperties": {
               "type": "object",
               "not": {
                 "required": [
                   "diagnostics"
                 ]
+              },
+              "properties": {
+                "contextVisibility": {
+                  "type": "string",
+                  "description": "Overrides the channel-wide contextVisibility for this account.",
+                  "enum": [
+                    "all",
+                    "allowlist",
+                    "allowlist_quote"
+                  ]
+                }
               }
             }
           }

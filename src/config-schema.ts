@@ -1,6 +1,5 @@
 import { DmPolicySchema, GroupPolicySchema } from "openclaw/plugin-sdk/channel-config-schema";
-import { VK_DIAG_LEVELS } from "./types.js";
-import { VK_CONTEXT_VISIBILITY_MODES } from "./types.js";
+import { VK_CONTEXT_VISIBILITY_MODES, VK_DIAG_LEVELS } from "./types.js";
 import { z } from "zod";
 
 function requireOpenAllowFrom(params: {

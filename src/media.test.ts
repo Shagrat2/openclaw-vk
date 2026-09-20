@@ -325,6 +325,16 @@ describe("resolveVkInboundReplyContext", () => {
 // ── shared wall posts ───────────────────────────────────────────────────────
 
 // Real vk-io objects, not look-alikes: the fix reads their getters.
+const WALL_AUDIO_MESSAGE = {
+  type: "audio_message",
+  audio_message: {
+    id: 2,
+    owner_id: -235198196,
+    duration: 12,
+    link_ogg: "https://psv4.userapi.com/post-voice.ogg",
+  },
+};
+
 const WALL_PHOTO = {
   type: "photo",
   photo: {
@@ -387,6 +397,22 @@ describe("shared wall posts", () => {
       resolveVkInboundResolvedMedia({ attachments: [post], mediaRuntime: { fetchRemoteMedia, saveMediaBuffer } }),
     ).resolves.toEqual([]);
     expect(fetchRemoteMedia).not.toHaveBeenCalled();
+  });
+
+  it("marks the post's own media as the post's, so only its images may be downloaded", () => {
+    const result = extractVkInboundAttachments([
+      vkWallPost({
+        id: 41941,
+        owner_id: -235198196,
+        text: "Промт",
+        attachments: [WALL_PHOTO, WALL_AUDIO_MESSAGE],
+      }),
+    ]);
+    expect(result.map((entry) => [entry.kind, entry.fromPost])).toEqual([
+      ["wall", undefined],
+      ["image", true],
+      ["audio", true],
+    ]);
   });
 
   it("takes the text and photos of a repost from its copy history", () => {

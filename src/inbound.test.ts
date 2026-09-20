@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { WallAttachment } from "vk-io";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
 
@@ -190,6 +191,7 @@ vi.mock("./send.js", () => ({
 }));
 
 import { resolveVkAccount } from "./accounts.js";
+import { extractVkInboundAttachments } from "./media.js";
 import { handleVkInbound } from "./inbound.js";
 import { setVkRuntime } from "./runtime.js";
 import {
@@ -1787,6 +1789,42 @@ const WALL_WITH_DIRECTIVE = {
   },
 };
 
+/** A shared wall post as vk-io hands it over, expanded the way inbound does. */
+function sharedWallPost(attachments: Record<string, unknown>[]) {
+  return extractVkInboundAttachments([
+    new WallAttachment({
+      api: {},
+      payload: {
+        id: 41941,
+        owner_id: -235198196,
+        date: 1,
+        text: "Промт в комментариях",
+        attachments,
+      },
+    } as unknown as ConstructorParameters<typeof WallAttachment>[0]),
+  ]);
+}
+
+const POST_PHOTO = {
+  type: "photo",
+  photo: {
+    id: 1,
+    owner_id: -235198196,
+    date: 1,
+    sizes: [{ type: "x", url: "https://sun.userapi.com/post.jpg", width: 604, height: 604 }],
+  },
+};
+
+const POST_VOICE = {
+  type: "audio_message",
+  audio_message: {
+    id: 2,
+    owner_id: -235198196,
+    duration: 12,
+    link_ogg: "https://psv4.userapi.com/post-voice.ogg",
+  },
+};
+
 function lastInboundContext(runtime: ReturnType<typeof installRuntime>): Record<string, unknown> {
   const calls = vi.mocked(runtime.channel.reply.finalizeInboundContext).mock.calls;
   return (calls[calls.length - 1]?.[0] ?? {}) as Record<string, unknown>;
@@ -1814,6 +1852,61 @@ describe("shared wall posts vs control input", () => {
     expect(ctx.RawBody).toBe("Кратко перескажи пост");
     expect(String(ctx.BodyForAgent)).toContain("/think high");
     expect(String(ctx.BodyForAgent)).toContain("vk.com/wall-235198196_41941");
+  });
+
+  it("downloads a shared post's photo but not its voice message, which is not the sender's", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "глянь",
+        attachments: sharedWallPost([POST_PHOTO, POST_VOICE]),
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const fetched = vi
+      .mocked(runtime.channel.media.fetchRemoteMedia)
+      .mock.calls.map(([arg]) => (arg as { url: string }).url);
+    expect(fetched).toEqual(["https://sun.userapi.com/post.jpg"]);
+    // The agent still gets the post itself — link and text — so it can ask about
+    // the recording; what it must not get is the recording transcribed as if the
+    // sender had spoken it.
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain(
+      "[VK wall post https://vk.com/wall-235198196_41941]",
+    );
+  });
+
+  it("still downloads a voice message the sender recorded themselves", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          {
+            type: "audio_message",
+            kind: "audio",
+            url: "https://psv4.userapi.com/own-voice.ogg",
+            mimeType: "audio/ogg",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const fetched = vi
+      .mocked(runtime.channel.media.fetchRemoteMedia)
+      .mock.calls.map(([arg]) => (arg as { url: string }).url);
+    expect(fetched).toEqual(["https://psv4.userapi.com/own-voice.ogg"]);
   });
 
   it("dispatches a post-only message without letting the post become the command", async () => {

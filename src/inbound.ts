@@ -90,6 +90,21 @@ function filterVkForwards(
  * would be transcribed into the turn as if the sender had said it; those stay a
  * placeholder inside the forward.
  */
+/**
+ * Media the sender is answerable for: their own attachments, plus the images of
+ * a wall post they shared. A post's audio or voice attachment stays a
+ * placeholder in the text — downloading it would let the core transcribe a
+ * third party's recording into the turn as if the sender had said it, the same
+ * reason forwards give up everything but images.
+ */
+function collectVkOwnMedia(
+  attachments: readonly VkInboundAttachment[] | undefined,
+): VkInboundAttachment[] {
+  return (attachments ?? []).filter(
+    (attachment) => !attachment.fromPost || attachment.kind === "image",
+  );
+}
+
 function collectVkForwardImages(forwards: readonly VkInboundForward[]): VkInboundAttachment[] {
   return forwards.flatMap((forward) => [
     ...(forward.attachments ?? []).filter((attachment) => attachment.kind === "image"),
@@ -435,7 +450,10 @@ export async function handleVkInbound(params: {
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
   const resolvedMedia = await resolveVkInboundResolvedMedia({
-    attachments: [...(message.attachments ?? []), ...collectVkForwardImages(visibleForwards)],
+    attachments: [
+      ...collectVkOwnMedia(message.attachments),
+      ...collectVkForwardImages(visibleForwards),
+    ],
     mediaRuntime: core.channel.media,
     logError: (line) => runtime.log?.(line),
   });

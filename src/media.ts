@@ -465,7 +465,12 @@ export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundA
       return [entry];
     }
     const { post, attachments } = readVkWallPost(record);
-    return [{ ...entry, post }, ...extractVkInboundAttachments(attachments)];
+    // The post's own media keeps its provenance: it is the post speaking, not
+    // the sender, and only its images may be downloaded (`collectVkOwnMedia`).
+    return [
+      { ...entry, post },
+      ...extractVkInboundAttachments(attachments).map((nested) => ({ ...nested, fromPost: true })),
+    ];
   });
 }
 
