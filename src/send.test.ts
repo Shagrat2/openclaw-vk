@@ -2309,29 +2309,6 @@ describe("sendPayloadVk", () => {
     expect(mockMessagesSend).not.toHaveBeenCalled();
   });
 
-  /**
-   * Lets `promise` settle under fake timers: each retry pause fires as soon as
-   * the code schedules it, while real I/O — the downloaded copy on disk — still
-   * runs in between, which a single `runAllTimersAsync` could return ahead of.
-   */
-  async function runTimersUntilSettled(promise: Promise<unknown>): Promise<void> {
-    let settled = false;
-    void promise.then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      },
-    );
-    // Bounded: a promise that never settles fails here instead of spinning
-    // until the test times out.
-    for (let step = 0; step < 1000 && !settled; step += 1) {
-      await vi.advanceTimersToNextTimerAsync();
-    }
-    expect(settled).toBe(true);
-  }
-
   describe("a voice message VK may already have accepted", () => {
     // The send failed without an answer from VK. The retries reuse one
     // random_id, so VK may have taken the voice, and the caption with the link
@@ -2355,20 +2332,13 @@ describe("sendPayloadVk", () => {
       const failure = error();
       mockMessagesSend.mockRejectedValue(failure);
 
-      // The two slow cases retry before giving up; their pauses fire at once.
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      const sending = sendPayloadVk(
+      // Remote materialization uses real filesystem I/O. Keep the retry clock
+      // real too, so it cannot race the download and leak work into the next test.
+      await expect(sendPayloadVk(
         "123",
         { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
         { cfg },
-      );
-      try {
-        await runTimersUntilSettled(sending);
-      } finally {
-        vi.useRealTimers();
-      }
-
-      await expect(sending).rejects.toMatchObject({ name: "VkSendOutcomeUnknownError", cause: failure });
+      )).rejects.toMatchObject({ name: "VkSendOutcomeUnknownError", cause: failure });
 
       // Only the voice itself, retried under one random_id — no text after it.
       expect(mockMessagesSend).toHaveBeenCalledTimes(attempts);
@@ -2410,19 +2380,11 @@ describe("sendPayloadVk", () => {
     );
     mockMessagesSend.mockResolvedValueOnce(43);
 
-    // The upload retries before giving up; its pauses fire at once.
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const sending = sendPayloadVk(
+    const result = await sendPayloadVk(
       "123",
       { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
       { cfg, abortSignal: controller.signal },
     );
-    try {
-      await runTimersUntilSettled(sending);
-    } finally {
-      vi.useRealTimers();
-    }
-    const result = await sending;
 
     expect(controller.signal.aborted).toBe(false);
     expect(result).toEqual({ messageId: "43", chatId: "123" });
