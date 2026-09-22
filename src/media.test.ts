@@ -2,9 +2,12 @@ import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from "vitest";
+import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
+  extractVkInboundForwards,
   loadVkOutboundMedia,
+  resolveVkInboundAgentText,
   resolveVkInboundBodyText,
   resolveVkInboundResolvedMedia,
   resolveVkInboundResolvedMediaPaths,
@@ -315,6 +318,163 @@ describe("resolveVkInboundReplyContext", () => {
   it("reads 'message' field as fallback for text", () => {
     const result = resolveVkInboundReplyContext({ id: 1, message: "alt text" });
     expect(result.replyToText).toBe("alt text");
+  });
+
+});
+
+// ── shared wall posts ───────────────────────────────────────────────────────
+
+// Real vk-io objects, not look-alikes: the fix reads their getters.
+const WALL_AUDIO_MESSAGE = {
+  type: "audio_message",
+  audio_message: {
+    id: 2,
+    owner_id: -235198196,
+    duration: 12,
+    link_ogg: "https://psv4.userapi.com/post-voice.ogg",
+  },
+};
+
+const WALL_PHOTO = {
+  type: "photo",
+  photo: {
+    id: 1,
+    owner_id: -235198196,
+    date: 1,
+    sizes: [{ type: "x", url: "https://sun.userapi.com/p1.jpg", width: 604, height: 604 }],
+  },
+};
+
+function vkWallPost(payload: Record<string, unknown>): WallAttachment {
+  return new WallAttachment({
+    api: {},
+    payload: { date: 1, attachments: [], ...payload },
+  } as unknown as ConstructorParameters<typeof WallAttachment>[0]);
+}
+
+function vkReplyMessage(reply: Record<string, unknown>): unknown {
+  const context = new MessageContext({
+    api: {},
+    upload: {},
+    source: "polling",
+    groupId: 239104331,
+    updateType: "message_new",
+    payload: {
+      client_info: {},
+      message: {
+        id: 9537,
+        peer_id: 1,
+        from_id: 1,
+        date: 1,
+        text: "А так",
+        attachments: [],
+        reply_message: { peer_id: 1, from_id: 1, date: 1, attachments: [], ...reply },
+      },
+    },
+  } as unknown as ConstructorParameters<typeof MessageContext>[0]);
+  return context.replyMessage;
+}
+
+describe("shared wall posts", () => {
+  it("expands a post into its link, its text and its photos", () => {
+    const result = extractVkInboundAttachments([
+      vkWallPost({ id: 41941, owner_id: -235198196, text: "Промт в комментариях", attachments: [WALL_PHOTO] }),
+    ]);
+    expect(result.map((entry) => entry.type)).toEqual(["wall", "photo"]);
+    expect(result[0]).toMatchObject({
+      kind: "wall",
+      post: { url: "https://vk.com/wall-235198196_41941", text: "Промт в комментариях" },
+    });
+    expect(result[1]).toMatchObject({ kind: "image", url: "https://sun.userapi.com/p1.jpg" });
+  });
+
+  it("gives the post itself no media URL, so nothing tries to download the page", async () => {
+    const [post] = extractVkInboundAttachments([vkWallPost({ id: 2, owner_id: -1, text: "Пост" })]);
+    expect(post.url).toBeUndefined();
+    const fetchRemoteMedia = vi.fn();
+    const saveMediaBuffer = vi.fn();
+    await expect(
+      resolveVkInboundResolvedMedia({ attachments: [post], mediaRuntime: { fetchRemoteMedia, saveMediaBuffer } }),
+    ).resolves.toEqual([]);
+    expect(fetchRemoteMedia).not.toHaveBeenCalled();
+  });
+
+  it("marks the post's own media as the post's, so only its images may be downloaded", () => {
+    const result = extractVkInboundAttachments([
+      vkWallPost({
+        id: 41941,
+        owner_id: -235198196,
+        text: "Промт",
+        attachments: [WALL_PHOTO, WALL_AUDIO_MESSAGE],
+      }),
+    ]);
+    expect(result.map((entry) => [entry.kind, entry.fromPost])).toEqual([
+      ["wall", undefined],
+      ["image", true],
+      ["audio", true],
+    ]);
+  });
+
+  it("takes the text and photos of a repost from its copy history", () => {
+    const result = extractVkInboundAttachments([
+      vkWallPost({
+        id: 7,
+        owner_id: 12,
+        text: "Смотри",
+        copy_history: [
+          { id: 41941, owner_id: -235198196, date: 1, text: "Оригинал", attachments: [WALL_PHOTO] },
+        ],
+      }),
+    ]);
+    expect(result[0].post).toEqual({ url: "https://vk.com/wall12_7", text: "Смотри\n\nОригинал" });
+    expect(result.slice(1).map((entry) => entry.url)).toEqual(["https://sun.userapi.com/p1.jpg"]);
+  });
+
+  it("shows the post in the agent body instead of a bare placeholder", () => {
+    const attachments = extractVkInboundAttachments([
+      vkWallPost({ id: 41941, owner_id: -235198196, text: "Промт", attachments: [WALL_PHOTO] }),
+    ]);
+    expect(resolveVkInboundBodyText({ text: "", attachments })).toBe("<media:wall>");
+    expect(resolveVkInboundAgentText({ text: "", attachments })).toBe(
+      "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+    );
+    expect(resolveVkInboundAgentText({ text: "Смотри что нашёл", attachments })).toBe(
+      "Смотри что нашёл\n\n[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+    );
+  });
+
+  it("shows the link of a post that has no text", () => {
+    const attachments = extractVkInboundAttachments([vkWallPost({ id: 2, owner_id: -1, text: "" })]);
+    expect(resolveVkInboundAgentText({ text: "", attachments })).toBe("[VK wall post https://vk.com/wall-1_2]");
+  });
+
+  it("describes a quoted post instead of passing only its id", () => {
+    const replyMessage = vkReplyMessage({
+      id: 9533,
+      text: "",
+      attachments: [
+        { type: "wall", wall: { id: 41941, owner_id: -235198196, date: 1, text: "Промт", attachments: [WALL_PHOTO] } },
+      ],
+    });
+    expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
+      replyToMessageId: "9533",
+      replyToText: "[VK wall post https://vk.com/wall-235198196_41941]\nПромт",
+      replyToSenderId: 1,
+    });
+  });
+
+  it("marks a quoted message that has only an attachment by its kind", () => {
+    const replyMessage = vkReplyMessage({ id: 9520, text: "", attachments: [WALL_PHOTO] });
+    expect(resolveVkInboundReplyContext(replyMessage)).toEqual({
+      replyToMessageId: "9520",
+      replyToText: "<media:image>",
+      replyToSenderId: 1,
+    });
+  });
+
+  it("reads the author of a quote from vk-io, a community as a negative id", () => {
+    const replyMessage = vkReplyMessage({ id: 9723, text: "ответ", from_id: -239104331 });
+    expect(resolveVkInboundReplyContext(replyMessage).replyToSenderId).toBe(-239104331);
   });
 });
 
@@ -803,6 +963,117 @@ describe("loadVkOutboundMedia", () => {
         loadVkOutboundMedia({ mediaUrl: join(tempDir, "missing.png") }),
       ).rejects.toThrow();
     });
+  });
+});
+// ── forwarded messages ──────────────────────────────────────────────────────
+
+// Real vk-io objects: each forward is a MessageContext built from fwd_messages.
+function vkForwards(fwd_messages: Array<Record<string, unknown>>): unknown {
+  const context = new MessageContext({
+    api: {},
+    upload: {},
+    source: "polling",
+    groupId: 239104331,
+    updateType: "message_new",
+    payload: {
+      client_info: {},
+      message: { id: 9709, peer_id: 1, from_id: 12324712, date: 1, text: "Вот", attachments: [], fwd_messages },
+    },
+  } as unknown as ConstructorParameters<typeof MessageContext>[0]);
+  return context.forwards;
+}
+
+const ORDER_FORWARD = {
+  from_id: -142153191,
+  date: 1_789_000_000,
+  text: "Заказ 10316111753 готов к выдаче",
+  attachments: [],
+};
+
+describe("forwarded messages", () => {
+  it("reads the author, date, text, photos and nested forwards", () => {
+    const result = extractVkInboundForwards(
+      vkForwards([
+        { ...ORDER_FORWARD, fwd_messages: [{ from_id: 7, date: 1_789_000_001, text: "вложенное", attachments: [] }] },
+        { from_id: 12324712, date: 1_789_000_002, text: "", attachments: [WALL_PHOTO] },
+      ]),
+    );
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({
+      senderId: -142153191,
+      timestamp: 1_789_000_000_000,
+      text: "Заказ 10316111753 готов к выдаче",
+      forwards: [{ senderId: 7, timestamp: 1_789_000_001_000, text: "вложенное" }],
+    });
+    expect(result[1]).toMatchObject({ senderId: 12324712, text: "" });
+    expect(result[1].attachments).toMatchObject([{ kind: "image", url: "https://sun.userapi.com/p1.jpg" }]);
+  });
+
+  it("keeps at most two levels of nesting", () => {
+    const deep = { from_id: 3, date: 1, text: "третий", attachments: [] };
+    const middle = { from_id: 2, date: 1, text: "второй", attachments: [], fwd_messages: [deep] };
+    const result = extractVkInboundForwards(
+      vkForwards([{ from_id: 1, date: 1, text: "первый", attachments: [], fwd_messages: [middle] }]),
+    );
+    expect(result[0].forwards?.[0]).toMatchObject({ senderId: 2, text: "второй" });
+    expect(result[0].forwards?.[0].forwards ?? []).toEqual([]);
+  });
+
+  it("keeps at most ten forwards in total", () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ from_id: i + 1, date: 1, text: `№${i + 1}`, attachments: [] }));
+    expect(extractVkInboundForwards(vkForwards(many))).toHaveLength(10);
+  });
+
+  it("returns nothing for input that is not a list of forwards", () => {
+    expect(extractVkInboundForwards(undefined)).toEqual([]);
+    expect(extractVkInboundForwards(null)).toEqual([]);
+    expect(extractVkInboundForwards("text")).toEqual([]);
+  });
+
+  it("shows a forward to the agent under its author and date, after the sender's text", () => {
+    const forwards = extractVkInboundForwards(vkForwards([ORDER_FORWARD]));
+    expect(resolveVkInboundAgentText({ text: "Вот сообщение пересланое чужое", forwards })).toBe(
+      "Вот сообщение пересланое чужое\n\n[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]\nЗаказ 10316111753 готов к выдаче",
+    );
+  });
+
+  it("shows nested forwards and a forwarded wall post", () => {
+    const forwards = extractVkInboundForwards(
+      vkForwards([
+        {
+          from_id: 5,
+          date: 1_789_000_000,
+          text: "",
+          attachments: [{ type: "wall", wall: { id: 2, owner_id: -1, date: 1, text: "Пост", attachments: [] } }],
+          fwd_messages: [{ from_id: 6, date: 1_789_000_000, text: "глубже", attachments: [] }],
+        },
+      ]),
+    );
+    expect(resolveVkInboundAgentText({ text: "", forwards })).toBe(
+      [
+        "[Forwarded from vk:5 at 2026-09-10T00:26:40.000Z]",
+        "[VK wall post https://vk.com/wall-1_2]",
+        "Пост",
+        "",
+        "[Forwarded from vk:6 at 2026-09-10T00:26:40.000Z]",
+        "глубже",
+      ].join("\n"),
+    );
+  });
+});
+
+describe("forwarded messages — the limit", () => {
+  it("spends the limit on every top-level forward before any nested one", () => {
+    const nested = Array.from({ length: 9 }, (_, i) => ({ from_id: 100 + i, date: 1, text: `вложенное ${i}`, attachments: [] }));
+    const result = extractVkInboundForwards(
+      vkForwards([
+        { from_id: 1, date: 1, text: "первое", attachments: [], fwd_messages: nested },
+        { from_id: 2, date: 1, text: "второе", attachments: [] },
+        { from_id: 3, date: 1, text: "третье", attachments: [] },
+      ]),
+    );
+    expect(result.map((forward) => forward.senderId)).toEqual([1, 2, 3]);
+    expect(result[0].forwards).toHaveLength(7);
   });
 });
 

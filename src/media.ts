@@ -2,7 +2,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PluginRuntime } from "openclaw/plugin-sdk/core";
-import type { VkInboundAttachment, VkInboundResolvedMedia } from "./types.js";
+import type { VkInboundAttachment, VkInboundForward, VkInboundResolvedMedia } from "./types.js";
 
 const IMAGE_EXTENSIONS = new Set([
   ".apng",
@@ -405,33 +405,142 @@ function inferVkAttachmentMimeType(
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * A wall post shared into the chat (vk-io's `WallAttachment`). It has no media
+ * of its own, so the model used to get a bare `<media:wall>`: the link and the
+ * text are what it needs, and the post's photos go on as images. A repost keeps
+ * the original's text and photos in `copyHistory`.
+ */
+function readVkWallPost(record: Record<string, unknown>): {
+  post: NonNullable<VkInboundAttachment["post"]>;
+  attachments: unknown[];
+} {
+  const { ownerId, id } = record;
+  const url =
+    typeof ownerId === "number" && typeof id === "number"
+      ? `https://vk.com/wall${ownerId}_${id}`
+      : undefined;
+  const history = Array.isArray(record.copyHistory) ? record.copyHistory : [];
+  const posts = [
+    record,
+    ...history.map(asRecord).filter((entry): entry is Record<string, unknown> => Boolean(entry)),
+  ];
+  const text =
+    posts
+      .map((entry) => readString(entry, "text"))
+      .filter(Boolean)
+      .join("\n\n") || undefined;
+  const attachments = posts.flatMap((entry) =>
+    Array.isArray(entry.attachments) ? entry.attachments : [],
+  );
+  return { post: { url, text }, attachments };
+}
+
 export function extractVkInboundAttachments(rawAttachments: unknown): VkInboundAttachment[] {
   if (!Array.isArray(rawAttachments)) {
     return [];
   }
 
-  return rawAttachments
-    .map((attachment) => {
-      if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
-        return undefined;
-      }
-      const record = attachment as Record<string, unknown>;
-      const type = readString(record, "type") ?? "attachment";
-      const url = normalizeVkAttachmentUrl(type, record);
-      return {
-        type,
-        kind: normalizeVkAttachmentKind(type, record),
-        url,
-        title: normalizeVkAttachmentTitle(type, record),
-        mimeType: inferVkAttachmentMimeType(type, record, url),
-      } satisfies VkInboundAttachment;
-    })
-    .filter((attachment): attachment is VkInboundAttachment => Boolean(attachment));
+  return rawAttachments.flatMap((attachment): VkInboundAttachment[] => {
+    const record = asRecord(attachment);
+    if (!record) {
+      return [];
+    }
+    const type = readString(record, "type") ?? "attachment";
+    const url = normalizeVkAttachmentUrl(type, record);
+    const entry: VkInboundAttachment = {
+      type,
+      kind: normalizeVkAttachmentKind(type, record),
+      url,
+      title: normalizeVkAttachmentTitle(type, record),
+      mimeType: inferVkAttachmentMimeType(type, record, url),
+    };
+    if (type !== "wall") {
+      return [entry];
+    }
+    const { post, attachments } = readVkWallPost(record);
+    // The post's own media keeps its provenance: it is the post speaking, not
+    // the sender, and only its images may be downloaded (`collectVkOwnMedia`).
+    return [
+      { ...entry, post },
+      ...extractVkInboundAttachments(attachments).map((nested) => ({ ...nested, fromPost: true })),
+    ];
+  });
+}
+
+/** Forwards kept per inbound message, nested ones included. */
+export const MAX_VK_FORWARDS = 10;
+
+/**
+ * Messages forwarded into this one — vk-io's `forwards`, where each forward is
+ * a MessageContext of its own — two levels deep, within `capVkForwards`.
+ */
+export function extractVkInboundForwards(raw: unknown): VkInboundForward[] {
+  return capVkForwards(readVkForwards(raw, 2));
+}
+
+function readVkForwards(raw: unknown, depth: number): VkInboundForward[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.flatMap((item): VkInboundForward[] => {
+    const record = asRecord(item);
+    if (!record) {
+      return [];
+    }
+    const { senderId, createdAt } = record;
+    const forward: VkInboundForward = {
+      senderId: typeof senderId === "number" ? senderId : 0,
+      text: readString(record, "text") ?? "",
+    };
+    if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
+      forward.timestamp = createdAt * 1000;
+    }
+    const attachments = extractVkInboundAttachments(record.attachments);
+    if (attachments.length > 0) {
+      forward.attachments = attachments;
+    }
+    const nested = depth > 1 ? readVkForwards(record.forwards, depth - 1) : [];
+    if (nested.length > 0) {
+      forward.forwards = nested;
+    }
+    return [forward];
+  });
+}
+
+/**
+ * Ten forwards in total, nested ones included: a chain of forwards is no reason
+ * to flood the prompt. Every top-level forward is kept first, then nested ones
+ * in order, so one forward full of others cannot crowd out the ones next to it.
+ */
+export function capVkForwards(forwards: readonly VkInboundForward[]): VkInboundForward[] {
+  let left = MAX_VK_FORWARDS;
+  const kept = forwards.slice(0, left).map((forward) => ({ ...forward }));
+  left -= kept.length;
+  for (const forward of kept) {
+    const nested = (forward.forwards ?? []).slice(0, left);
+    left -= nested.length;
+    if (nested.length > 0) {
+      forward.forwards = nested;
+    } else {
+      delete forward.forwards;
+    }
+  }
+  return kept;
 }
 
 export function resolveVkInboundReplyContext(replyMessage: unknown): {
   replyToMessageId?: string;
   replyToText?: string;
+  replyToForwards?: VkInboundForward[];
+  /** Author of the quoted message; negative for a community. */
+  replyToSenderId?: number;
 } {
   if (!replyMessage || typeof replyMessage !== "object" || Array.isArray(replyMessage)) {
     return {};
@@ -441,10 +550,21 @@ export function resolveVkInboundReplyContext(replyMessage: unknown): {
     typeof record.id === "number" ? String(record.id) : undefined,
     readString(record, "id"),
   ]);
-  const replyToText = pickFirstString([readString(record, "text"), readString(record, "message")]);
+  // The quoted message is described the way an incoming one is: taking only its
+  // text left a quoted post, photo or voice message as a bare id.
+  const replyToText =
+    resolveVkInboundAgentText({
+      text: pickFirstString([readString(record, "text"), readString(record, "message")]),
+      attachments: extractVkInboundAttachments(record.attachments),
+    }) || undefined;
+  const replyToForwards = extractVkInboundForwards(record.forwards);
+  const replyToSenderId =
+    typeof record.senderId === "number" && record.senderId !== 0 ? record.senderId : undefined;
   return {
     replyToMessageId,
     replyToText,
+    ...(replyToForwards.length > 0 ? { replyToForwards } : {}),
+    ...(replyToSenderId !== undefined ? { replyToSenderId } : {}),
   };
 }
 
@@ -600,9 +720,21 @@ export function resolveVkInboundResolvedMediaTypes(
     .filter((entry): entry is string => Boolean(entry));
 }
 
+function describeVkWallPost(post: NonNullable<VkInboundAttachment["post"]>): string {
+  const header = post.url ? `[VK wall post ${post.url}]` : "[VK wall post]";
+  return post.text ? `${header}\n${post.text}` : header;
+}
+
+/**
+ * What the sender wrote, as control input: commands, directives and the mention
+ * gate must see only this. A shared post or a forward is a third party’s text,
+ * so it stays out. A message without text keeps a placeholder: left empty, the
+ * core would fall back to the body and read that text as the sender’s command.
+ */
 export function resolveVkInboundBodyText(params: {
   text?: string | null;
   attachments?: readonly VkInboundAttachment[];
+  forwards?: readonly VkInboundForward[];
 }): string {
   const trimmedText = params.text?.trim() ?? "";
   if (trimmedText) {
@@ -617,10 +749,38 @@ export function resolveVkInboundBodyText(params: {
     ),
   );
   if (mediaKinds.length === 0) {
-    return "";
+    return (params.forwards?.length ?? 0) > 0 ? "<forwarded>" : "";
   }
 
   return `<media:${mediaKinds[0] ?? "attachment"}>`;
+}
+
+/** A forward as the agent sees it: author and date, then its own body. */
+function describeVkForward(forward: VkInboundForward): string {
+  const at = forward.timestamp !== undefined ? ` at ${new Date(forward.timestamp).toISOString()}` : "";
+  const body = resolveVkInboundAgentText({ text: forward.text, attachments: forward.attachments });
+  const own = [`[Forwarded from vk:${forward.senderId}${at}]`, body].filter(Boolean).join("\n");
+  return [own, ...(forward.forwards ?? []).map(describeVkForward)].join("\n\n");
+}
+
+/**
+ * The body the agent sees: the sender’s text plus any post shared with it and
+ * any messages forwarded into it. The caller decides which forwards are visible.
+ */
+export function resolveVkInboundAgentText(params: {
+  text?: string | null;
+  attachments?: readonly VkInboundAttachment[];
+  forwards?: readonly VkInboundForward[];
+}): string {
+  const posts = (params.attachments ?? []).flatMap((attachment) =>
+    attachment.post ? [describeVkWallPost(attachment.post)] : [],
+  );
+  const forwarded = (params.forwards ?? []).map(describeVkForward);
+  const own =
+    posts.length > 0
+      ? [params.text?.trim() ?? "", ...posts]
+      : [resolveVkInboundBodyText({ text: params.text, attachments: params.attachments })];
+  return [...own, ...forwarded].filter(Boolean).join("\n\n");
 }
 
 function isHttpMediaUrl(value: string): boolean {

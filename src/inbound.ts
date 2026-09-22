@@ -26,13 +26,30 @@ import {
   resolveDefaultGroupPolicy,
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/runtime-group-policy";
+import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
-import { resolveVkInboundBodyText, resolveVkInboundResolvedMedia } from "./media.js";
+import {
+  resolveVkInboundAgentText,
+  resolveVkInboundBodyText,
+  resolveVkInboundResolvedMedia,
+} from "./media.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { getVkRuntime } from "./runtime.js";
-import { markMessageReadVk, sendPayloadVk, sendTypingVk } from "./send.js";
+import {
+  markMessageReadVk,
+  resolveVkOwnGroup,
+  sendPayloadVk,
+  sendTypingVk,
+} from "./send.js";
 import type { ResolvedVkAccount } from "./types.js";
-import type { CoreConfig, VkInboundMessage } from "./types.js";
+import type {
+  CoreConfig,
+  VkAccountConfig,
+  VkContextVisibility,
+  VkInboundAttachment,
+  VkInboundForward,
+  VkInboundMessage,
+} from "./types.js";
 
 const CHANNEL_ID = "vk" as const;
 
@@ -48,6 +65,51 @@ function normalizeVkAllowlist(allowFrom: Array<string | number> | undefined): st
     return [];
   }
   return allowFrom.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean);
+}
+
+/** The core's precedence: account, then channel (merged into the account), then channel defaults. */
+function resolveVkContextVisibility(accountConfig: VkAccountConfig, config: unknown): VkContextVisibility {
+  const defaults = (config as { channels?: { defaults?: { contextVisibility?: VkContextVisibility } } })
+    ?.channels?.defaults;
+  return accountConfig.contextVisibility ?? defaults?.contextVisibility ?? "all";
+}
+
+function filterVkForwards(
+  forwards: readonly VkInboundForward[] | undefined,
+  isVisible: (forward: VkInboundForward) => boolean,
+): VkInboundForward[] {
+  return (forwards ?? [])
+    .filter(isVisible)
+    .map((forward) =>
+      forward.forwards ? { ...forward, forwards: filterVkForwards(forward.forwards, isVisible) } : forward,
+    );
+}
+
+/**
+ * Only the images of forwards are downloaded. A forwarded voice message or audio
+ * would be transcribed into the turn as if the sender had said it; those stay a
+ * placeholder inside the forward.
+ */
+/**
+ * Media the sender is answerable for: their own attachments, plus the images of
+ * a wall post they shared. A post's audio or voice attachment stays a
+ * placeholder in the text — downloading it would let the core transcribe a
+ * third party's recording into the turn as if the sender had said it, the same
+ * reason forwards give up everything but images.
+ */
+function collectVkOwnMedia(
+  attachments: readonly VkInboundAttachment[] | undefined,
+): VkInboundAttachment[] {
+  return (attachments ?? []).filter(
+    (attachment) => !attachment.fromPost || attachment.kind === "image",
+  );
+}
+
+function collectVkForwardImages(forwards: readonly VkInboundForward[]): VkInboundAttachment[] {
+  return forwards.flatMap((forward) => [
+    ...(forward.attachments ?? []).filter((attachment) => attachment.kind === "image"),
+    ...collectVkForwardImages(forward.forwards ?? []),
+  ]);
 }
 
 function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number }): {
@@ -88,6 +150,21 @@ type VkDispatchPayload = {
   channelData?: Record<string, unknown>;
 };
 
+/**
+ * Who wrote a message, labelled the way the core's Telegram labels senders: the
+ * bot itself by name with " (you)", so the agent knows it is quoting itself;
+ * anyone else by VK id, as in `ForwardedFrom`.
+ */
+async function resolveVkSenderLabel(account: ResolvedVkAccount, senderId: number): Promise<string> {
+  if (senderId < 0) {
+    const ownGroup = await resolveVkOwnGroup(account.token);
+    if (ownGroup && senderId === -ownGroup.id) {
+      return `${account.name ?? ownGroup.name ?? "OpenClaw"} (you)`;
+    }
+  }
+  return `vk:${senderId}`;
+}
+
 async function deliverVkReply(params: {
   payload: VkDispatchPayload;
   peerId: number;
@@ -121,12 +198,16 @@ export async function handleVkInbound(params: {
   });
 
   const payloadCommand = resolveVkCommandFromPayload(message.messagePayload);
+  // Two inputs, deliberately separate. The control input is what the sender
+  // authored: it decides commands, directives and the mention gate. The agent
+  // body may carry a third party’s text (a shared post), so it reaches neither.
   const visibleBody = resolveVkInboundBodyText({
     text: message.text,
     attachments: message.attachments,
+    forwards: message.forwards,
   });
-  const rawBody = payloadCommand ?? visibleBody;
-  if (!rawBody) {
+  const commandInput = payloadCommand ?? visibleBody;
+  if (!commandInput) {
     return;
   }
 
@@ -176,6 +257,51 @@ export async function handleVkInbound(params: {
       ? normalizeVkAllowlist(groupConfig.allowFrom)
       : undefined;
   const effectiveGroupSenderAllowFrom = groupAllowOverride ?? effectiveGroupAllowFrom;
+
+  // Forwards follow the core's supplemental context visibility, as in Telegram:
+  // filtered in groups only — in a direct chat the sender already passed allowFrom,
+  // and an empty group allowlist lets every author through.
+  const contextVisibility = resolveVkContextVisibility(account.config, config);
+  // An author VK did not give us is NOT an allowed author while the allowlist is
+  // non-empty — the core's isSenderIdAllowed says the same, and the mode then
+  // decides: "allowlist" hides such a quote, "allowlist_quote" may keep it. An
+  // empty allowlist still lets every author through, known or not.
+  const isSupplementalVisible = (
+    kind: "quote" | "forwarded",
+    senderId: number | undefined,
+  ): boolean => {
+    if (!isGroup) {
+      return true;
+    }
+    const senderAllowed =
+      effectiveGroupSenderAllowFrom.length === 0 ||
+      (senderId !== undefined &&
+        resolveVkAllowlistMatch({ allowFrom: effectiveGroupSenderAllowFrom, senderId }).allowed);
+    return evaluateSupplementalContextVisibility({ mode: contextVisibility, kind, senderAllowed }).include;
+  };
+  const isForwardVisible = (forward: VkInboundForward): boolean =>
+    isSupplementalVisible("forwarded", forward.senderId);
+  // The quote target is judged by its own author first, as Telegram's
+  // resolveVisibleReplyTarget does: hidden means the whole target — text, author
+  // and ids — and only a visible quote has its forwards filtered on their own.
+  const isQuoteVisible = isSupplementalVisible("quote", message.replyToSenderId);
+  const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
+  const firstForward = visibleForwards[0];
+  const rawBody =
+    payloadCommand ??
+    resolveVkInboundAgentText({
+      text: message.text,
+      attachments: message.attachments,
+      forwards: visibleForwards,
+    });
+  if (!rawBody) {
+    // Only reachable when every forward was hidden: the empty-message check above
+    // already let this one through. Say so, without naming the hidden authors.
+    runtime.log?.(
+      `vk: drop group peerId=${message.peerId} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
+    );
+    return;
+  }
 
   // Group access check
   if (isGroup) {
@@ -250,7 +376,10 @@ export async function handleVkInbound(params: {
     allowFrom: isGroup ? effectiveGroupSenderAllowFrom : effectiveAllowFrom,
     senderId: message.senderId,
   }).allowed;
-  const hasControlCommand = core.channel.text.hasControlCommand(rawBody, config as OpenClawConfig);
+  const hasControlCommand = core.channel.text.hasControlCommand(
+    commandInput,
+    config as OpenClawConfig,
+  );
   const commandGate = resolveControlCommandGate({
     useAccessGroups,
     authorizers: [
@@ -275,7 +404,10 @@ export async function handleVkInbound(params: {
 
   // Mention check for group chats
   const mentionRegexes = core.channel.mentions.buildMentionRegexes(config as OpenClawConfig);
-  const wasMentioned = core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes);
+  const wasMentioned = core.channel.mentions.matchesMentionPatterns(
+    commandInput,
+    mentionRegexes,
+  );
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
   if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
@@ -318,7 +450,10 @@ export async function handleVkInbound(params: {
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
   const resolvedMedia = await resolveVkInboundResolvedMedia({
-    attachments: message.attachments,
+    attachments: [
+      ...collectVkOwnMedia(message.attachments),
+      ...collectVkForwardImages(visibleForwards),
+    ],
     mediaRuntime: core.channel.media,
     logError: (line) => runtime.log?.(line),
   });
@@ -333,11 +468,17 @@ export async function handleVkInbound(params: {
     { messageId: message.messageId },
   );
 
+  const replyToSender =
+    message.replyToSenderId === undefined || !isQuoteVisible
+      ? undefined
+      : await resolveVkSenderLabel(account, message.replyToSenderId);
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
     BodyForAgent: rawBody,
-    RawBody: visibleBody || rawBody,
-    CommandBody: rawBody,
+    RawBody: visibleBody || commandInput,
+    CommandBody: commandInput,
+    BodyForCommands: commandInput,
     From: fromLabel,
     To: `vk:${peerId}`,
     SessionKey: route.sessionKey,
@@ -357,9 +498,22 @@ export async function handleVkInbound(params: {
     OriginatingTo: `vk:${peerId}`,
     CommandAuthorized: commandGate.commandAuthorized,
     media: media.length > 0 ? media : undefined,
-    ReplyToId: message.replyToMessageId,
-    ReplyToIdFull: message.replyToMessageId,
-    ReplyToBody: message.replyToText,
+    ...(isQuoteVisible && {
+      ReplyToId: message.replyToMessageId,
+      ReplyToIdFull: message.replyToMessageId,
+      ReplyToSender: replyToSender,
+      ReplyToBody:
+        resolveVkInboundAgentText({
+          text: message.replyToText,
+          forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
+        }) || undefined,
+    }),
+    ...(firstForward && {
+      ForwardedFrom: `vk:${firstForward.senderId}`,
+      ForwardedFromId: String(firstForward.senderId),
+      ForwardedFromType: firstForward.senderId < 0 ? "group" : "user",
+      ForwardedDate: firstForward.timestamp,
+    }),
   });
 
   const onDispatchError = (err: unknown, info: { kind: string }) => {

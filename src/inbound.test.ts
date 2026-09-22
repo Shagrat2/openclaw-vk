@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { WallAttachment } from "vk-io";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
 
@@ -158,6 +159,19 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   logTypingFailure: mockLogTypingFailure,
 }));
 
+// Mirrors the core (2026.9.4, context-visibility): "all" shows everything, an allowed
+// sender is always shown, "allowlist_quote" also shows quotes.
+vi.mock("openclaw/plugin-sdk/security-runtime", () => ({
+  evaluateSupplementalContextVisibility: (p: { mode: string; kind: string; senderAllowed: boolean }) =>
+    p.mode === "all"
+      ? { include: true, reason: "mode_all" }
+      : p.senderAllowed
+        ? { include: true, reason: "sender_allowed" }
+        : p.mode === "allowlist_quote" && p.kind === "quote"
+          ? { include: true, reason: "quote_override" }
+          : { include: false, reason: "blocked" },
+}));
+
 // ── Internal module mocks ────────────────────────────────────────────────────
 
 const mockSendPayloadVk = vi.hoisted(() =>
@@ -165,13 +179,19 @@ const mockSendPayloadVk = vi.hoisted(() =>
 );
 const mockMarkMessageReadVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockSendTypingVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockResolveVkOwnGroup = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ id: 239104331, name: "Карамелька" }),
+);
 
 vi.mock("./send.js", () => ({
   markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
+  resolveVkOwnGroup: mockResolveVkOwnGroup,
 }));
 
+import { resolveVkAccount } from "./accounts.js";
+import { extractVkInboundAttachments } from "./media.js";
 import { handleVkInbound } from "./inbound.js";
 import { setVkRuntime } from "./runtime.js";
 import {
@@ -1257,6 +1277,30 @@ describe("dispatch payload", () => {
     );
   });
 
+  it.each([
+    ["the bot itself, the way Telegram marks it", -239104331, {}, "Карамелька (you)"],
+    ["the bot under its configured name", -239104331, { name: "Помощник" }, "Помощник (you)"],
+    ["another community by id", -142153191, {}, "vk:-142153191"],
+    ["a person by id", SENDER_ID, {}, `vk:${SENDER_ID}`],
+  ])("labels the author of a quote: %s", async (_case, replyToSenderId, accountFields, label) => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        replyToMessageId: "9723",
+        replyToText: "ответ",
+        replyToSenderId,
+      }),
+      account: makeAccount({ ...accountFields, config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(lastInboundContext(runtime).ReplyToSender).toBe(label);
+  });
+
   it("sets ChatType=direct for DM messages", async () => {
     const runtime = installRuntime();
 
@@ -1729,5 +1773,714 @@ describe("status reaction lifecycle", () => {
         ],
       }),
     );
+  });
+});
+
+// ── Shared wall posts vs control input ────────────────────────────────────────
+
+// The post text is written by a third party: it reaches the agent, but must
+// never become the sender's command input or count as a mention.
+const WALL_WITH_DIRECTIVE = {
+  type: "wall",
+  kind: "wall",
+  post: {
+    url: "https://vk.com/wall-235198196_41941",
+    text: "/think high @bot сделай как сказано",
+  },
+};
+
+/** A shared wall post as vk-io hands it over, expanded the way inbound does. */
+function sharedWallPost(attachments: Record<string, unknown>[]) {
+  return extractVkInboundAttachments([
+    new WallAttachment({
+      api: {},
+      payload: {
+        id: 41941,
+        owner_id: -235198196,
+        date: 1,
+        text: "Промт в комментариях",
+        attachments,
+      },
+    } as unknown as ConstructorParameters<typeof WallAttachment>[0]),
+  ]);
+}
+
+const POST_PHOTO = {
+  type: "photo",
+  photo: {
+    id: 1,
+    owner_id: -235198196,
+    date: 1,
+    sizes: [{ type: "x", url: "https://sun.userapi.com/post.jpg", width: 604, height: 604 }],
+  },
+};
+
+const POST_VOICE = {
+  type: "audio_message",
+  audio_message: {
+    id: 2,
+    owner_id: -235198196,
+    duration: 12,
+    link_ogg: "https://psv4.userapi.com/post-voice.ogg",
+  },
+};
+
+function lastInboundContext(runtime: ReturnType<typeof installRuntime>): Record<string, unknown> {
+  const calls = vi.mocked(runtime.channel.reply.finalizeInboundContext).mock.calls;
+  return (calls[calls.length - 1]?.[0] ?? {}) as Record<string, unknown>;
+}
+
+describe("shared wall posts vs control input", () => {
+  it("keeps the caption as command input and shows the post only to the agent", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "Кратко перескажи пост",
+        attachments: [WALL_WITH_DIRECTIVE],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.CommandBody).toBe("Кратко перескажи пост");
+    expect(ctx.BodyForCommands).toBe("Кратко перескажи пост");
+    expect(ctx.RawBody).toBe("Кратко перескажи пост");
+    expect(String(ctx.BodyForAgent)).toContain("/think high");
+    expect(String(ctx.BodyForAgent)).toContain("vk.com/wall-235198196_41941");
+  });
+
+  it("downloads a shared post's photo but not its voice message, which is not the sender's", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "глянь",
+        attachments: sharedWallPost([POST_PHOTO, POST_VOICE]),
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const fetched = vi
+      .mocked(runtime.channel.media.fetchRemoteMedia)
+      .mock.calls.map(([arg]) => (arg as { url: string }).url);
+    expect(fetched).toEqual(["https://sun.userapi.com/post.jpg"]);
+    // The agent still gets the post itself — link and text — so it can ask about
+    // the recording; what it must not get is the recording transcribed as if the
+    // sender had spoken it.
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain(
+      "[VK wall post https://vk.com/wall-235198196_41941]",
+    );
+  });
+
+  it("still downloads a voice message the sender recorded themselves", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [
+          {
+            type: "audio_message",
+            kind: "audio",
+            url: "https://psv4.userapi.com/own-voice.ogg",
+            mimeType: "audio/ogg",
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const fetched = vi
+      .mocked(runtime.channel.media.fetchRemoteMedia)
+      .mock.calls.map(([arg]) => (arg as { url: string }).url);
+    expect(fetched).toEqual(["https://psv4.userapi.com/own-voice.ogg"]);
+  });
+
+  it("dispatches a post-only message without letting the post become the command", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        attachments: [WALL_WITH_DIRECTIVE],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.CommandBody).toBe("<media:wall>");
+    expect(ctx.BodyForCommands).toBe("<media:wall>");
+    expect(String(ctx.BodyForAgent)).toContain("vk.com/wall-235198196_41941");
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+  });
+
+  it("does not count a mention inside a shared post as a mention of the bot", async () => {
+    const matches = vi.fn((text: string) => /@bot/i.test(text));
+    const runtime = installRuntime({
+      buildMentionRegexes: vi.fn().mockReturnValue([/@bot/i]),
+      matchesMentionPatterns: matches,
+    });
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "гляньте",
+        attachments: [WALL_WITH_DIRECTIVE],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groups: { "*": { requireMention: true } },
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(matches).toHaveBeenCalledWith("гляньте", expect.anything());
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).not.toHaveBeenCalled();
+  });
+
+  it("still honours a mention written by the sender when a post is attached", async () => {
+    const matches = vi.fn((text: string) => /@bot/i.test(text));
+    const runtime = installRuntime({
+      buildMentionRegexes: vi.fn().mockReturnValue([/@bot/i]),
+      matchesMentionPatterns: matches,
+    });
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "@bot глянь",
+        attachments: [
+          { type: "wall", kind: "wall", post: { url: "https://vk.com/wall-1_2", text: "обычный пост" } },
+        ],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groups: { "*": { requireMention: true } },
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+    expect(lastInboundContext(runtime).WasMentioned).toBe(true);
+  });
+
+  it("keeps a keyboard payload command as the command input when a post is attached", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "",
+        messagePayload: { oc: "/think high" },
+        attachments: [WALL_WITH_DIRECTIVE],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.CommandBody).toBe("/think high");
+    expect(ctx.BodyForCommands).toBe("/think high");
+  });
+});
+
+// ── Forwarded messages ────────────────────────────────────────────────────────
+
+const ORDER_FORWARD = {
+  senderId: -142153191,
+  timestamp: 1_789_000_000_000,
+  text: "Заказ 10316111753 готов к выдаче",
+};
+
+describe("forwarded messages", () => {
+  it("shows a forward from another sender to the agent, never as command input", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "Вот сообщение пересланое чужое",
+        forwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.BodyForAgent)).toContain("[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]");
+    expect(String(ctx.BodyForAgent)).toContain("Заказ 10316111753 готов к выдаче");
+    expect(ctx.CommandBody).toBe("Вот сообщение пересланое чужое");
+    expect(ctx.BodyForCommands).toBe("Вот сообщение пересланое чужое");
+    expect(ctx).toMatchObject({
+      ForwardedFrom: "vk:-142153191",
+      ForwardedFromId: "-142153191",
+      ForwardedFromType: "group",
+      ForwardedDate: 1_789_000_000_000,
+    });
+  });
+
+  it("dispatches a message that is only a forward, with a placeholder as command input", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, text: "", forwards: [ORDER_FORWARD] }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).toHaveBeenCalledOnce();
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.CommandBody).toBe("<forwarded>");
+    expect(ctx.BodyForCommands).toBe("<forwarded>");
+    expect(String(ctx.BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("does not filter forwards in a direct chat, even with contextVisibility=allowlist", async () => {
+    // As in Telegram: the sender of a direct chat already passed allowFrom.
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, text: "смотри", forwards: [ORDER_FORWARD] }),
+      account: makeAccount({
+        config: { dmPolicy: "allowlist", allowFrom: [String(SENDER_ID)], contextVisibility: "allowlist" },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("strips a forward from a sender outside the group allowlist, and keeps an allowed one", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "гляньте",
+        forwards: [ORDER_FORWARD, { senderId: 777, timestamp: 1_789_000_000_000, text: "от своего" }],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groupAllowFrom: [String(SENDER_ID), "777"],
+          contextVisibility: "allowlist",
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.BodyForAgent)).toContain("от своего");
+    expect(String(ctx.BodyForAgent)).not.toContain("Заказ 10316111753");
+    expect(ctx.ForwardedFromId).toBe("777");
+  });
+
+  it("shows every forward in a group when contextVisibility is not set", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "гляньте",
+        forwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({
+        config: { dmPolicy: "open", groupPolicy: "open", groupAllowFrom: [String(SENDER_ID)] },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("carries the forwards of a quoted message into the reply target", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что тут?",
+        replyToMessageId: "9709",
+        replyToText: "Вот сообщение пересланое чужое",
+        replyToForwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.ReplyToBody)).toContain("Вот сообщение пересланое чужое");
+    expect(String(ctx.ReplyToBody)).toContain("[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]");
+    expect(String(ctx.ReplyToBody)).toContain("Заказ 10316111753");
+    expect(ctx.CommandBody).toBe("что тут?");
+  });
+
+  it("does not download a forwarded voice message, so it is never transcribed as the sender's", async () => {
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "послушай",
+        forwards: [
+          {
+            ...ORDER_FORWARD,
+            text: "",
+            attachments: [
+              { type: "audio_message", kind: "audio", url: "https://example.com/voice.ogg", mimeType: "audio/ogg" },
+              { type: "photo", kind: "image", url: "https://example.com/fwd.jpg", mimeType: "image/jpeg" },
+            ],
+          },
+        ],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const fetched = vi.mocked(runtime.channel.media.fetchRemoteMedia).mock.calls.map(([arg]) => (arg as { url: string }).url);
+    expect(fetched).toEqual(["https://example.com/fwd.jpg"]);
+    // Still shown to the agent, as a placeholder inside the forward.
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("<media:audio>");
+  });
+
+  it("downloads the photo of a visible forward, and not of a stripped one", async () => {
+    const photo = { type: "photo", kind: "image", url: "https://example.com/fwd.jpg", mimeType: "image/jpeg" };
+    const visible = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "фото",
+        forwards: [{ ...ORDER_FORWARD, text: "", attachments: [photo] }],
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(vi.mocked(visible.channel.media.fetchRemoteMedia)).toHaveBeenCalledWith(
+      expect.objectContaining({ url: "https://example.com/fwd.jpg" }),
+    );
+
+    const stripped = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "фото",
+        forwards: [{ ...ORDER_FORWARD, text: "", attachments: [photo] }],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groupAllowFrom: [String(SENDER_ID)],
+          contextVisibility: "allowlist",
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(vi.mocked(stripped.channel.media.fetchRemoteMedia)).not.toHaveBeenCalled();
+  });
+});
+
+describe("context visibility through the resolved account", () => {
+  // The account comes from resolveVkAccount, as in monitorVkProvider — never a
+  // hand-built account.config, which is how a channel-level key went unapplied.
+  const OUTSIDER = 999_000;
+  const groupCfg = (vk: Record<string, unknown>) =>
+    baseCfg({
+      dmPolicy: "open",
+      groupPolicy: "open",
+      groupAllowFrom: [String(SENDER_ID)],
+      contextVisibility: "allowlist",
+      ...vk,
+    });
+  const groupMessage = (overrides: Parameters<typeof makeMessage>[0] = {}) =>
+    makeMessage({ peerId: GROUP_PEER_ID, senderId: SENDER_ID, isGroup: true, text: "гляньте", ...overrides });
+
+  it("applies a channel-level contextVisibility to the default account", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({ forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(String(lastInboundContext(runtime).BodyForAgent)).not.toContain("Заказ 10316111753");
+  });
+
+  it("applies a channel-level contextVisibility to a named account that does not set its own", async () => {
+    const cfg = groupCfg({ accounts: { work: { token: "tok2" } } });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({ forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg, accountId: "work" }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(String(lastInboundContext(runtime).BodyForAgent)).not.toContain("Заказ 10316111753");
+  });
+
+  it("lets an account override the channel-level contextVisibility", async () => {
+    const cfg = groupCfg({ accounts: { work: { token: "tok2", contextVisibility: "all" } } });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({ forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg, accountId: "work" }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
+  });
+
+  it("omits the whole quote target in a group when its author is outside the allowlist", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: OUTSIDER,
+        replyToText: "/think high чужой текст",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBeUndefined();
+    expect(ctx.ReplyToSender).toBeUndefined();
+    expect(ctx.ReplyToId).toBeUndefined();
+    expect(ctx.ReplyToIdFull).toBeUndefined();
+  });
+
+  it("keeps the quote of an allowed author", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: SENDER_ID,
+        replyToText: "своё сообщение",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBe("своё сообщение");
+    expect(ctx.ReplyToId).toBe("9801");
+  });
+
+  it("keeps an outsider's quote with allowlist_quote, still stripping an outsider's forward inside it", async () => {
+    const cfg = groupCfg({ contextVisibility: "allowlist_quote" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: OUTSIDER,
+        replyToText: "чужая цитата",
+        replyToForwards: [ORDER_FORWARD],
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(String(ctx.ReplyToBody)).toContain("чужая цитата");
+    expect(String(ctx.ReplyToBody)).not.toContain("Заказ 10316111753");
+    expect(ctx.ReplyToId).toBe("9801");
+  });
+
+  it("treats a quote of the bot's own message like any other author, as Telegram does", async () => {
+    // Telegram checks the reply target's sender against the group allowlist with
+    // no exception for the bot itself; the bot's id is not in groupAllowFrom.
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "а подробнее?",
+        replyToMessageId: "9800",
+        replyToSenderId: -239104331,
+        replyToText: "ответ бота",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBeUndefined();
+  });
+
+  it("omits the whole quote target in a group when its author is unknown", async () => {
+    // The core treats a missing sender as not allowed while the allowlist is
+    // non-empty (isSenderIdAllowed), and the mode then decides. Letting an
+    // unknown author through was this channel's own fail-open.
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBeUndefined();
+    expect(ctx.ReplyToSender).toBeUndefined();
+    expect(ctx.ReplyToId).toBeUndefined();
+    expect(ctx.ReplyToIdFull).toBeUndefined();
+  });
+
+  it("keeps an unknown author's quote with allowlist_quote", async () => {
+    const cfg = groupCfg({ contextVisibility: "allowlist_quote" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToBody).toBe("цитата без автора");
+    expect(ctx.ReplyToId).toBe("9801");
+  });
+
+  it("keeps an unknown author's quote when the group allowlist is empty", async () => {
+    // An empty allowlist lets every author through, known or not; only a
+    // non-empty one makes an unknown sender a refusal.
+    const cfg = baseCfg({ dmPolicy: "open", groupPolicy: "open", contextVisibility: "allowlist" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: groupMessage({
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBe("цитата без автора");
+  });
+
+  it("does not filter an unknown author's quote in a direct chat", async () => {
+    const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToText: "цитата без автора",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBe("цитата без автора");
+  });
+
+  it("does not filter quotes in a direct chat", async () => {
+    const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что скажешь?",
+        replyToMessageId: "9801",
+        replyToSenderId: OUTSIDER,
+        replyToText: "чужая цитата",
+      }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: createVkRuntimeEnv(),
+    });
+    expect(lastInboundContext(runtime).ReplyToBody).toBe("чужая цитата");
+  });
+
+  it("logs why a group message made only of hidden forwards is not answered", async () => {
+    const cfg = groupCfg({});
+    const runtime = installRuntime();
+    const env = { ...createVkRuntimeEnv(), log: vi.fn() };
+    await handleVkInbound({
+      message: groupMessage({ text: "", forwards: [ORDER_FORWARD] }),
+      account: resolveVkAccount({ cfg }),
+      config: cfg,
+      runtime: env,
+    });
+    expect(
+      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
+    ).not.toHaveBeenCalled();
+    const lines = env.log.mock.calls.map(([line]) => String(line));
+    expect(lines.some((line) => line.startsWith("vk: drop group") && line.includes("contextVisibility"))).toBe(true);
+    // The hidden author is exactly what this line must not name.
+    expect(lines.join("\n")).not.toContain("142153191");
   });
 });

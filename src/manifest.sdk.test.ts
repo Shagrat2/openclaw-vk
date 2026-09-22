@@ -50,6 +50,24 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     expect(validate({ diagnostics: { level: "redacted", extra: true } })).toBe(false);
   });
 
+  it("accepts contextVisibility at channel level and under an account", () => {
+    expect(validate({ token: "tok", contextVisibility: "allowlist" })).toBe(true);
+    expect(
+      validate({ contextVisibility: "all", accounts: { work: { token: "tok", contextVisibility: "allowlist_quote" } } }),
+    ).toBe(true);
+  });
+
+  // Without this the zod schema rejects the value at runtime while
+  // `openclaw config validate` reports the config as good.
+  it("rejects an unknown contextVisibility mode, at either level", () => {
+    expect(validate({ contextVisibility: "quotes-only" })).toBe(false);
+    expect(validate({ accounts: { work: { contextVisibility: "quotes-only" } } })).toBe(false);
+  });
+
+  it("rejects a contextVisibility that is not a string", () => {
+    expect(validate({ contextVisibility: { mode: "allowlist" } })).toBe(false);
+  });
+
   it("accepts the voice limits at channel level", () => {
     expect(validate({ token: "tok", audio: { maxVoiceMs: 240_000, maxSegments: 12 } })).toBe(true);
   });
