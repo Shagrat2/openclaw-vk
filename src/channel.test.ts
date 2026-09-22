@@ -909,6 +909,66 @@ describe("outbound", () => {
     expect(result).toEqual({ channel: "vk", messageId: "fm-1", chatId: "0" });
   });
 
+  it("hands a running account's stop signal to outbound sends, and only while it runs", async () => {
+    // The core's outbound context carries no cancellation, so a gateway stop
+    // used to leave a download or an ffmpeg run to finish and upload after it.
+    // The account's own stop signal stands in for it.
+    const controller = new AbortController();
+    await vkPlugin.gateway!.startAccount({
+      account: { accountId: "sales", token: "test-token" },
+      cfg: { channels: { vk: { token: "test-token" } } },
+      runtime: {},
+      abortSignal: controller.signal,
+      setStatus: vi.fn(),
+      log: { info: vi.fn(), debug: vi.fn() },
+    } as never);
+
+    await vkPlugin.outbound!.sendPayload({
+      cfg: {},
+      to: "123",
+      payload: { text: "test" },
+      accountId: "sales",
+    } as never);
+    await vkPlugin.outbound!.sendMedia({
+      cfg: {},
+      to: "123",
+      text: "caption",
+      mediaUrl: "https://example.com/voice.ogg",
+      accountId: "sales",
+    } as never);
+
+    expect(mockSendPayloadVk).toHaveBeenLastCalledWith(
+      "123",
+      { text: "test" },
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+    expect(mockSendFormattedMediaVk).toHaveBeenLastCalledWith(
+      "123",
+      "caption",
+      "https://example.com/voice.ogg",
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+
+    // Another account does not borrow it.
+    await vkPlugin.outbound!.sendPayload({
+      cfg: {},
+      to: "123",
+      payload: { text: "test" },
+      accountId: "default",
+    } as never);
+    expect(mockSendPayloadVk.mock.calls.at(-1)?.[2]?.abortSignal).toBeUndefined();
+
+    // Once the account has stopped, nothing carries a stale signal.
+    controller.abort();
+    await vkPlugin.outbound!.sendPayload({
+      cfg: {},
+      to: "123",
+      payload: { text: "test" },
+      accountId: "sales",
+    } as never);
+    expect(mockSendPayloadVk.mock.calls.at(-1)?.[2]?.abortSignal).toBeUndefined();
+  });
+
   it("sendPayload returns empty messageId when sendPayloadVk returns null", async () => {
     mockSendPayloadVk.mockResolvedValueOnce(null);
 

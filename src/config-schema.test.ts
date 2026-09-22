@@ -223,6 +223,17 @@ describe("VkConfigSchema", () => {
     expect(result.success).toBe(false);
     expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain("accounts.work");
   });
+  // Voice limits are read from channels.vk.audio only (settings.ts), for every
+  // account; accepting them under an account would be a setting that does nothing.
+  it("accepts audio limits at channel level", () => {
+    expect(VkConfigSchema.safeParse({ audio: {} }).success).toBe(true);
+  });
+
+  it("rejects audio limits under an account", () => {
+    const result = VkConfigSchema.safeParse({ accounts: { work: { token: "tok", audio: {} } } });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.path.join("."))).toContain("accounts.work");
+  });
 });
 
 // ── Transport ────────────────────────────────────────────────────────────────
