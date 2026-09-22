@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { VK } from "vk-io";
 import {
   applyVkAllowlistConfigEdit,
@@ -36,11 +36,49 @@ import { makeAccount } from "./test-helpers.js";
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  // The core serializes tasks by key; this is the same semantics in three lines,
+  // so the tests observe real ordering instead of a pass-through stub.
+  enqueueKeyedTask: async <T,>({
+    tails,
+    key,
+    task,
+  }: {
+    tails: Map<string, Promise<void>>;
+    key: string;
+    task: () => Promise<T>;
+  }): Promise<T> => {
+    const previous = tails.get(key) ?? Promise.resolve();
+    const next = previous.then(task, task);
+    tails.set(
+      key,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return await next;
+  },
+  parseStrictPositiveInteger: (v: unknown) => {
+    const n = Number.parseInt(String(v ?? ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  },
+}));
+
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   normalizeAccountId: (id?: string) => id?.trim() || "default",
+}));
+
+const mockUploadLogger = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
 }));
 
 const mockGetVkRuntime = vi.hoisted(() =>
@@ -49,14 +87,22 @@ const mockGetVkRuntime = vi.hoisted(() =>
       activity: { record: vi.fn() },
     },
     config: { current: vi.fn().mockReturnValue({}) },
+    logging: {
+      shouldLogVerbose: vi.fn().mockReturnValue(false),
+      getChildLogger: vi.fn().mockReturnValue(mockUploadLogger),
+    },
   }),
 );
 
 vi.mock("./runtime.js", () => ({
   getVkRuntime: mockGetVkRuntime,
+  tryGetVkRuntime: mockGetVkRuntime,
 }));
 
 const mockMessagesSend = vi.hoisted(() => vi.fn());
+const mockGetMessagesUploadServer = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ upload_url: "https://upload.vk.example/audio" }),
+);
 const mockMessagesMarkAsRead = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSetActivity = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockSendReaction = vi.hoisted(() => vi.fn().mockResolvedValue(1));
@@ -75,6 +121,9 @@ vi.mock("vk-io", () => ({
   VK: vi.fn().mockImplementation(function () {
     return {
       api: {
+        docs: {
+          getMessagesUploadServer: mockGetMessagesUploadServer,
+        },
         groups: {
           getById: mockGroupsGetById,
         },
@@ -96,6 +145,40 @@ vi.mock("vk-io", () => ({
   getRandomId: mockGetRandomId,
 }));
 vi.stubGlobal("fetch", mockFetch as unknown as typeof fetch);
+
+/**
+ * A remote audio body for the bounded reader. Remote audio is always downloaded
+ * first — measured, split if needed, and uploaded from the copy — so every test
+ * that sends a URL has to answer the download.
+ */
+function stubAudioDownload(bytes = 2048, contentLength: string | null = String(bytes)): Buffer {
+  const audio = Buffer.alloc(bytes, 7);
+  mockFetch.mockResolvedValueOnce({
+    ok: true,
+    headers: { get: (k: string) => (k.toLowerCase() === "content-length" ? contentLength : null) },
+    body: (async function* () {
+      yield new Uint8Array(audio);
+    })(),
+  } as unknown as Response);
+  return audio;
+}
+
+const abortError = () => new DOMException("The operation was aborted", "AbortError");
+
+// ── audio-chunk mocks (ffmpeg/ffprobe split) ────────────────────────────────
+const mockProbeAudioDurationMs = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const mockSplitAudioAtSilence = vi.hoisted(() => vi.fn().mockResolvedValue([]));
+const mockCleanupAudioSegments = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock("./audio-chunk.js", () => ({
+  getVkAudioMessageMaxMs: () => 270_000,
+  probeAudioDurationMs: mockProbeAudioDurationMs,
+  splitAudioAtSilence: mockSplitAudioAtSilence,
+  cleanupAudioSegments: mockCleanupAudioSegments,
+  // Real implementation: the send path asks it for a segment's extension, and
+  // the answer has to match what splitting actually produced.
+  audioFileExtension: (file: string) => file.slice(file.lastIndexOf(".")) || ".ogg",
+}));
 
 const TOKEN = "test-token";
 const cfg = { channels: { vk: { token: TOKEN } } } as never;
@@ -142,8 +225,14 @@ beforeEach(() => {
   mockUploadPhoto.mockReset().mockResolvedValue("photo123_456");
   mockUploadDocument.mockReset().mockResolvedValue("doc123_789");
   mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGetMessagesUploadServer
+    .mockReset()
+    .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
   mockGroupsGetById.mockReset().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] });
   mockFetch.mockReset().mockRejectedValue(new Error("unexpected fetch"));
+  mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
+  mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
+  mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
   // Reset constructor counters between tests.
   vi.mocked(VK).mockClear();
 });
@@ -451,6 +540,83 @@ describe("sendPhotoVk", () => {
     expect(result).toEqual({ messageId: "99", chatId: "123" });
   });
 
+  it("serializes concurrent uploads for one account so transfers never overlap", async () => {
+    const gates: Array<() => void> = [];
+    let inFlight = 0;
+    let peak = 0;
+    mockUploadPhoto.mockReset().mockImplementation(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise<void>((resolve) => gates.push(resolve));
+      inFlight -= 1;
+      return "photo123_456";
+    });
+    mockMessagesSend.mockResolvedValue(1);
+
+    const sends = [
+      sendPhotoVk("123", Buffer.from("a"), undefined, { cfg }),
+      sendPhotoVk("456", Buffer.from("b"), undefined, { cfg }),
+    ];
+
+    // Both sends have started, but exactly one reached the upload server: the
+    // second is queued. Without the queue there would be two at once.
+    await vi.waitFor(() => expect(gates.length).toBe(1));
+    gates[0]?.();
+    await vi.waitFor(() => expect(gates.length).toBe(2));
+    gates[1]?.();
+    await Promise.all(sends);
+
+    expect(peak).toBe(1);
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a local photo on transient «photo is undefined» instead of falling back to a document", async () => {
+    // A real case: a 177 KB frame failed on attempt 1 and the recipient got a
+    // grey "JPG · 173 KB" card instead of the picture — the document fallback
+    // fired on a failure that a retry gets through.
+    const tempDir = await mkdtemp(join(tmpdir(), "openclaw-vk-photo-"));
+    const filePath = join(tempDir, "frame.jpg");
+    await writeFile(filePath, "jpeg-bytes");
+    const transient = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto
+      .mockReset()
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValueOnce("photo123_456");
+    mockUploadDocument.mockReset();
+    mockMessagesSend.mockResolvedValueOnce(77);
+
+    const result = await sendPayloadVk(
+      "123",
+      { text: "кадр", mediaUrl: pathToFileURL(filePath).toString() },
+      { cfg, mediaLocalRoots: [tempDir] },
+    );
+
+    expect(mockUploadPhoto).toHaveBeenCalledTimes(2);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(result).toEqual({ messageId: "77", chatId: "123" });
+  });
+
+  it("logs a failed upload with the VK error code and no payload details", async () => {
+    const failure = Object.assign(new Error("boom"), { code: 100 });
+    mockUploadPhoto.mockReset().mockRejectedValue(failure);
+    mockMessagesSend.mockResolvedValue(1);
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ kind: "photo", vkCode: 100, bytes: 3 }),
+    );
+    // Attachment content is never logged — a Buffer becomes the source kind.
+    const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect((meta as { source?: unknown })?.source).toBe("buffer");
+  });
+
   it("sends empty message text when no caption", async () => {
     mockMessagesSend.mockResolvedValueOnce(1);
 
@@ -545,21 +711,42 @@ describe("sendAudioMessageVk", () => {
     clearVkInstances();
     mockMessagesSend.mockReset();
     mockUploadAudioMessage.mockReset().mockResolvedValue("audio_message123_789");
+  mockGetMessagesUploadServer
+    .mockReset()
+    .mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
+    mockProbeAudioDurationMs.mockReset().mockResolvedValue(null);
+    mockSplitAudioAtSilence.mockReset().mockResolvedValue([]);
+    mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
     vi.mocked(VK).mockClear();
   });
 
   it("uploads audio as VK audio_message and sends it as attachment", async () => {
     mockMessagesSend.mockResolvedValueOnce(88);
+    stubAudioDownload();
 
     const result = await sendAudioMessageVk("456", "https://example.com/voice.mp3", "voice.mp3", "caption", {
       cfg,
     });
 
+    // The upload server is fetched by a separate request (with its own narrow
+    // retry) and the transfer uses the ready uploadUrl — vk-io no longer goes
+    // for the server itself.
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledWith({
+      type: "audio_message",
+      peer_id: 456,
+    });
+    // Uploaded from the downloaded copy, never from the URL: the copy is what
+    // was measured, and vk-io fetching the URL itself would bypass the ceiling.
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 456,
       source: {
-        value: "https://example.com/voice.mp3",
-        filename: "voice.mp3",
+        uploadUrl: "https://upload.vk.example/audio",
+        values: [
+          {
+            value: expect.stringContaining("vk-voice-src-"),
+            filename: "voice.mp3",
+          },
+        ],
       },
       title: "voice.mp3",
     });
@@ -570,6 +757,708 @@ describe("sendAudioMessageVk", () => {
         attachment: "audio_message123_789",
       }),
     );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+    // Measured within the limit (the probe returns null here), so no split.
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+  });
+
+  it("скачивает удалённое аудио, чтобы длинную запись можно было порезать", async () => {
+    // A URL used not to be split at all: materialization returned null for
+    // http, and a long recording went as one piece, which VK rejected.
+    const audio = Buffer.alloc(2048, 7);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: (k: string) => (k === "content-length" ? String(audio.length) : null) },
+      body: (async function* () {
+        yield new Uint8Array(audio);
+      })(),
+    } as unknown as Response);
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockMessagesSend.mockResolvedValue(91);
+
+    await sendAudioMessageVk("456", "https://example.com/long.ogg", "voice.ogg", "caption", {
+      cfg,
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith("https://example.com/long.ogg", expect.anything());
+    expect(mockSplitAudioAtSilence).toHaveBeenCalled();
+    // Two segments mean two voice messages.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a remote source over the declared ceiling and never hands the URL to vk-io", async () => {
+    // The refusal used to fail open: materialization returned null, the URL
+    // stayed the upload source, and vk-io fetched the very bytes the ceiling
+    // had just refused — with no ceiling at all.
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "1024";
+    try {
+      stubAudioDownload(10, "999999999");
+
+      await expect(
+        sendAudioMessageVk("456", "https://example.com/huge.ogg", "voice.ogg", undefined, { cfg }),
+      ).rejects.toMatchObject({ name: "VkMediaRejectedError", reason: "too-large" });
+
+      expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+      expect(mockGetMessagesUploadServer).not.toHaveBeenCalled();
+      expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+    }
+  });
+
+  it("refuses a remote source whose body outgrows the ceiling while streaming", async () => {
+    // No content-length: only the counter can catch it, and it must end the
+    // path the same way the declared size does.
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "1024";
+    try {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        headers: { get: () => null },
+        body: (async function* () {
+          yield new Uint8Array(700);
+          yield new Uint8Array(700);
+        })(),
+      } as unknown as Response);
+
+      await expect(
+        sendAudioMessageVk("456", "https://example.com/huge.ogg", "voice.ogg", undefined, { cfg }),
+      ).rejects.toMatchObject({ name: "VkMediaRejectedError", reason: "too-large" });
+
+      expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+    }
+  });
+
+  it("refuses a remote source that cannot be downloaded instead of letting vk-io fetch it", async () => {
+    mockFetch.mockRejectedValueOnce(new Error("connection refused"));
+
+    await expect(
+      sendAudioMessageVk("456", "https://example.com/gone.ogg", "voice.ogg", undefined, { cfg }),
+    ).rejects.toMatchObject({ name: "VkMediaRejectedError", reason: "unavailable" });
+
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+  });
+
+  it("retries only the upload-server request on a transient code=15", async () => {
+    // Review asked for a narrower retry: code 15 used to replay the whole
+    // pipeline (get server → upload → save), and a retry after a successful
+    // upload could create the document twice.
+    const batchedError = Object.assign(new Error("Access denied"), { code: 15 });
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockRejectedValueOnce(batchedError)
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/audio" });
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk(
+      "456",
+      "/tmp/voice.mp3",
+      "voice.mp3",
+      "caption",
+      { cfg },
+    );
+
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
+    // The file is uploaded exactly once — no duplicate document is possible.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("берёт свежий upload_url на каждую попытку заливки", async () => {
+    // VK's upload_url is single-use: replaying multipart against a spent address
+    // would always fail, making the "file is undefined" retry pointless.
+    const fileUndefined = Object.assign(new Error("file is undefined"), { code: 100 });
+    mockGetMessagesUploadServer
+      .mockReset()
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/first" })
+      .mockResolvedValueOnce({ upload_url: "https://upload.vk.example/second" });
+    mockUploadAudioMessage
+      .mockReset()
+      .mockRejectedValueOnce(fileUndefined)
+      .mockResolvedValueOnce("audio_message123_789");
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    await sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", undefined, {
+      cfg,
+    });
+
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(2);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]?.source?.uploadUrl).toBe(
+      "https://upload.vk.example/first",
+    );
+    expect(mockUploadAudioMessage.mock.calls[1]?.[0]?.source?.uploadUrl).toBe(
+      "https://upload.vk.example/second",
+    );
+  });
+
+  it("does not replay the upload when code=15 comes from a later stage", async () => {
+    // A permanent permission failure on the upload itself: nothing to retry, and
+    // extra attempts only delay the normal switch to sending a document.
+    const scopeError = Object.assign(
+      new Error("Access denied: no access to call this method with current scopes"),
+      { code: 15 },
+    );
+    mockUploadAudioMessage.mockReset().mockRejectedValue(scopeError);
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries audio upload on transient code=100 \"file is undefined\"", async () => {
+    const fileUndefinedError = Object.assign(
+      new Error("One of the parameters specified was missing or invalid: file is undefined"),
+      { code: 100 },
+    );
+    mockUploadAudioMessage
+      .mockRejectedValueOnce(fileUndefinedError)
+      .mockResolvedValueOnce("audio_message123_789");
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", "caption", {
+      cfg,
+    });
+
+    // Two upload attempts: transient failure then success — the voice is delivered.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+    expect(mockMessagesSend).toHaveBeenCalledWith(
+      expect.objectContaining({ peer_id: 456, attachment: "audio_message123_789" }),
+    );
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("does not retry audio upload on a genuine (non-file) code=100", async () => {
+    const paramError = Object.assign(
+      new Error("One of the parameters specified was missing or invalid: peer_id is invalid"),
+      { code: 100 },
+    );
+    mockUploadAudioMessage.mockRejectedValue(paramError);
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+    // Only one attempt — an arbitrary code=100 must not be masked as transient.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the single-message path for a short local file", async () => {
+    mockMessagesSend.mockResolvedValueOnce(88);
+    mockProbeAudioDurationMs.mockResolvedValueOnce(60_000); // 1 min ≤ limit
+
+    const result = await sendAudioMessageVk("456", "/tmp/voice.ogg", "voice.ogg", "caption", {
+      cfg,
+    });
+
+    expect(mockProbeAudioDurationMs).toHaveBeenCalledWith("/tmp/voice.ogg", undefined);
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("splits an over-limit local file into multiple voice messages", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000); // 10 min > limit
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_part1")
+      .mockResolvedValueOnce("audio_part2");
+    mockMessagesSend.mockResolvedValueOnce(101).mockResolvedValueOnce(102);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+      cfg,
+      replyTo: "777",
+    });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000, {
+      // The duration was already measured by the caller — no second ffprobe run.
+      knownDurationMs: 600_000,
+    });
+    // Two voice uploads, one per segment.
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(2);
+    expect(mockUploadAudioMessage.mock.calls[0]?.[0]).toMatchObject({
+      source: expect.objectContaining({
+        values: [expect.objectContaining({ value: "/tmp/part-0.ogg" })],
+      }),
+    });
+    // Two voice messages sent in order; caption + replyTo on first only.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(getSendCall(0)).toMatchObject({
+      message: "caption",
+      attachment: "audio_part1",
+      reply_to: 777,
+    });
+    expect(getSendCall(1)).toMatchObject({ attachment: "audio_part2" });
+    expect(getSendCall(1)).not.toHaveProperty("reply_to");
+    // Segment temp files cleaned up.
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    expect(result).toEqual({ messageId: "102", chatId: "456" });
+  });
+
+  it("sends tail text chunks after all voice segments", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage
+      .mockResolvedValueOnce("audio_part1")
+      .mockResolvedValueOnce("audio_part2");
+    // 2 voice sends + 1 tail text-chunk send (5000 chars → 4096 + 904; the
+    // first 4096 chunk rides voice #1, the 904 remainder is the single tail).
+    mockMessagesSend
+      .mockResolvedValueOnce(101)
+      .mockResolvedValueOnce(102)
+      .mockResolvedValueOnce(103);
+
+    const longTail = "a".repeat(5000);
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", longTail, { cfg });
+
+    // First voice carries chunk 0; remaining text chunk comes after both voices.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+    expect(getSendCall(0).attachment).toBe("audio_part1");
+    expect(getSendCall(0).message).toBe("a".repeat(4096));
+    expect(getSendCall(1).attachment).toBe("audio_part2");
+    expect(getSendCall(2)).not.toHaveProperty("attachment");
+    expect(getSendCall(2).message).toBe("a".repeat(904));
+    expect(result).toEqual({ messageId: "103", chatId: "456" });
+  });
+
+  it("sends a measured over-limit source as a document when the split yields nothing", async () => {
+    // Measured over the limit, and no validated split: the original used to be
+    // retried as a voice message, which VK rejects exactly as it rejected the
+    // split. It goes as a document instead — the one thing VK will take.
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce([]);
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledTimes(1);
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockUploadDocument).toHaveBeenCalledTimes(1);
+    expect(mockUploadDocument.mock.calls[0]?.[0]).toMatchObject({
+      source: expect.objectContaining({ value: "/tmp/long.ogg" }),
+      title: "long.ogg",
+    });
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(getSendCall(0)).toMatchObject({ message: "caption", attachment: "doc123_789" });
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("sends a document when the splitter itself fails on a measured over-limit source", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockRejectedValueOnce(new Error("ffmpeg exploded"));
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockUploadDocument).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends a document when a segment upload fails before the first send", async () => {
+    // Every segment is uploaded before anything is sent, so a failed upload has
+    // shown the recipient nothing — the document replaces the reply, it does not
+    // duplicate part of it.
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockRejectedValue(new Error("upload exploded"));
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockUploadDocument).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(getSendCall(0)).toMatchObject({ attachment: "doc123_789" });
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("reports a partial delivery when a later voice message fails after the first was sent", async () => {
+    // Pre-uploading makes the uploads atomic, not the sends. Once the first
+    // voice message is out, a failure is reported as what it is — not replaced
+    // by a document on top of it, not counted as a full delivery.
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockResolvedValueOnce("audio_part2");
+    mockMessagesSend.mockResolvedValueOnce(101).mockRejectedValueOnce(new Error("send exploded"));
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg }),
+    ).rejects.toMatchObject({ name: "VkPartialDeliveryError", delivered: 1, total: 2 });
+
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+  });
+
+  it("stops during the initial probe without uploading or sending anything", async () => {
+    // The stop arrives while ffprobe runs. It must end the path right there:
+    // caught as an ordinary failure, it used to fall through to uploading the
+    // original after the gateway had asked everything to end.
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockImplementationOnce(async () => {
+      controller.abort();
+      throw abortError();
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+        cfg,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(mockProbeAudioDurationMs).toHaveBeenCalledWith("/tmp/long.ogg", controller.signal);
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it("stops during splitting without uploading or sending anything", async () => {
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockImplementationOnce(async () => {
+      controller.abort();
+      return ["/tmp/part-0.ogg", "/tmp/part-1.ogg"];
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+        cfg,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(mockSplitAudioAtSilence).toHaveBeenCalledWith("/tmp/long.ogg", 270_000, {
+      knownDurationMs: 600_000,
+      signal: controller.signal,
+    });
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+    // What the split produced is not left behind in /tmp.
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+  });
+
+  it("stops between segment sends and reports what was delivered", async () => {
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockResolvedValueOnce("audio_part2");
+    mockMessagesSend.mockImplementationOnce(async () => {
+      controller.abort();
+      return 101;
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+        cfg,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "VkPartialDeliveryError", delivered: 1, total: 2 });
+
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+  });
+
+  it("does not start queued uploads once the stop has come", async () => {
+    // Uploads for one token go one at a time. A transfer waiting in that queue
+    // used to start when its turn came, stop or no stop — whatever it carried.
+    let finishFirst!: (attachment: string) => void;
+    mockUploadAudioMessage.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    mockMessagesSend.mockResolvedValue(88);
+    const first = sendAudioMessageVk("456", "/tmp/first.ogg", "first.ogg", undefined, { cfg });
+    await vi.waitFor(() => expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1));
+
+    const controller = new AbortController();
+    const stopped = { cfg, abortSignal: controller.signal };
+    const queuedVoice = sendAudioMessageVk("456", "/tmp/second.ogg", "second.ogg", undefined, stopped).catch(
+      (error: unknown) => error,
+    );
+    const queuedDocument = sendDocumentVk("456", "/tmp/report.pdf", "report.pdf", undefined, stopped).catch(
+      (error: unknown) => error,
+    );
+    const queuedPhoto = sendPhotoVk("456", "/tmp/picture.png", undefined, stopped).catch(
+      (error: unknown) => error,
+    );
+    // Let them all reach the queue behind the first transfer.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(mockProbeAudioDurationMs).toHaveBeenCalledTimes(2);
+    controller.abort();
+    finishFirst("audio_message123_789");
+
+    await expect(first).resolves.toEqual({ messageId: "88", chatId: "456" });
+    await expect(queuedVoice).resolves.toMatchObject({ name: "AbortError" });
+    await expect(queuedDocument).resolves.toMatchObject({ name: "AbortError" });
+    await expect(queuedPhoto).resolves.toMatchObject({ name: "AbortError" });
+    // The first transfer is the only one: the queued ones never started.
+    expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(1);
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockUploadPhoto).not.toHaveBeenCalled();
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+  });
+
+  // With the jitter pinned, a retry pause is told apart from every other timer
+  // by its delay alone. retryDelayMs(1): a 250 ms base plus the jitter's share.
+  const JITTER = 0.99;
+  const firstPauseMs = 250 + Math.floor(JITTER * 250);
+
+  describe("a stop during the pause before a retry", () => {
+    // "Cut short" is proven by the pause timer being cleared, not by the wall
+    // clock.
+    let random: { mockRestore: () => void };
+    let setTimer: MockInstance;
+    let clearTimer: MockInstance;
+    beforeEach(() => {
+      random = vi.spyOn(Math, "random").mockReturnValue(JITTER);
+      setTimer = vi.spyOn(globalThis, "setTimeout");
+      clearTimer = vi.spyOn(globalThis, "clearTimeout");
+    });
+    afterEach(() => {
+      random.mockRestore();
+      setTimer.mockRestore();
+      clearTimer.mockRestore();
+    });
+
+    /** Fails an attempt and stops 20 ms into the pause that follows it. */
+    const failThenStop = (controller: AbortController, error: unknown) => async () => {
+      setTimeout(() => controller.abort(), 20);
+      throw error;
+    };
+    const fileUndefined = () => Object.assign(new Error("file is undefined"), { code: 100 });
+    const addressDenied = () => Object.assign(new Error("Access denied"), { code: 15 });
+
+    it.each([
+      {
+        name: "the upload-address request",
+        arrange: (controller: AbortController) => {
+          mockGetMessagesUploadServer.mockImplementationOnce(failThenStop(controller, addressDenied()));
+        },
+        attempts: () => mockGetMessagesUploadServer.mock.calls.length,
+      },
+      {
+        name: "a voice transfer",
+        arrange: (controller: AbortController) => {
+          mockUploadAudioMessage.mockImplementationOnce(failThenStop(controller, fileUndefined()));
+        },
+        attempts: () => mockUploadAudioMessage.mock.calls.length,
+      },
+      {
+        name: "a segment transfer of a split reply",
+        arrange: (controller: AbortController) => {
+          mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+          mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+          mockUploadAudioMessage.mockImplementationOnce(failThenStop(controller, fileUndefined()));
+        },
+        attempts: () => mockUploadAudioMessage.mock.calls.length,
+      },
+    ])("ends the send there, with no further attempt at $name", async ({ arrange, attempts }) => {
+      const controller = new AbortController();
+      arrange(controller);
+      mockMessagesSend.mockResolvedValue(88);
+
+      await expect(
+        sendAudioMessageVk("456", "/tmp/voice.ogg", "voice.ogg", "caption", {
+          cfg,
+          abortSignal: controller.signal,
+        }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+
+      // Cut short by the stop, not waited out: the one pause timer was cleared.
+      const pauses = setTimer.mock.calls.flatMap((call, index) =>
+        call[1] === firstPauseMs ? [setTimer.mock.results[index]?.value] : [],
+      );
+      expect(pauses).toHaveLength(1);
+      expect(clearTimer).toHaveBeenCalledWith(pauses[0]);
+      expect(attempts()).toBe(1);
+      expect(mockUploadDocument).not.toHaveBeenCalled();
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not start the transfer when the stop lands during the upload-address request", async () => {
+    // Nor a retry pause: the stop's own AbortError reads as retryable ("abort"
+    // is in the retryable set), and a pause on a signal already aborted would
+    // run its full length before the next attempt noticed the stop.
+    const random = vi.spyOn(Math, "random").mockReturnValue(JITTER);
+    const setTimer = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const controller = new AbortController();
+      let answerAddress!: (server: { upload_url: string }) => void;
+      mockGetMessagesUploadServer.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            answerAddress = resolve;
+          }),
+      );
+
+      const sending = sendAudioMessageVk("456", "/tmp/voice.ogg", "voice.ogg", "caption", {
+        cfg,
+        abortSignal: controller.signal,
+      });
+      await vi.waitFor(() => expect(mockGetMessagesUploadServer).toHaveBeenCalledTimes(1));
+      controller.abort();
+      answerAddress({ upload_url: "https://upload.vk.example/audio" });
+
+      await expect(sending).rejects.toMatchObject({ name: "AbortError" });
+      expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+      expect(setTimer.mock.calls.some((call) => call[1] === firstPauseMs)).toBe(false);
+    } finally {
+      random.mockRestore();
+      setTimer.mockRestore();
+    }
+  });
+
+  it("stops between the caption messages that follow a single voice", async () => {
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(60_000);
+    // 9000 characters: the first chunk rides the voice, two more follow as text.
+    mockMessagesSend.mockResolvedValueOnce(101).mockImplementationOnce(async () => {
+      controller.abort();
+      return 102;
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/voice.ogg", "voice.ogg", "a".repeat(9000), {
+        cfg,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+  });
+
+  it("counts the caption messages already sent when a stop cuts a split reply short", async () => {
+    // A stop between tail chunks is a partial delivery, and the chunks that
+    // went out are part of what was delivered.
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockResolvedValueOnce("audio_part2");
+    mockMessagesSend
+      .mockResolvedValueOnce(101)
+      .mockResolvedValueOnce(102)
+      .mockImplementationOnce(async () => {
+        controller.abort();
+        return 103;
+      });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "a".repeat(9000), {
+        cfg,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "VkPartialDeliveryError", delivered: 3, total: 4 });
+
+    // Two voices and the first tail chunk; the second tail chunk never went out.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+  });
+
+  it("sends no document when the first segment send fails without an answer from VK", async () => {
+    // VK may already show the first part of the reply; the whole recording as
+    // a document on top would repeat it.
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockResolvedValueOnce("audio_part2");
+    const failure = new Error("boom");
+    mockMessagesSend.mockRejectedValueOnce(failure);
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg }),
+    ).rejects.toMatchObject({ name: "VkSendOutcomeUnknownError", cause: failure });
+
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockCleanupAudioSegments).toHaveBeenCalledWith(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+  });
+
+  it("still sends a document when VK refuses the first segment with an error code", async () => {
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockResolvedValueOnce("audio_part2");
+    mockMessagesSend
+      .mockRejectedValueOnce(
+        Object.assign(new Error("Can't send messages for users without permission"), { code: 901 }),
+      )
+      .mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockUploadDocument).toHaveBeenCalledTimes(1);
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(getSendCall(1)).toMatchObject({ message: "caption", attachment: "doc123_789" });
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("sends a document when the splitter runs out of its own deadline", async () => {
+    // The splitter's private deadline reaches us as an AbortError (cause
+    // TimeoutError) while the gateway keeps running. That is a failed split,
+    // and a failed split of an over-limit source goes as a document.
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockRejectedValueOnce(
+      Object.assign(
+        new Error("The operation was aborted", {
+          cause: new DOMException("The operation timed out.", "TimeoutError"),
+        }),
+        { name: "AbortError", code: "ABORT_ERR" },
+      ),
+    );
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+      cfg,
+      abortSignal: controller.signal,
+    });
+
+    expect(controller.signal.aborted).toBe(false);
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockUploadDocument).toHaveBeenCalledTimes(1);
+    expect(getSendCall(0)).toMatchObject({ message: "caption", attachment: "doc123_789" });
+    expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("stops without a document when the gateway stop interrupts the splitter", async () => {
+    const controller = new AbortController();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockImplementationOnce(async () => {
+      controller.abort();
+      throw abortError();
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", {
+        cfg,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it("does not crash and falls back when probe throws", async () => {
+    mockProbeAudioDurationMs.mockRejectedValueOnce(new Error("ffprobe missing"));
+    mockMessagesSend.mockResolvedValueOnce(88);
+
+    const result = await sendAudioMessageVk("456", "/tmp/long.ogg", "long.ogg", "caption", { cfg });
+
+    expect(mockSplitAudioAtSilence).not.toHaveBeenCalled();
+    expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ messageId: "88", chatId: "456" });
   });
 });
@@ -903,6 +1792,38 @@ describe("sendPayloadVk", () => {
     );
   });
 
+  it("refuses a remote photo that exceeds the media ceiling", async () => {
+    // The photo path used to read `arrayBuffer()` with no limit at all, on the
+    // same untrusted model-supplied URL the audio path already capped.
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "4";
+    const invalidPhotoError = Object.assign(
+      new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
+      { code: 100 },
+    );
+    mockUploadPhoto.mockRejectedValueOnce(invalidPhotoError);
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: () => "image/png" },
+      body: (async function* () {
+        yield new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      })(),
+    } as unknown as Response);
+    mockMessagesSend.mockResolvedValue(77);
+
+    try {
+      await sendPayloadVk(
+        "123",
+        { text: "caption", mediaUrl: "https://example.com/big.png" },
+        { cfg },
+      );
+      // The oversized body is dropped, so no second upload attempt is made
+      // from it; delivery falls through to the document path instead.
+      expect(mockUploadPhoto).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+    }
+  });
+
   it("retries image upload with downloaded buffer when VK rejects URL source", async () => {
     const invalidPhotoError = Object.assign(
       new Error("Code №100 - One of the parameters specified was missing or invalid: photo is undefined"),
@@ -914,8 +1835,12 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "image/png",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Uint8Array.from([1, 2, 3, 4]));
+      })(),
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(34);
 
     const result = await sendPayloadVk(
@@ -964,8 +1889,12 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "image/png",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Uint8Array.from([1, 2, 3, 4]));
+      })(),
       arrayBuffer: async () => Uint8Array.from([1, 2, 3, 4]).buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(38);
 
     const result = await sendPayloadVk(
@@ -1046,8 +1975,12 @@ describe("sendPayloadVk", () => {
       headers: {
         get: () => "text/html; charset=utf-8",
       },
+      // The reader streams: it takes `body`, not `arrayBuffer()`.
+      body: (async function* () {
+        yield new Uint8Array(Buffer.from("<html>not image</html>"));
+      })(),
       arrayBuffer: async () => Buffer.from("<html>not image</html>").buffer,
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(36);
 
     const result = await sendPayloadVk(
@@ -1214,13 +2147,14 @@ describe("sendPayloadVk", () => {
     const fallbackCall = getSendCall(mockMessagesSend.mock.calls.length - 1);
     expect(fallbackCall.message).toContain("caption");
     expect(fallbackCall.message).toContain(
-      "Attachment generated, but VK token lacks media upload scopes (photos/docs).",
+      "Attachment could not be delivered; sent as text instead.",
     );
     expect(fallbackCall).not.toHaveProperty("attachment");
   });
 
   it("sends audio media through VK audio_message upload flow", async () => {
     mockMessagesSend.mockResolvedValueOnce(28);
+    stubAudioDownload();
 
     await sendPayloadVk(
       "123",
@@ -1234,9 +2168,14 @@ describe("sendPayloadVk", () => {
     expect(mockUploadAudioMessage).toHaveBeenCalledWith({
       peer_id: 123,
       source: {
-        value: "https://example.com/voice.mp3",
-        filename: "voice.mp3",
-        contentType: "audio/mpeg",
+        uploadUrl: "https://upload.vk.example/audio",
+        values: [
+          {
+            value: expect.stringContaining("vk-voice-src-"),
+            filename: "voice.mp3",
+            contentType: "audio/mpeg",
+          },
+        ],
       },
       title: "voice.mp3",
     });
@@ -1253,8 +2192,11 @@ describe("sendPayloadVk", () => {
       new Error("Code №15 - Access denied: no access to call this method. It cannot be called with current scopes."),
       { code: 15 },
     );
-    mockUploadAudioMessage.mockRejectedValueOnce(scopeError);
+    // Error 15 is retried (transient under batching); reject every attempt so
+    // the retries are exhausted and the URL-text fallback is exercised.
+    mockUploadAudioMessage.mockRejectedValue(scopeError);
     mockMessagesSend.mockResolvedValueOnce(37);
+    stubAudioDownload();
 
     const result = await sendPayloadVk(
       "123",
@@ -1273,20 +2215,238 @@ describe("sendPayloadVk", () => {
     );
   });
 
-  it("rethrows non-scope audio_message upload errors", async () => {
+  it("falls back to text when audio_message upload fails (voice is best-effort)", async () => {
     const audioError = new Error("audio upload exploded");
-    mockUploadAudioMessage.mockRejectedValueOnce(audioError);
+    mockUploadAudioMessage.mockRejectedValue(audioError);
+    mockMessagesSend.mockResolvedValueOnce(41);
+    stubAudioDownload();
+
+    const result = await sendPayloadVk(
+      "123",
+      {
+        text: "voice caption",
+        mediaUrl: "https://example.com/voice.mp3",
+      },
+      { cfg },
+    );
+
+    expect(result).toEqual({ messageId: "41", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: "voice caption\nhttps://example.com/voice.mp3",
+      }),
+    );
+  });
+
+  it("falls back to the link, not to a vk-io fetch, when the remote audio is refused", async () => {
+    // The refused download ends the media path; the reply still carries the
+    // link as text, which is not a second download.
+    process.env.VK_REMOTE_AUDIO_MAX_BYTES = "4";
+    try {
+      stubAudioDownload(16);
+      mockMessagesSend.mockResolvedValueOnce(42);
+
+      const result = await sendPayloadVk(
+        "123",
+        { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
+        { cfg },
+      );
+
+      expect(result).toEqual({ messageId: "42", chatId: "123" });
+      expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+      expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+      expect(getSendCall(0).message).toBe("voice caption\nhttps://example.com/voice.mp3");
+    } finally {
+      delete process.env.VK_REMOTE_AUDIO_MAX_BYTES;
+    }
+  });
+
+  it("does not fall back to text when the send was cancelled", async () => {
+    const controller = new AbortController();
+    stubAudioDownload();
+    mockProbeAudioDurationMs.mockImplementationOnce(async () => {
+      controller.abort();
+      throw abortError();
+    });
 
     await expect(
       sendPayloadVk(
         "123",
-        {
-          text: "voice caption",
-          mediaUrl: "https://example.com/voice.mp3",
-        },
+        { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
+        { cfg, abortSignal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(mockUploadAudioMessage).not.toHaveBeenCalled();
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it("sends nothing once a stop lands while the voice is uploading", async () => {
+    // The stop comes while the upload is in flight. VK keeps that upload — it
+    // was already accepted — but no new request may start after the stop:
+    // neither the voice message nor a text fallback in its place.
+    const controller = new AbortController();
+    stubAudioDownload();
+    let finishUpload!: (attachment: string) => void;
+    mockUploadAudioMessage.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          finishUpload = resolve;
+        }),
+    );
+    mockMessagesSend.mockResolvedValue(88);
+
+    const sending = sendPayloadVk(
+      "123",
+      { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
+      { cfg, abortSignal: controller.signal },
+    );
+    await vi.waitFor(() => expect(mockUploadAudioMessage).toHaveBeenCalledTimes(1));
+    controller.abort();
+    finishUpload("audio_message123_789");
+
+    await expect(sending).rejects.toMatchObject({ name: "AbortError" });
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Lets `promise` settle under fake timers: each retry pause fires as soon as
+   * the code schedules it, while real I/O — the downloaded copy on disk — still
+   * runs in between, which a single `runAllTimersAsync` could return ahead of.
+   */
+  async function runTimersUntilSettled(promise: Promise<unknown>): Promise<void> {
+    let settled = false;
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // Bounded: a promise that never settles fails here instead of spinning
+    // until the test times out.
+    for (let step = 0; step < 1000 && !settled; step += 1) {
+      await vi.advanceTimersToNextTimerAsync();
+    }
+    expect(settled).toBe(true);
+  }
+
+  describe("a voice message VK may already have accepted", () => {
+    // The send failed without an answer from VK. The retries reuse one
+    // random_id, so VK may have taken the voice, and the caption with the link
+    // sent as text on top would reach the recipient twice.
+    it.each([
+      { failure: "a failure with no VK code", error: () => new Error("boom"), attempts: 1 },
+      {
+        // What vk-io's own request timeout throws: node-fetch's AbortError.
+        failure: "vk-io's request timeout",
+        error: () => Object.assign(new Error("The operation was aborted."), { name: "AbortError", type: "aborted" }),
+        attempts: 3,
+      },
+      {
+        // A numeric `code` that is not VK's: 20, the legacy DOM code of AbortError.
+        failure: "a DOMException from the transport",
+        error: () => new DOMException("The operation was aborted.", "AbortError"),
+        attempts: 3,
+      },
+    ])("sends no fallback after $failure", async ({ error, attempts }) => {
+      stubAudioDownload();
+      const failure = error();
+      mockMessagesSend.mockRejectedValue(failure);
+
+      // The two slow cases retry before giving up; their pauses fire at once.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const sending = sendPayloadVk(
+        "123",
+        { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
+        { cfg },
+      );
+      try {
+        await runTimersUntilSettled(sending);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      await expect(sending).rejects.toMatchObject({ name: "VkSendOutcomeUnknownError", cause: failure });
+
+      // Only the voice itself, retried under one random_id — no text after it.
+      expect(mockMessagesSend).toHaveBeenCalledTimes(attempts);
+      const calls = mockMessagesSend.mock.calls.map(([call]) => call as VkSendCall);
+      expect(calls.every((call) => call.attachment === "audio_message123_789")).toBe(true);
+      expect(new Set(calls.map((call) => call.random_id)).size).toBe(1);
+    });
+
+    it("still falls back to text when VK refused the voice with an error code", async () => {
+      // A coded failure is VK's definite answer: the voice was not delivered.
+      stubAudioDownload();
+      mockMessagesSend
+        .mockRejectedValueOnce(
+          Object.assign(new Error("Can't send messages for users without permission"), { code: 901 }),
+        )
+        .mockResolvedValueOnce(44);
+
+      const result = await sendPayloadVk(
+        "123",
+        { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
+        { cfg },
+      );
+
+      expect(result).toEqual({ messageId: "44", chatId: "123" });
+      expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+      expect(getSendCall(1)).not.toHaveProperty("attachment");
+      expect(getSendCall(1).message).toBe("voice caption\nhttps://example.com/voice.mp3");
+    });
+  });
+
+  it("falls back to text when the voice upload times out on its own while the gateway runs", async () => {
+    // vk-io reports its own request timeout as an AbortError. With no stop from
+    // the gateway that is a failed voice like any other, and the reply still
+    // goes out as text.
+    const controller = new AbortController();
+    stubAudioDownload();
+    mockUploadAudioMessage.mockRejectedValue(
+      Object.assign(new Error("The operation was aborted."), { name: "AbortError" }),
+    );
+    mockMessagesSend.mockResolvedValueOnce(43);
+
+    // The upload retries before giving up; its pauses fire at once.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const sending = sendPayloadVk(
+      "123",
+      { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
+      { cfg, abortSignal: controller.signal },
+    );
+    try {
+      await runTimersUntilSettled(sending);
+    } finally {
+      vi.useRealTimers();
+    }
+    const result = await sending;
+
+    expect(controller.signal.aborted).toBe(false);
+    expect(result).toEqual({ messageId: "43", chatId: "123" });
+    expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+    expect(getSendCall(0).message).toBe("voice caption\nhttps://example.com/voice.mp3");
+  });
+
+  it("does not re-send a partially delivered voice reply as text", async () => {
+    stubAudioDownload();
+    mockProbeAudioDurationMs.mockResolvedValueOnce(600_000);
+    mockSplitAudioAtSilence.mockResolvedValueOnce(["/tmp/part-0.ogg", "/tmp/part-1.ogg"]);
+    mockUploadAudioMessage.mockResolvedValueOnce("audio_part1").mockResolvedValueOnce("audio_part2");
+    mockMessagesSend.mockResolvedValueOnce(101).mockRejectedValueOnce(new Error("send exploded"));
+
+    await expect(
+      sendPayloadVk(
+        "123",
+        { text: "voice caption", mediaUrl: "https://example.com/voice.mp3" },
         { cfg },
       ),
-    ).rejects.toThrow("audio upload exploded");
+    ).rejects.toMatchObject({ name: "VkPartialDeliveryError", delivered: 1, total: 2 });
+
+    // Exactly the two voice sends: no text fallback on top of what went out.
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
   });
 
   it("sends remaining text chunks after media as plain messages", async () => {
@@ -1359,7 +2519,7 @@ describe("sendPayloadVk", () => {
               : null,
       },
       body: { cancel },
-    } as Response);
+    } as unknown as Response);
     mockMessagesSend.mockResolvedValueOnce(47);
 
     const result = await sendPayloadVk(
@@ -2107,5 +3267,29 @@ describe("retry logic", () => {
 
     await expect(sendMessageVk("123", "hello", { cfg })).rejects.toThrow("rate limit");
     expect(mockMessagesSend).toHaveBeenCalledTimes(3);
+  });
+
+  it("leaves no stop listener on the account signal after a pause that ran its course", async () => {
+    // The account's stop signal lives as long as the gateway: a pause that
+    // left its listener there would add one per retry, for good.
+    const controller = new AbortController();
+    const added = vi.spyOn(controller.signal, "addEventListener");
+    const removed = vi.spyOn(controller.signal, "removeEventListener");
+    const error = Object.assign(new Error("Too many requests"), { code: 6 });
+    mockMessagesSend.mockRejectedValueOnce(error).mockResolvedValueOnce(42);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const sending = sendMessageVk("123", "hello", { cfg, abortSignal: controller.signal });
+      await vi.runAllTimersAsync();
+      await expect(sending).resolves.toMatchObject({ messageId: "42" });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const aborts = (spy: MockInstance) => spy.mock.calls.filter((call) => call[0] === "abort").length;
+    expect(mockMessagesSend).toHaveBeenCalledTimes(2);
+    expect(aborts(added)).toBe(1);
+    expect(aborts(removed)).toBe(1);
   });
 });

@@ -43,16 +43,64 @@
               "allowlist_quote"
             ]
           },
+          "audio": {
+            "type": "object",
+            "description": "Channel-wide voice limits; `settings.ts` reads `channels.vk.audio` for every account, so they are not accepted per account. `openclaw config validate` reads this schema, so the limits are typed here as well as in the zod schema.",
+            "additionalProperties": false,
+            "properties": {
+              "maxVoiceMs": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Hard cap for one voice message; VK rejects longer ones."
+              },
+              "splitDeadlineMs": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Deadline for the whole split operation."
+              },
+              "splitTimeoutMs": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Timeout for a single ffmpeg/ffprobe run."
+              },
+              "maxInputBytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Input files larger than this are not split at all."
+              },
+              "maxSegments": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Ceiling on segments: nobody listens to more voice messages than this."
+              },
+              "remoteMaxBytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Download ceiling for remote media; the URL comes from a model reply."
+              }
+            }
+          },
           "accounts": {
             "type": "object",
-            "description": "Per-account overrides. The diagnostics level is channel-wide and is not accepted here; contextVisibility is.",
+            "description": "Per-account overrides. Diagnostics and voice limits are channel-wide; contextVisibility can be overridden here.",
             "additionalProperties": {
               "type": "object",
-              "not": {
-                "required": [
-                  "diagnostics"
-                ]
-              },
+              "allOf": [
+                {
+                  "not": {
+                    "required": [
+                      "diagnostics"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "audio"
+                    ]
+                  }
+                }
+              ],
               "properties": {
                 "contextVisibility": {
                   "type": "string",

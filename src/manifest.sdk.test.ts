@@ -68,6 +68,30 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     expect(validate({ contextVisibility: { mode: "allowlist" } })).toBe(false);
   });
 
+  it("accepts the voice limits at channel level", () => {
+    expect(validate({ token: "tok", audio: { maxVoiceMs: 240_000, maxSegments: 12 } })).toBe(true);
+  });
+
+  // The limits are read from `channels.vk.audio` for every account, so an
+  // account block would be a setting that silently does nothing.
+  it("rejects voice limits under an account", () => {
+    expect(validate({ accounts: { work: { token: "tok", audio: { maxSegments: 4 } } } })).toBe(false);
+  });
+
+  it("rejects an unknown key inside audio", () => {
+    expect(validate({ audio: { maxSegments: 4, maxChunks: 4 } })).toBe(false);
+  });
+
+  it("rejects an audio value that is not an object", () => {
+    expect(validate({ audio: 240_000 })).toBe(false);
+  });
+
+  it("rejects a non-positive or fractional voice limit", () => {
+    expect(validate({ audio: { maxSegments: 0 } })).toBe(false);
+    expect(validate({ audio: { maxVoiceMs: -1 } })).toBe(false);
+    expect(validate({ audio: { splitTimeoutMs: 1.5 } })).toBe(false);
+  });
+
   it("still accepts an ordinary account and keys it does not describe", () => {
     // The root stays open: tightening it would fail existing configs on keys the
     // manifest has never listed.
