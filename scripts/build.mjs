@@ -1,34 +1,18 @@
-import { rmSync } from "node:fs";
+import { globSync, rmSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const entryPoints = [
   "index.ts",
   "setup-entry.ts",
   "api.ts",
   "doctor-contract-api.ts",
-  "src/accounts.ts",
-  "src/channel.setup.ts",
-  "src/channel.ts",
-  "src/config-schema.ts",
-  "src/audio-chunk.ts",
-  "src/vk-errors.ts",
-  "src/settings.ts",
-  "src/diagnostics.ts",
-  "src/stall-watchdog.ts",
-  "src/format.ts",
-  "src/inbound.ts",
-  "src/keyboard.ts",
-  "src/media.ts",
-  "src/monitor.ts",
-  "src/probe.ts",
-  "src/reactions-controller.ts",
-  "src/runtime.ts",
-  "src/sanitize.ts",
-  "src/send-support.ts",
-  "src/send.ts",
-  "src/setup-core.ts",
-  "src/setup-surface.ts",
-  "src/types.ts",
+  ...globSync("src/*.ts", { cwd: root }).filter(
+    (file) => !file.endsWith(".test.ts") && file !== "src/test-helpers.ts",
+  ).sort(),
 ];
 
 rmSync("dist", { recursive: true, force: true });

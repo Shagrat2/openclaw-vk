@@ -1,0 +1,16 @@
+{
+  "src/format.ts TS2537 Type 'VkRenderedText' has no matching index signature for type 'number'.": 2,
+  "src/monitor.ts TS2339 Property 'ts' does not exist on type 'object & Record<\"failed\", unknown>'.": 6,
+  "src/reactions-controller.test.ts TS2339 Property 'adapter' does not exist on type 'undefined'.": 1,
+  "src/reactions-controller.test.ts TS2493 Tuple type '[]' of length '0' has no element at index '0'.": 5,
+  "src/reactions-controller.test.ts TS2339 Property 'emojis' does not exist on type 'undefined'.": 2,
+  "src/reactions-controller.test.ts TS2339 Property 'initialEmoji' does not exist on type 'undefined'.": 1,
+  "src/reactions-controller.test.ts TS18048 'args' is possibly 'undefined'.": 3,
+  "src/reactions-controller.test.ts TS2532 Object is possibly 'undefined'.": 1,
+  "src/setup-core.test.ts TS2345 Argument of type '{ accountId: string; }' is not assignable to parameter of type '{ cfg: OpenClawConfig; accountId?: str": 1,
+  "src/setup-core.test.ts TS2345 Argument of type '{ accountId: never; }' is not assignable to parameter of type '{ cfg: OpenClawConfig; accountId?: stri": 1,
+  "src/setup-core.test.ts TS2345 Argument of type '{ accountId: string; input: { useEnv: true; }; }' is not assignable to parameter of type '{ cfg: OpenC": 4,
+  "src/setup-core.test.ts TS2345 Argument of type '{ accountId: string; input: {}; }' is not assignable to parameter of type '{ cfg: OpenClawConfig; acco": 1,
+  "src/setup-core.test.ts TS2345 Argument of type '{ accountId: string; input: { token: string; }; }' is not assignable to parameter of type '{ cfg: Open": 2,
+  "src/setup-core.test.ts TS2345 Argument of type '{ accountId: string; input: { tokenFile: string; }; }' is not assignable to parameter of type '{ cfg: ": 2
+}

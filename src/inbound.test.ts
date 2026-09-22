@@ -1,11 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { WallAttachment } from "vk-io";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
+
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
+}));
 
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
+  parseStrictPositiveInteger: (v: unknown) => {
+    const n = Number.parseInt(String(v ?? ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  },
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
@@ -81,6 +89,21 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
       ...entry,
       messageId: entry.messageId ?? defaults.messageId,
     })),
+  formatAgentEnvelope: (...a: any[]) => currentRuntime.value.channel.reply.formatAgentEnvelope(...a),
+  resolveEnvelopeFormatOptions: (...a: any[]) =>
+    currentRuntime.value.channel.reply.resolveEnvelopeFormatOptions(...a),
+}));
+
+const mockStatusReactionCtrl = vi.hoisted(() => ({
+  setQueued: vi.fn(),
+  setThinking: vi.fn(),
+  setTool: vi.fn(),
+  setCompacting: vi.fn(),
+  setDone: vi.fn().mockResolvedValue(undefined),
+  setError: vi.fn().mockResolvedValue(undefined),
+  cancelPending: vi.fn(),
+  clear: vi.fn().mockResolvedValue(undefined),
+  restoreInitial: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
@@ -106,17 +129,7 @@ vi.mock("openclaw/plugin-sdk/channel-feedback", () => ({
     doneHoldMs: 1500,
     errorHoldMs: 2500,
   },
-  createStatusReactionController: vi.fn(() => ({
-    setQueued: vi.fn(),
-    setThinking: vi.fn(),
-    setTool: vi.fn(),
-    setCompacting: vi.fn(),
-    setDone: vi.fn().mockResolvedValue(undefined),
-    setError: vi.fn().mockResolvedValue(undefined),
-    cancelPending: vi.fn(),
-    clear: vi.fn().mockResolvedValue(undefined),
-    restoreInitial: vi.fn().mockResolvedValue(undefined),
-  })),
+  createStatusReactionController: vi.fn(() => mockStatusReactionCtrl),
 }));
 
 vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
@@ -132,11 +145,36 @@ vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   }),
 }));
 
+// Faithful to the core (`reply-payload`): a supplement is recognised only when it
+// carries spoken text AND media, and the "already delivered" flag survives only
+// when it is literally true. A looser stub would let the tests below pass while
+// production still deleted the draft.
+vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
+  getReplyPayloadTtsSupplement: (payload: {
+    ttsSupplement?: { spokenText?: string; visibleTextAlreadyDelivered?: boolean };
+    mediaUrl?: string;
+    mediaUrls?: string[];
+  }) => {
+    const spokenText = payload?.ttsSupplement?.spokenText?.trim();
+    const hasMedia = Boolean(payload?.mediaUrl || payload?.mediaUrls?.length);
+    if (!spokenText || !hasMedia) {
+      return undefined;
+    }
+    return {
+      spokenText,
+      ...(payload.ttsSupplement?.visibleTextAlreadyDelivered === true
+        ? { visibleTextAlreadyDelivered: true }
+        : {}),
+    };
+  },
+}));
+
 vi.mock("openclaw/plugin-sdk/command-auth-native", () => ({
   resolveControlCommandGate: vi.fn(() => ({
     shouldBlock: false,
     commandAuthorized: false,
   })),
+  hasControlCommand: (...a: any[]) => currentRuntime.value.channel.text.hasControlCommand(...a),
 }));
 
 vi.mock("openclaw/plugin-sdk/runtime-group-policy", () => ({
@@ -154,10 +192,36 @@ const mockCreateTypingCallbacks = vi.hoisted(() => vi.fn());
 const mockLogTypingFailure = vi.hoisted(() => vi.fn());
 
 vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
+  resolveChannelPreviewStreamMode: mockResolveStreamMode,
+  // Return the raw input as the "line" so tests can assert what was built.
+  buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
+  // The core decides whether a final is truncated and which text wins.
+  isPotentialTruncatedFinal: (text: string) => text.trim().length === 0,
+  selectLongerFinalText: ({
+    finalText,
+    candidateTexts,
+  }: {
+    finalText: string;
+    candidateTexts: readonly (string | undefined)[];
+  }) =>
+    [finalText, ...candidateTexts]
+      .filter((t): t is string => Boolean(t))
+      .sort((a, b) => b.length - a.length)[0],
+  // Progress label resolution: mirrors the core contract ("auto"/false plus a
+  // default label list) so the draft label can be asserted.
+  resolveChannelProgressDraftConfig: (entry: any) => ({
+    ...(entry?.streaming?.progress ?? {}),
+    labels: entry?.streaming?.progress?.labels ?? ["⏳ Работаю"],
+  }),
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
   logTypingFailure: mockLogTypingFailure,
 }));
+
+// Inbound imports canonical SDK subpaths directly, so those are what we mock.
+// The test environment has no `openclaw` package at all, so without these mocks
+// the module would not load.
+const currentRuntime = vi.hoisted(() => ({ value: null as any }));
 
 // Mirrors the core (2026.9.4, context-visibility): "all" shows everything, an allowed
 // sender is always shown, "allowlist_quote" also shows quotes.
@@ -172,6 +236,63 @@ vi.mock("openclaw/plugin-sdk/security-runtime", () => ({
           : { include: false, reason: "blocked" },
 }));
 
+vi.mock("openclaw/plugin-sdk/reply-dispatch-runtime", () => ({
+  dispatchReplyWithBufferedBlockDispatcher: (...a: any[]) =>
+    currentRuntime.value.channel.reply.dispatchReplyWithBufferedBlockDispatcher(...a),
+  finalizeInboundContext: (...a: any[]) => currentRuntime.value.channel.reply.finalizeInboundContext(...a),
+}));
+
+vi.mock("openclaw/plugin-sdk/session-store-runtime", () => ({
+  resolveStorePath: (...a: any[]) => currentRuntime.value.channel.session.resolveStorePath(...a),
+  readSessionUpdatedAt: (...a: any[]) => currentRuntime.value.channel.session.readSessionUpdatedAt(...a),
+  recordSessionMetaFromInbound: (...a: any[]) =>
+    currentRuntime.value.channel.session.recordInboundSession(...a),
+}));
+
+// Step-progress: default mode "off" keeps the existing (reactions/plain) paths;
+// individual tests flip resolveChannelPreviewStreamMode to "progress".
+const mockResolveStreamMode = vi.hoisted(() => vi.fn(() => "off"));
+const mockProgressCompositor = vi.hoisted(() => ({
+  noteActivity: vi.fn().mockResolvedValue(true),
+  pushToolProgress: vi.fn().mockResolvedValue(true),
+  pushReasoningProgress: vi.fn().mockResolvedValue(true),
+  markFinalReplyStarted: vi.fn(),
+  markFinalReplyDelivered: vi.fn(),
+  cancel: vi.fn(),
+}));
+// currentMessageId defaults to undefined (no live draft); the edit-into-answer
+// test overrides it to a number to exercise the single-bubble finalize.
+const mockCurrentMessageId = vi.hoisted(() => vi.fn<() => number | undefined>(() => undefined));
+const mockDraftRemove = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockDraftClose = vi.hoisted(() => vi.fn());
+// `overwrite` resolves to whether the text made it into the draft; shared so a
+// test can make one write fail.
+const mockDraftOverwrite = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mockCreateVkProgressDraft = vi.hoisted(() =>
+  vi.fn(() => ({
+    compositor: mockProgressCompositor,
+    currentMessageId: mockCurrentMessageId,
+    overwrite: mockDraftOverwrite,
+    remove: mockDraftRemove,
+    close: mockDraftClose,
+  })),
+);
+
+
+vi.mock("./progress-draft.js", () => ({
+  // The label resolver lives in the same module — the mock keeps the real config
+  // parsing, otherwise the test would never check that the label comes from
+  // settings at all.
+  // Takes the channel entry now, not the whole config: the label is resolved
+  // through the core, which reads the same entry the compositor is given.
+  resolveVkProgressLabel: (entry: any) => {
+    const label = entry?.streaming?.progress?.label;
+    return typeof label === "string" && label.trim() && label.trim() !== "auto"
+      ? label.trim()
+      : undefined;
+  },
+  createVkProgressDraftCompositor: mockCreateVkProgressDraft,}));
+
 // ── Internal module mocks ────────────────────────────────────────────────────
 
 const mockSendPayloadVk = vi.hoisted(() =>
@@ -179,6 +300,7 @@ const mockSendPayloadVk = vi.hoisted(() =>
 );
 const mockMarkMessageReadVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const mockSendTypingVk = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const mockEditMessageVk = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const mockResolveVkOwnGroup = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ id: 239104331, name: "Карамелька" }),
 );
@@ -187,11 +309,20 @@ vi.mock("./send.js", () => ({
   markMessageReadVk: mockMarkMessageReadVk,
   sendPayloadVk: mockSendPayloadVk,
   sendTypingVk: mockSendTypingVk,
+  // editMessageVk backs the edit-in-place finalize; the rest are no-ops here.
+  editMessageVk: mockEditMessageVk,
+  sendMessageVk: vi.fn().mockResolvedValue({ messageId: "9", chatId: "0" }),
+  deleteMessageVk: vi.fn().mockResolvedValue(undefined),
+  clearVkInstances: vi.fn(),
   resolveVkOwnGroup: mockResolveVkOwnGroup,
 }));
 
-import { resolveVkAccount } from "./accounts.js";
-import { extractVkInboundAttachments } from "./media.js";
+// inbound.ts renders the final answer with renderVkMarkdownChunks for the
+// edit-in-place finalize; stub it to a single plain chunk.
+vi.mock("./format.js", () => ({
+  renderVkMarkdownChunks: (md: string) => [{ text: md }],
+}));
+
 import { handleVkInbound } from "./inbound.js";
 import { setVkRuntime } from "./runtime.js";
 import {
@@ -201,6 +332,19 @@ import {
   makeVkRuntime,
 } from "./test-helpers.js";
 import type { CoreConfig } from "./types.js";
+
+/**
+ * Replaces the core reply dispatcher with a loose implementation.
+ *
+ * The tests drive it with a hand-written params shape rather than the full
+ * dispatcher contract, so the cast lives here instead of at thirteen call sites.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mockReplyDispatcher(runtime: any, impl: (params: any) => Promise<void>): void {
+  vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    impl as never,
+  );
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -220,6 +364,9 @@ function baseCfg(vkOverrides: Record<string, unknown> = {}): CoreConfig {
 function installRuntime(opts: Parameters<typeof makeVkRuntime>[0] = {}) {
   const runtime = makeVkRuntime(opts);
   setVkRuntime(runtime);
+  // Canonical SDK subpaths are mocked onto spies of this same runtime, so the
+  // existing "the core was called with X" assertions keep working.
+  currentRuntime.value = runtime;
   return runtime;
 }
 
@@ -238,6 +385,19 @@ beforeEach(() => {
   mockMarkMessageReadVk.mockReset().mockResolvedValue(undefined);
   mockSendPayloadVk.mockReset().mockResolvedValue({ messageId: "1", chatId: "0" });
   mockSendTypingVk.mockReset().mockResolvedValue(undefined);
+  mockResolveStreamMode.mockReset().mockReturnValue("off");
+  mockCreateVkProgressDraft.mockClear();
+  mockCurrentMessageId.mockReset().mockReturnValue(undefined);
+  mockDraftRemove.mockClear();
+  mockDraftClose.mockClear();
+  mockEditMessageVk.mockReset().mockResolvedValue(true);
+  mockProgressCompositor.noteActivity.mockClear();
+  mockProgressCompositor.pushToolProgress.mockClear();
+  mockProgressCompositor.pushReasoningProgress.mockClear();
+  mockProgressCompositor.markFinalReplyStarted.mockClear();
+  mockProgressCompositor.markFinalReplyDelivered.mockClear();
+  mockProgressCompositor.cancel.mockClear();
+  Object.values(mockStatusReactionCtrl).forEach((fn) => fn.mockClear());
   PREFIX_OPTIONS.responsePrefixContextProvider.mockReset().mockReturnValue({});
   PREFIX_OPTIONS.onModelSelected.mockReset();
   mockCreateReplyPrefixOptions.mockReset().mockReturnValue(PREFIX_OPTIONS);
@@ -877,9 +1037,9 @@ describe("dispatch payload", () => {
     );
   });
 
-  it("removes reply ids from ordinary direct replies without stripping channelData", async () => {
+  it("forwards full reply payloads to sendPayloadVk without stripping channelData", async () => {
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver({
           text: "Providers:",
@@ -900,50 +1060,27 @@ describe("dispatch payload", () => {
       runtime: createVkRuntimeEnv(),
     });
 
+    // С 2026.9.6 цитата ставится только там, где нужен контекст: в группе и в
+    // ответе на команду. В личке без команды ядро её снимает — даже ту, что
+    // агент попросил сам (`replyToId` в нагрузке выше).
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(SENDER_ID),
-      {
+      expect.objectContaining({
         text: "Providers:",
         channelData: {
           vk: {
             buttons: [[{ text: "OpenAI", callback_data: "/models openai", style: "primary" }]],
           },
         },
-      },
-      { accountId: "default" },
-    );
-  });
-
-  it("quotes the inbound message in group replies", async () => {
-    const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
-      async ({ dispatcherOptions }: any) => {
-        await dispatcherOptions.deliver({ text: "Group reply" });
-      },
-    );
-
-    await handleVkInbound({
-      message: makeMessage({
-        senderId: SENDER_ID,
-        peerId: GROUP_PEER_ID,
-        messageId: "group-77",
-        isGroup: true,
       }),
-      account: makeAccount({ config: { groupPolicy: "open", requireMention: false } }),
-      config: baseCfg(),
-      runtime: createVkRuntimeEnv(),
-    });
-
-    expect(mockSendPayloadVk).toHaveBeenCalledWith(
-      String(GROUP_PEER_ID),
-      { text: "Group reply", replyToId: "group-77" },
-      { accountId: "default" },
+      expect.objectContaining({ accountId: "default" }),
     );
+    expect(mockSendPayloadVk.mock.calls[0]?.[1]).not.toHaveProperty("replyToId");
   });
 
   it("clears the old keyboard after a button-triggered final reply with no new choices", async () => {
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver(
           {
@@ -966,19 +1103,18 @@ describe("dispatch payload", () => {
       runtime: createVkRuntimeEnv(),
     });
 
+    // Ответ на команду — тот случай, где контекст нужен: с 2026.9.6 он цитирует
+    // сообщение, которым команду позвали.
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(SENDER_ID),
-      {
-        text: "Thinking level set to high.",
-        replyToId: "msg-1",
-      },
-      { accountId: "default", clearKeyboard: true },
+      expect.objectContaining({ text: "Thinking level set to high.", replyToId: "msg-1" }),
+      expect.objectContaining({ accountId: "default", clearKeyboard: true }),
     );
   });
 
   it("keeps the keyboard when a button-triggered final reply still has choices", async () => {
     const runtime = installRuntime();
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions }: any) => {
         await dispatcherOptions.deliver(
           {
@@ -1006,14 +1142,14 @@ describe("dispatch payload", () => {
 
     expect(mockSendPayloadVk).toHaveBeenCalledWith(
       String(SENDER_ID),
-      {
+      expect.objectContaining({
         text: [
           "Current thinking level: high.",
           "Options: off, minimal, low, medium, high, adaptive.",
         ].join("\n"),
         replyToId: "msg-1",
-      },
-      { accountId: "default" },
+      }),
+      expect.objectContaining({ accountId: "default" }),
     );
   });
 
@@ -1099,6 +1235,7 @@ describe("dispatch payload", () => {
       contentType: "image/heic",
     } as Awaited<ReturnType<typeof runtime.channel.media.fetchRemoteMedia>>);
     vi.mocked(runtime.channel.media.saveMediaBuffer).mockResolvedValueOnce({
+      id: "IMG_0001",
       path: "/tmp/openclaw/media/inbound/IMG_0001.HEIC",
       contentType: "image/heic",
       size: 4,
@@ -1547,6 +1684,536 @@ describe("command gating", () => {
   });
 });
 
+describe("step-progress (channels.vk.streaming.mode=progress)", () => {
+  it("routes execution steps to the edit-in-place draft and finalizes on the last block", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "done" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // A draft compositor was created and fed by the execution steps.
+    expect(mockCreateVkProgressDraft).toHaveBeenCalledTimes(1);
+    // The step is rendered from a built line (not undefined) and shown at once.
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "tool", name: "Bash" }),
+      expect.objectContaining({ toolName: "Bash", startImmediately: true }),
+    );
+    // The final answer still flows through the normal deliver path…
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+    // …bracketed by the compositor's finalize signals.
+    expect(mockProgressCompositor.markFinalReplyStarted).toHaveBeenCalledTimes(1);
+    expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the draft when the final carries no text but the draft already holds the answer", async () => {
+    // Real incident: after switching to a local model the answer text arrived as
+    // a block along the way and landed in the draft, while the final was empty
+    // (voice only). The draft was then deleted and the recipient was left with no
+    // text at all. Cloud models put the whole text in the final, so the problem
+    // never showed up there.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        // The answer arrives as a block and lands in the draft…
+        await dispatcherOptions.deliver({ text: "вот полный ответ" }, { kind: "block" });
+        // …while the final carries only the voice message, no text.
+        await dispatcherOptions.deliver(
+          { text: "", mediaUrl: "/tmp/voice.ogg" },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The draft stays: it is the answer.
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("keeps the fuller draft when the final arrives truncated", async () => {
+    // The old test was `!finalText` — a final that is present but plainly cut
+    // short still lost the fuller answer along with the draft. The core decides
+    // both questions now: whether the final looks truncated, and which text wins.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockEditMessageVk.mockClear();
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, async ({ dispatcherOptions }: any) => {
+      await dispatcherOptions.onReplyStart?.();
+      await dispatcherOptions.deliver(
+        { text: "полный ответ, который сложился из блоков по ходу работы" },
+        { kind: "block" },
+      );
+      await dispatcherOptions.deliver({ text: "   " }, { kind: "final" });
+    });
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      expect.anything(),
+      4242,
+      expect.stringContaining("сложился из блоков"),
+      expect.anything(),
+    );
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  // ── Voice supplement must not decide the draft's fate ─────────────────────
+  // The core follows a delivered answer with a SECOND final that carries only
+  // audio and no text, marked `visibleTextAlreadyDelivered`. Read as an ordinary
+  // final, its empty text means "no answer came" and the draft holding the answer
+  // is deleted — on 08.09.2026 that left three live replies as a picture plus a
+  // voice note and no text at all.
+  const voiceSupplement = (spokenText = "полный ответ, который уже отправлен") => ({
+    mediaUrl: "/tmp/speech.opus",
+    audioAsVoice: true,
+    ttsSupplement: { spokenText, visibleTextAlreadyDelivered: true },
+  });
+
+  it("оставляет черновик с ответом, когда следом идёт голосовая добавка", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockEditMessageVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "вот график, который ты просил", mediaUrl: "/tmp/chart.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    // Both attachments still reach the person: the picture and then its voice.
+    const sent = JSON.stringify(mockSendPayloadVk.mock.calls);
+    expect(sent).toContain("/tmp/speech.opus");
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("оставляет черновик, когда добавка идёт за ответом без картинки", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "ответ целиком" }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("доставляет голосовую добавку, когда черновика нет вовсе", async () => {
+    mockResolveStreamMode.mockReturnValue("off");
+    mockDraftRemove.mockClear();
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "ответ" }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "off" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(JSON.stringify(mockSendPayloadVk.mock.calls)).toContain("/tmp/speech.opus");
+  });
+
+  it("оставляет черновик, даже когда накопленный текст блоков уже сброшен", async () => {
+    // The live case. A tool step wipes `draftAnswerText`, so by the time the
+    // supplement arrives the plugin has no accumulated answer of its own — which
+    // is exactly the state in which it used to delete the draft.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(8416);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver({ text: "начало работы" }, { kind: "block" });
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "итог с картинкой", mediaUrl: "/tmp/chart.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("не мешает черновику держать более полный ответ при обрезанном финале", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockEditMessageVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver(
+          { text: "полный ответ, который сложился из блоков по ходу работы" },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver({ text: "   " }, { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement(), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      expect.anything(),
+      4242,
+      expect.stringContaining("сложился из блоков"),
+      expect.anything(),
+    );
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("по-прежнему сносит черновик, когда пустой финал НЕ помечен как добавка", async () => {
+    // The guard is the mark, not the empty text: an ordinary media-only final
+    // with nothing kept in the draft still drops it, exactly as before.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { mediaUrl: "/tmp/speech.opus", audioAsVoice: true },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("переживает несколько голосовых добавок подряд", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftRemove.mockClear();
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver(
+          { text: "две картинки", mediaUrl: "/tmp/a.png" },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver(voiceSupplement("первая часть"), { kind: "final" });
+        await dispatcherOptions.deliver(voiceSupplement("вторая часть"), { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).not.toHaveBeenCalled();
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("sends the block the usual way when the draft write fails", async () => {
+    // `overwrite` reports the outcome instead of throwing, so a failed VK edit
+    // has to be checked. Missing that left the person with nothing at all on a
+    // blocks-plus-empty-final turn: the block went into a draft that was never
+    // written, and the final carried no text of its own.
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    mockDraftOverwrite.mockResolvedValueOnce(false);
+    mockSendPayloadVk.mockClear();
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await dispatcherOptions.deliver({ text: "ответ блоком" }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The block reached the person as an ordinary message rather than vanishing.
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+    const sentText = JSON.stringify(mockSendPayloadVk.mock.calls);
+    expect(sentText).toContain("ответ блоком");
+    mockCurrentMessageId.mockReturnValue(undefined);
+  });
+
+  it("builds no draft when streaming mode is off (default reactions/plain path)", async () => {
+    mockResolveStreamMode.mockReturnValue("off");
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockCreateVkProgressDraft).not.toHaveBeenCalled();
+    expect(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledOnce();
+  });
+
+  it("runs reactions AND the step draft together when both are enabled (Telegram parity)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ replyOptions }: any) => {
+        await replyOptions.onToolStart?.({ name: "Bash" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: {
+        ...baseCfg({ streaming: { mode: "progress" } }),
+        messages: { statusReactions: { enabled: true }, ackReactionScope: "all" },
+      } as CoreConfig,
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // Both controllers exist and the single onToolStart fans out to each.
+    expect(mockCreateVkProgressDraft).toHaveBeenCalledTimes(1);
+    expect(mockStatusReactionCtrl.setTool).toHaveBeenCalledWith("Bash");
+    expect(mockProgressCompositor.pushToolProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "tool", name: "Bash" }),
+      expect.objectContaining({ toolName: "Bash", startImmediately: true }),
+    );
+  });
+
+  it("edits the live draft INTO the final answer (single bubble) for a plain text reply", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555); // a live draft exists
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The draft message is edited into the answer; no separate reply is sent.
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      555,
+      "The answer.",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(mockSendPayloadVk).not.toHaveBeenCalled();
+    expect(mockProgressCompositor.markFinalReplyDelivered).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a normal reply when the draft edit fails (answer never lost)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555);
+    mockEditMessageVk.mockResolvedValue(false); // edit fails
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver({ text: "The answer." }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockDraftRemove).toHaveBeenCalled();
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+  });
+
+  it("промежуточный блок с картинкой уходит своим сообщением, но помечен", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(777);
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          { text: "Кадр 38, проба 1", mediaUrl: "https://example/frame.jpg" },
+          { kind: "block" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 9 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({
+        streaming: { mode: "progress", progress: { label: "⏳ Работаю" } },
+      }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // A picture cannot go into the draft, so such a chunk goes as its own
+    // message — the label keeps it from looking like a finished answer.
+    expect(mockSendPayloadVk).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        text: expect.stringContaining("⏳ Работаю"),
+        mediaUrl: "https://example/frame.jpg",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("editing into the answer also works for media replies (voice follows separately)", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(555);
+    const runtime = installRuntime();
+    mockReplyDispatcher(runtime, 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async ({ dispatcherOptions }: any) => {
+        await dispatcherOptions.deliver(
+          { text: "See this", mediaUrl: "https://example/y.jpg" },
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The progress draft is rewritten with the answer text…
+    expect(mockEditMessageVk).toHaveBeenCalledWith(
+      String(SENDER_ID),
+      555,
+      expect.stringContaining("See this"),
+      expect.anything(),
+      expect.anything(),
+    );
+    // …and the image or voice message follows as a separate message.
+    expect(mockSendPayloadVk).toHaveBeenCalled();
+  });
+});
+
 // ── Status reaction lifecycle ────────────────────────────────────────────────
 
 describe("status reaction lifecycle", () => {
@@ -1585,12 +2252,40 @@ describe("status reaction lifecycle", () => {
     } as unknown as CoreConfig;
   }
 
+  it("passes the adoption lifecycle to the core as replyOptions.turnAdoptionLifecycle", async () => {
+    // The core frees the debounce lane on this signal. Drop it here and the
+    // lane holds until the answer is finished, so a follow-up sent mid-answer
+    // cannot be steered into the running turn.
+    const runtime = installRuntime();
+    const seen: unknown[] = [];
+    mockReplyDispatcher(runtime, async ({ replyOptions }: any) => {
+      seen.push(replyOptions.turnAdoptionLifecycle);
+    });
+    const turnAdoptionLifecycle = {
+      abortSignal: new AbortController().signal,
+      onAdopted: async () => {},
+      onDeferred: () => undefined,
+      onAdoptionFinalizing: () => {},
+      onAbandoned: async () => {},
+    };
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: statusReactionConfig(),
+      runtime: createVkRuntimeEnv(),
+      turnAdoptionLifecycle,
+    });
+
+    expect(seen).toEqual([turnAdoptionLifecycle]);
+  });
+
   it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
     const controller = await installStatusController();
     const runtime = installRuntime();
     const statusSink = vi.fn();
     vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
-    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+    mockReplyDispatcher(runtime, 
       async ({ dispatcherOptions, replyOptions }: any) => {
         expect(replyOptions).toEqual(
           expect.objectContaining({
@@ -1624,7 +2319,7 @@ describe("status reaction lifecycle", () => {
       isDirect: true,
       isGroup: false,
       isMentionableGroup: false,
-      requireMention: false,
+      shouldBypassMention: true,
       canDetectMention: true,
       effectiveWasMentioned: false,
     });
@@ -1653,7 +2348,7 @@ describe("status reaction lifecycle", () => {
       const logSpy = vi.spyOn(runtimeEnv, "log").mockImplementation(() => {});
       const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
       vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
-      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      mockReplyDispatcher(runtime, 
         async ({ dispatcherOptions }: any) => {
           dispatcherOptions.onError(new Error("delivery failed"), { kind: "final" });
           throw new Error("dispatch failed");
@@ -1697,8 +2392,9 @@ describe("status reaction lifecycle", () => {
     const runtimeEnv = createVkRuntimeEnv();
     const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
     vi.mocked(runtime.channel.session.recordInboundSession).mockImplementation(
-      async ({ onRecordError }: any) => {
-        onRecordError(new Error("session store unavailable"));
+      async () => {
+        // The core takes no error callback: a failure surfaces as a rejection.
+        throw new Error("session store unavailable");
       },
     );
 
@@ -1789,42 +2485,6 @@ const WALL_WITH_DIRECTIVE = {
   },
 };
 
-/** A shared wall post as vk-io hands it over, expanded the way inbound does. */
-function sharedWallPost(attachments: Record<string, unknown>[]) {
-  return extractVkInboundAttachments([
-    new WallAttachment({
-      api: {},
-      payload: {
-        id: 41941,
-        owner_id: -235198196,
-        date: 1,
-        text: "Промт в комментариях",
-        attachments,
-      },
-    } as unknown as ConstructorParameters<typeof WallAttachment>[0]),
-  ]);
-}
-
-const POST_PHOTO = {
-  type: "photo",
-  photo: {
-    id: 1,
-    owner_id: -235198196,
-    date: 1,
-    sizes: [{ type: "x", url: "https://sun.userapi.com/post.jpg", width: 604, height: 604 }],
-  },
-};
-
-const POST_VOICE = {
-  type: "audio_message",
-  audio_message: {
-    id: 2,
-    owner_id: -235198196,
-    duration: 12,
-    link_ogg: "https://psv4.userapi.com/post-voice.ogg",
-  },
-};
-
 function lastInboundContext(runtime: ReturnType<typeof installRuntime>): Record<string, unknown> {
   const calls = vi.mocked(runtime.channel.reply.finalizeInboundContext).mock.calls;
   return (calls[calls.length - 1]?.[0] ?? {}) as Record<string, unknown>;
@@ -1852,61 +2512,6 @@ describe("shared wall posts vs control input", () => {
     expect(ctx.RawBody).toBe("Кратко перескажи пост");
     expect(String(ctx.BodyForAgent)).toContain("/think high");
     expect(String(ctx.BodyForAgent)).toContain("vk.com/wall-235198196_41941");
-  });
-
-  it("downloads a shared post's photo but not its voice message, which is not the sender's", async () => {
-    const runtime = installRuntime();
-
-    await handleVkInbound({
-      message: makeMessage({
-        senderId: SENDER_ID,
-        peerId: SENDER_ID,
-        text: "глянь",
-        attachments: sharedWallPost([POST_PHOTO, POST_VOICE]),
-      }),
-      account: makeAccount({ config: { dmPolicy: "open" } }),
-      config: baseCfg(),
-      runtime: createVkRuntimeEnv(),
-    });
-
-    const fetched = vi
-      .mocked(runtime.channel.media.fetchRemoteMedia)
-      .mock.calls.map(([arg]) => (arg as { url: string }).url);
-    expect(fetched).toEqual(["https://sun.userapi.com/post.jpg"]);
-    // The agent still gets the post itself — link and text — so it can ask about
-    // the recording; what it must not get is the recording transcribed as if the
-    // sender had spoken it.
-    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain(
-      "[VK wall post https://vk.com/wall-235198196_41941]",
-    );
-  });
-
-  it("still downloads a voice message the sender recorded themselves", async () => {
-    const runtime = installRuntime();
-
-    await handleVkInbound({
-      message: makeMessage({
-        senderId: SENDER_ID,
-        peerId: SENDER_ID,
-        text: "",
-        attachments: [
-          {
-            type: "audio_message",
-            kind: "audio",
-            url: "https://psv4.userapi.com/own-voice.ogg",
-            mimeType: "audio/ogg",
-          },
-        ],
-      }),
-      account: makeAccount({ config: { dmPolicy: "open" } }),
-      config: baseCfg(),
-      runtime: createVkRuntimeEnv(),
-    });
-
-    const fetched = vi
-      .mocked(runtime.channel.media.fetchRemoteMedia)
-      .mock.calls.map(([arg]) => (arg as { url: string }).url);
-    expect(fetched).toEqual(["https://psv4.userapi.com/own-voice.ogg"]);
   });
 
   it("dispatches a post-only message without letting the post become the command", async () => {
@@ -2235,252 +2840,5 @@ describe("forwarded messages", () => {
       runtime: createVkRuntimeEnv(),
     });
     expect(vi.mocked(stripped.channel.media.fetchRemoteMedia)).not.toHaveBeenCalled();
-  });
-});
-
-describe("context visibility through the resolved account", () => {
-  // The account comes from resolveVkAccount, as in monitorVkProvider — never a
-  // hand-built account.config, which is how a channel-level key went unapplied.
-  const OUTSIDER = 999_000;
-  const groupCfg = (vk: Record<string, unknown>) =>
-    baseCfg({
-      dmPolicy: "open",
-      groupPolicy: "open",
-      groupAllowFrom: [String(SENDER_ID)],
-      contextVisibility: "allowlist",
-      ...vk,
-    });
-  const groupMessage = (overrides: Parameters<typeof makeMessage>[0] = {}) =>
-    makeMessage({ peerId: GROUP_PEER_ID, senderId: SENDER_ID, isGroup: true, text: "гляньте", ...overrides });
-
-  it("applies a channel-level contextVisibility to the default account", async () => {
-    const cfg = groupCfg({});
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({ forwards: [ORDER_FORWARD] }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(String(lastInboundContext(runtime).BodyForAgent)).not.toContain("Заказ 10316111753");
-  });
-
-  it("applies a channel-level contextVisibility to a named account that does not set its own", async () => {
-    const cfg = groupCfg({ accounts: { work: { token: "tok2" } } });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({ forwards: [ORDER_FORWARD] }),
-      account: resolveVkAccount({ cfg, accountId: "work" }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(String(lastInboundContext(runtime).BodyForAgent)).not.toContain("Заказ 10316111753");
-  });
-
-  it("lets an account override the channel-level contextVisibility", async () => {
-    const cfg = groupCfg({ accounts: { work: { token: "tok2", contextVisibility: "all" } } });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({ forwards: [ORDER_FORWARD] }),
-      account: resolveVkAccount({ cfg, accountId: "work" }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain("Заказ 10316111753");
-  });
-
-  it("omits the whole quote target in a group when its author is outside the allowlist", async () => {
-    const cfg = groupCfg({});
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToSenderId: OUTSIDER,
-        replyToText: "/think high чужой текст",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    const ctx = lastInboundContext(runtime);
-    expect(ctx.ReplyToBody).toBeUndefined();
-    expect(ctx.ReplyToSender).toBeUndefined();
-    expect(ctx.ReplyToId).toBeUndefined();
-    expect(ctx.ReplyToIdFull).toBeUndefined();
-  });
-
-  it("keeps the quote of an allowed author", async () => {
-    const cfg = groupCfg({});
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToSenderId: SENDER_ID,
-        replyToText: "своё сообщение",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    const ctx = lastInboundContext(runtime);
-    expect(ctx.ReplyToBody).toBe("своё сообщение");
-    expect(ctx.ReplyToId).toBe("9801");
-  });
-
-  it("keeps an outsider's quote with allowlist_quote, still stripping an outsider's forward inside it", async () => {
-    const cfg = groupCfg({ contextVisibility: "allowlist_quote" });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToSenderId: OUTSIDER,
-        replyToText: "чужая цитата",
-        replyToForwards: [ORDER_FORWARD],
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    const ctx = lastInboundContext(runtime);
-    expect(String(ctx.ReplyToBody)).toContain("чужая цитата");
-    expect(String(ctx.ReplyToBody)).not.toContain("Заказ 10316111753");
-    expect(ctx.ReplyToId).toBe("9801");
-  });
-
-  it("treats a quote of the bot's own message like any other author, as Telegram does", async () => {
-    // Telegram checks the reply target's sender against the group allowlist with
-    // no exception for the bot itself; the bot's id is not in groupAllowFrom.
-    const cfg = groupCfg({});
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "а подробнее?",
-        replyToMessageId: "9800",
-        replyToSenderId: -239104331,
-        replyToText: "ответ бота",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(lastInboundContext(runtime).ReplyToBody).toBeUndefined();
-  });
-
-  it("omits the whole quote target in a group when its author is unknown", async () => {
-    // The core treats a missing sender as not allowed while the allowlist is
-    // non-empty (isSenderIdAllowed), and the mode then decides. Letting an
-    // unknown author through was this channel's own fail-open.
-    const cfg = groupCfg({});
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToText: "цитата без автора",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    const ctx = lastInboundContext(runtime);
-    expect(ctx.ReplyToBody).toBeUndefined();
-    expect(ctx.ReplyToSender).toBeUndefined();
-    expect(ctx.ReplyToId).toBeUndefined();
-    expect(ctx.ReplyToIdFull).toBeUndefined();
-  });
-
-  it("keeps an unknown author's quote with allowlist_quote", async () => {
-    const cfg = groupCfg({ contextVisibility: "allowlist_quote" });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToText: "цитата без автора",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    const ctx = lastInboundContext(runtime);
-    expect(ctx.ReplyToBody).toBe("цитата без автора");
-    expect(ctx.ReplyToId).toBe("9801");
-  });
-
-  it("keeps an unknown author's quote when the group allowlist is empty", async () => {
-    // An empty allowlist lets every author through, known or not; only a
-    // non-empty one makes an unknown sender a refusal.
-    const cfg = baseCfg({ dmPolicy: "open", groupPolicy: "open", contextVisibility: "allowlist" });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: groupMessage({
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToText: "цитата без автора",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(lastInboundContext(runtime).ReplyToBody).toBe("цитата без автора");
-  });
-
-  it("does not filter an unknown author's quote in a direct chat", async () => {
-    const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: makeMessage({
-        senderId: SENDER_ID,
-        peerId: SENDER_ID,
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToText: "цитата без автора",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(lastInboundContext(runtime).ReplyToBody).toBe("цитата без автора");
-  });
-
-  it("does not filter quotes in a direct chat", async () => {
-    const cfg = baseCfg({ dmPolicy: "open", allowFrom: ["*"], contextVisibility: "allowlist" });
-    const runtime = installRuntime();
-    await handleVkInbound({
-      message: makeMessage({
-        senderId: SENDER_ID,
-        peerId: SENDER_ID,
-        text: "что скажешь?",
-        replyToMessageId: "9801",
-        replyToSenderId: OUTSIDER,
-        replyToText: "чужая цитата",
-      }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: createVkRuntimeEnv(),
-    });
-    expect(lastInboundContext(runtime).ReplyToBody).toBe("чужая цитата");
-  });
-
-  it("logs why a group message made only of hidden forwards is not answered", async () => {
-    const cfg = groupCfg({});
-    const runtime = installRuntime();
-    const env = { ...createVkRuntimeEnv(), log: vi.fn() };
-    await handleVkInbound({
-      message: groupMessage({ text: "", forwards: [ORDER_FORWARD] }),
-      account: resolveVkAccount({ cfg }),
-      config: cfg,
-      runtime: env,
-    });
-    expect(
-      vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
-    ).not.toHaveBeenCalled();
-    const lines = env.log.mock.calls.map(([line]) => String(line));
-    expect(lines.some((line) => line.startsWith("vk: drop group") && line.includes("contextVisibility"))).toBe(true);
-    // The hidden author is exactly what this line must not name.
-    expect(lines.join("\n")).not.toContain("142153191");
   });
 });

@@ -6,7 +6,7 @@ import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
 import { VK, getRandomId } from "vk-io";
 import { resolveVkAccount } from "./accounts.js";
 import { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } from "./diagnostics.js";
-import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
+import { readVkErrorCode, readVkErrorMessage, readVkErrorSystemCode } from "./vk-errors.js";
 import {
   cleanupAudioSegments,
   getVkAudioMessageMaxMs,
@@ -18,13 +18,18 @@ import {
   renderVkMarkdownChunks,
   type VkPreparedFormattedMessage,
 } from "./format.js";
+import {
+  claimTtsParts,
+  discardTtsParts,
+  readTtsPartsManifest,
+  waitForTtsPart,
+} from "./tts-parts.js";
 import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } from "./keyboard.js";
 import { loadVkOutboundMedia } from "./media.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { vkPositiveSetting } from "./settings.js";
 import { normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
-import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
 export {
   applyVkAllowlistConfigEdit,
   isVkGroupPeerId,
@@ -317,13 +322,91 @@ function isRetryableVkError(error: unknown): boolean {
  */
 type MediaUploadKind = "photo" | "document" | "audio";
 
+type VkUploader = VK["upload"];
+
+/**
+ * What the upload server answered during one attempt.
+ *
+ * vk-io posts the file, parses the JSON and spreads it straight into the save
+ * call, so all that reaches us is the save call's "file is undefined" or "photo
+ * is undefined": the answer that lacked the field is gone. Without it a refusal
+ * by VK, a file VK did not like and a cut transfer read the same, and any retry
+ * policy for them is a guess. On 17.09 three attempts in a row failed on one
+ * 116 KB voice message, which does not look like the cut transfer the retry was
+ * written for.
+ */
+type VkUploadServerTrace = { answered: boolean; response?: unknown };
+
+/**
+ * The uploader for one attempt, with the upload server's answer recorded.
+ *
+ * Only the POST to the upload server is wrapped, and only on an object made for
+ * this call: vk-io is not patched, and every other step runs through the real
+ * instance, reached through the prototype.
+ */
+function traceVkUploadServer(upload: VkUploader, trace: VkUploadServerTrace): VkUploader {
+  return Object.create(upload, {
+    upload: {
+      value: async (...args: Parameters<VkUploader["upload"]>) => {
+        const response = await upload.upload(...args);
+        trace.answered = true;
+        trace.response = response;
+        return response;
+      },
+    },
+  }) as VkUploader;
+}
+
+/** Longer values in the upload server's answer are logged by length: a file token is one of them. */
+const UPLOAD_ANSWER_VALUE_SHOWN = 64;
+
+/**
+ * The upload server's answer as log fields. `payloadField` is what the save call
+ * needs from it: `file` for documents and voice messages, `photo` for photos.
+ * Keys, the presence of the payload and a token-shaped error pass at every
+ * level; the answer's text is kept at `full` only, as any other text.
+ */
+function describeVkUploadServerAnswer(
+  trace: VkUploadServerTrace,
+  payloadField: "file" | "photo",
+): Record<string, unknown> {
+  if (!trace.answered) {
+    return { uploadAnswered: false };
+  }
+  const response = trace.response;
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    return {
+      uploadAnswered: true,
+      uploadAnswerType: Array.isArray(response) ? "array" : typeof response,
+      uploadAnswer: typeof response === "string" ? response : undefined,
+    };
+  }
+  const record = response as Record<string, unknown>;
+  const payload = record[payloadField];
+  return {
+    uploadAnswered: true,
+    uploadKeys: Object.keys(record).slice(0, 16),
+    uploadHasPayload: payload !== undefined && payload !== null && payload !== "",
+    uploadError: typeof record.error === "string" ? record.error : undefined,
+    uploadAnswer: JSON.stringify(record, (_key, value: unknown) =>
+      typeof value === "string" && value.length > UPLOAD_ANSWER_VALUE_SHOWN
+        ? `<${value.length} chars>`
+        : value,
+    ),
+  };
+}
+
 function logMediaUploadOutcome(params: {
   kind: MediaUploadKind;
   source: string | Buffer;
   mime?: string;
   bytes?: number;
   attempt: number;
+  /** How long this attempt ran before it finished or failed. */
+  elapsedMs?: number;
   error?: unknown;
+  /** Failure-only fields from the caller, such as the upload server's answer. */
+  failureFields?: Record<string, unknown>;
 }): void {
   const fields = {
     kind: params.kind,
@@ -331,6 +414,11 @@ function logMediaUploadOutcome(params: {
     mime: params.mime,
     bytes: params.bytes,
     attempt: params.attempt,
+    elapsedMs: params.elapsedMs,
+    // Only on failure, and only the errno-shaped token: it separates a broken
+    // connection from a refusal by VK, which the numeric code cannot do.
+    errno: params.error ? readVkErrorSystemCode(params.error) : undefined,
+    ...(params.error ? params.failureFields : undefined),
   };
   if (params.error) {
     vkDiagFailure("vk upload failed", params.error, fields);
@@ -369,14 +457,16 @@ function retryDelayMs(attempt: number): number {
  * one was only computed for buffers, leaving a hole for on-disk files exactly
  * where the number tells an empty render from a complete one.
  *
- * The stat call happens only when diagnostics are on, and once per upload rather
- * than per attempt: with diagnostics off the send path must pay nothing.
+ * Gating lives in the caller, not here: on the happy path the size is measured only
+ * when diagnostics are on, so a successful send with `off` still touches no disk;
+ * on failure it is measured regardless, because failures are logged at every level
+ * and that is exactly where the number tells an empty render from a complete one.
  */
 async function localSourceSize(source: string | Buffer): Promise<number | undefined> {
   if (Buffer.isBuffer(source)) {
     return source.byteLength;
   }
-  if (resolveVkDiagLevel() === "off" || describeVkSourceKind(source) !== "local") {
+  if (describeVkSourceKind(source) !== "local") {
     return undefined;
   }
   try {
@@ -393,6 +483,8 @@ async function runMediaUpload<T>(params: {
   mime?: string;
   token: string;
   upload: () => Promise<T>;
+  /** Extra fields for a failed attempt's log line, read when the attempt fails. */
+  describeFailure?: () => Record<string, unknown>;
   /** Per-kind retry policy, when this attachment kind differs from the default. */
   retry?: {
     extraRetryableCodes?: readonly number[];
@@ -402,11 +494,19 @@ async function runMediaUpload<T>(params: {
   /** Gateway stop: no queued transfer and no retry starts after it. */
   signal?: AbortSignal;
 }): Promise<T> {
-  const bytes = await localSourceSize(params.source);
+  // Happy path keeps its old cost: nothing is measured while diagnostics are off.
+  let bytes =
+    resolveVkDiagLevel() === "off" ? undefined : await localSourceSize(params.source);
   let attempt = 0;
   return await withVkRetry(
     async () => {
       attempt += 1;
+      // Measured per attempt, not per upload: an instant refusal and a transfer
+      // that ran for seconds and then failed look identical in the log without
+      // it, and they have opposite causes. In the 07.09 incident three attempts
+      // took 11 seconds between them, which is what showed the file was actually
+      // being sent.
+      const startedAt = Date.now();
       try {
         const result = await enqueueKeyedTask({
           tails: mediaUploadTails,
@@ -419,16 +519,30 @@ async function runMediaUpload<T>(params: {
             return await params.upload();
           },
         });
-        logMediaUploadOutcome({ kind: params.kind, source: params.source, mime: params.mime, bytes, attempt });
-        return result;
-      } catch (error) {
         logMediaUploadOutcome({
           kind: params.kind,
           source: params.source,
           mime: params.mime,
           bytes,
           attempt,
+          elapsedMs: Date.now() - startedAt,
+        });
+        return result;
+      } catch (error) {
+        // A failure is logged even at `off`, and the byte count is a safe field —
+        // measure it now if the happy path skipped it.
+        if (bytes === undefined) {
+          bytes = await localSourceSize(params.source);
+        }
+        logMediaUploadOutcome({
+          kind: params.kind,
+          source: params.source,
+          mime: params.mime,
+          bytes,
+          attempt,
+          elapsedMs: Date.now() - startedAt,
           error,
+          failureFields: params.describeFailure?.(),
         });
         throw error;
       }
@@ -867,6 +981,7 @@ export async function sendPhotoVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
+  let uploadTrace: VkUploadServerTrace = { answered: false };
   const attachment = await runMediaUpload({
     kind: "photo",
     source: photoSource,
@@ -877,8 +992,9 @@ export async function sendPhotoVk(
         ? { extraRetryablePredicate: isVkRetryablePhotoUploadError }
         : undefined,
     signal: opts.abortSignal,
+    describeFailure: () => describeVkUploadServerAnswer(uploadTrace, "photo"),
     upload: () =>
-      vk.upload.messagePhoto({
+      traceVkUploadServer(vk.upload, (uploadTrace = { answered: false })).messagePhoto({
         peer_id: peerId,
         source: buildVkUploadSource({
           source: photoSource,
@@ -911,14 +1027,16 @@ export async function sendDocumentVk(
     to,
   });
   const vk = getOrCreateVk(account.token);
+  let uploadTrace: VkUploadServerTrace = { answered: false };
   const attachment = await runMediaUpload({
     kind: "document",
     source: docSource,
     mime: uploadMeta?.contentType,
     token: account.token,
     signal: opts.abortSignal,
+    describeFailure: () => describeVkUploadServerAnswer(uploadTrace, "file"),
     upload: () =>
-      vk.upload.messageDocument({
+      traceVkUploadServer(vk.upload, (uploadTrace = { answered: false })).messageDocument({
         peer_id: peerId,
         source: buildVkUploadSource({
           source: docSource,
@@ -944,7 +1062,9 @@ type VkRemoteMediaRejection = "unavailable" | "content-type" | "too-large" | "em
 type VkRemoteMediaRead = { ok: true; bytes: number } | { ok: false; reason: VkRemoteMediaRejection };
 
 function readRejection(read: VkRemoteMediaRead): VkRemoteMediaRejection | null {
-  return read.ok ? null : read.reason;
+  // Narrowed by the field, not by `ok`: the test build runs without strictNullChecks,
+  // where a boolean discriminant does not narrow.
+  return "reason" in read ? read.reason : null;
 }
 
 /**
@@ -1158,17 +1278,20 @@ async function uploadVkAudioMessage(params: {
       { extraRetryableCodes: [15], signal: params.signal },
     );
 
+  let uploadTrace: VkUploadServerTrace = { answered: false };
   const attachment = await runMediaUpload({
     kind: "audio",
     source: params.source,
     mime: params.contentType,
     token: params.token,
+    describeFailure: () => describeVkUploadServerAnswer(uploadTrace, "file"),
     upload: async () => {
+      uploadTrace = { answered: false };
       const uploadUrl = await requestUploadUrl();
       // The address request is a round trip of its own; a stop during it must
       // not be followed by the transfer.
       params.signal?.throwIfAborted();
-      return await params.vk.upload.audioMessage({
+      return await traceVkUploadServer(params.vk.upload, uploadTrace).audioMessage({
         peer_id: params.peerId,
         source: {
           uploadUrl,
@@ -1189,6 +1312,139 @@ async function uploadVkAudioMessage(params: {
     signal: params.signal,
   });
   return String(attachment);
+}
+
+/**
+ * Streams the continuation parts of a long spoken reply as follow-up voice
+ * messages (see `./tts-parts.ts`). Runs detached from the reply operation:
+ * parts are still being synthesized while this waits, and blocking the reply on
+ * that would stall the dispatcher.
+ */
+async function deliverTtsContinuation(params: {
+  vk: VK;
+  peerId: number;
+  to: string;
+  account: ResolvedVkAccount;
+  dir: string;
+  opts: SendVkOptions;
+}): Promise<void> {
+  const manifest = await readTtsPartsManifest(params.dir);
+  if (!manifest) {
+    return;
+  }
+  vkDiag("tts continuation start", {
+    parts: manifest.parts.length,
+    dir: params.dir,
+    peerId: params.peerId,
+  });
+  const maxMs = getVkAudioMessageMaxMs();
+
+  for (const entry of manifest.parts) {
+    const part = await waitForTtsPart(params.dir, entry.index);
+    if (!part) {
+      vkDiag("tts continuation skip", { part: entry.index, reason: "not ready" });
+      continue;
+    }
+    const file = join(params.dir, part.file);
+    let segments: string[] = [];
+    try {
+      if ((part.durationMs ?? 0) > maxMs) {
+        segments = await splitAudioAtSilence(file, maxMs, {
+          // The manifest already carries it — measuring again would spawn an
+          // ffprobe per part, up to eight on one long reply.
+          knownDurationMs: part.durationMs,
+          signal: params.opts.abortSignal,
+        });
+      }
+    } catch {
+      segments = [];
+    }
+    const sources = segments.length >= 2 ? segments : [file];
+    try {
+      for (let index = 0; index < sources.length; index += 1) {
+        const source = sources[index] as string;
+        const attachment = await uploadVkAudioMessage({
+          vk: params.vk,
+          token: params.account.token,
+          peerId: params.peerId,
+          source,
+          filename: `voice-part-${String(part.index).padStart(2, "0")}-${index + 1}${
+            source.endsWith(".wav") ? ".wav" : ".ogg"
+          }`,
+        });
+        await sendVkApiMessage({
+          to: params.to,
+          peerId: params.peerId,
+          account: params.account,
+          formatted: { text: "" },
+          attachment,
+          opts: {
+            ...params.opts,
+            replyTo: undefined,
+            buttons: undefined,
+            clearKeyboard: undefined,
+          },
+        });
+      }
+      vkDiag("tts continuation sent", {
+        part: part.index,
+        total: manifest.parts.length,
+        segments: sources.length,
+      });
+    } catch (error) {
+      // One lost part must not swallow the rest of the reply.
+      vkDiagFailure("tts continuation failed", error, { part: part.index });
+    } finally {
+      if (segments.length >= 2) {
+        await cleanupAudioSegments(segments);
+      }
+    }
+  }
+
+  await discardTtsParts(params.dir);
+  vkDiag("tts continuation done", { parts: manifest.parts.length, dir: params.dir });
+}
+
+/**
+ * Claims the continuation directory for a just-sent head audio and starts
+ * delivering it, if there is one.
+ *
+ * Both audio paths — split and single-file — ended with the same claim-and-start
+ * pair; a third path would have needed a third copy.
+ */
+async function startTtsContinuationForHead(params: {
+  vk: VK;
+  peerId: number;
+  to: string;
+  account: ResolvedVkAccount;
+  headDurationMs: number | null;
+  opts: SendVkOptions;
+}): Promise<void> {
+  const dir = await claimTtsParts(params.headDurationMs);
+  if (!dir) {
+    return;
+  }
+  startTtsContinuation({
+    vk: params.vk,
+    peerId: params.peerId,
+    to: params.to,
+    account: params.account,
+    dir,
+    opts: params.opts,
+  });
+}
+
+function startTtsContinuation(params: {
+  vk: VK;
+  peerId: number;
+  to: string;
+  account: ResolvedVkAccount;
+  dir: string;
+  opts: SendVkOptions;
+}): void {
+  void deliverTtsContinuation(params).catch((error: unknown) => {
+    vkDiagFailure("tts continuation error", error);
+  });
 }
 
 /** Duration, or null when it cannot be measured; a cancellation is rethrown. */
@@ -1315,14 +1571,17 @@ export async function sendAudioMessageVk(
   // already fetched them to measure the duration.
   let uploadSource: string | Buffer = audioSource;
   let uploadCleanup: (() => Promise<void>) | null = null;
+  // Head duration doubles as the key that claims this reply's continuation parts.
+  let headDurationMs: number | null = null;
   if (local.kind === "local") {
     let handedOver = false;
     try {
       const maxMs = getVkAudioMessageMaxMs();
       const measuredMs = await measureAudioMs(local.path, signal);
+      headDurationMs = measuredMs;
       signal?.throwIfAborted();
       if (measuredMs !== null && measuredMs > maxMs) {
-        return await sendOverLimitAudio({
+        const result = await sendOverLimitAudio({
           to: normalizedTo,
           peerId,
           account,
@@ -1337,6 +1596,18 @@ export async function sendAudioMessageVk(
           tailChunks,
           opts,
         });
+        // Continuation parts follow the head however it went out — split into
+        // voice messages or sent as a document — but never after a stop or a
+        // failure, which leave `sendOverLimitAudio` by throwing.
+        await startTtsContinuationForHead({
+          vk,
+          peerId,
+          to: normalizedTo,
+          account,
+          headDurationMs: measuredMs,
+          opts,
+        });
+        return result;
       }
       if (typeof audioSource === "string" && isHttpUrl(audioSource)) {
         // Keep the download until the send finishes, then clean it up.
@@ -1378,6 +1649,15 @@ export async function sendAudioMessageVk(
     },
   }).catch((error: unknown) => {
     throw voiceSendFailure(error, signal);
+  });
+
+  await startTtsContinuationForHead({
+    vk,
+    peerId,
+    to: normalizedTo,
+    account,
+    headDurationMs,
+    opts,
   });
 
   if (tailChunks.length === 0) {
@@ -1667,6 +1947,75 @@ export async function deleteReactionVk(
     await vk.api.messages.deleteReaction({
       peer_id: peerId,
       cmid,
+    });
+  });
+}
+
+/**
+ * Edit an already-sent bot message in place. Used by the step-progress draft
+ * (progress-draft.ts) to rewrite a single "live" message with the running list
+ * of execution steps. `messageId` is the value returned as `SendVkResult.messageId`
+ * (the message_id from messages.send). Returns false when the account/target is
+ * unusable so the caller can fall back to a fresh send.
+ */
+export async function editMessageVk(
+  to: string,
+  messageId: number,
+  text: string,
+  account: ResolvedVkAccount,
+  opts: { formatData?: VkPreparedFormattedMessage["formatData"] } = {},
+): Promise<boolean> {
+  if (!account.token) {
+    return false;
+  }
+  const peerId = Number(normalizeVkTargetId(to));
+  if (Number.isNaN(peerId) || !Number.isFinite(messageId) || messageId <= 0) {
+    return false;
+  }
+  const vk = getOrCreateVk(account.token);
+  const editParams: Record<string, unknown> = {
+    peer_id: peerId,
+    message_id: messageId,
+    message: text,
+    keep_forward_messages: 1,
+    keep_snippets: 1,
+  };
+  // format_data carries VK's rich-text runs (markdown). It is a real messages.edit
+  // param but not typed by vk-io, so build the params loosely and cast on the call.
+  if (opts.formatData && opts.formatData.items.length > 0) {
+    editParams.format_data = JSON.stringify(opts.formatData);
+  }
+  await withVkRetry(async () => {
+    await vk.api.messages.edit(
+      editParams as unknown as Parameters<typeof vk.api.messages.edit>[0],
+    );
+  });
+  return true;
+}
+
+/**
+ * Delete a bot message the plugin previously sent (e.g. drop the progress draft
+ * when the final answer is delivered as a separate message). Best-effort:
+ * failures are swallowed by withVkRetry semantics and never block delivery.
+ */
+export async function deleteMessageVk(
+  to: string,
+  messageId: number,
+  account: ResolvedVkAccount,
+): Promise<void> {
+  if (!account.token) {
+    return;
+  }
+  const peerId = Number(normalizeVkTargetId(to));
+  if (Number.isNaN(peerId) || !Number.isFinite(messageId) || messageId <= 0) {
+    return;
+  }
+  const vk = getOrCreateVk(account.token);
+  await withVkRetry(async () => {
+    await vk.api.messages.delete({
+      peer_id: peerId,
+      message_ids: [messageId],
+      delete_for_all: 1,
     });
   });
 }

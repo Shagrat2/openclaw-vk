@@ -47,3 +47,32 @@ export function vkPositiveSetting(params: {
   const configured = readVkChannelSection(params.section)?.[params.key];
   return parseStrictPositiveInteger(configured) ?? params.fallback;
 }
+
+/** Boolean setting; `false` in either place disables. */
+export function vkBooleanSetting(params: {
+  env: string;
+  section: string;
+  key: string;
+  fallback: boolean;
+}): boolean {
+  const fromEnv = process.env[params.env]?.trim();
+  if (fromEnv) {
+    return fromEnv !== "0" && fromEnv.toLowerCase() !== "false";
+  }
+  const configured = readVkChannelSection(params.section)?.[params.key];
+  return typeof configured === "boolean" ? configured : params.fallback;
+}
+
+/** String setting with the same precedence. */
+export function vkStringSetting(params: {
+  env: string;
+  section: string;
+  key: string;
+}): string | undefined {
+  const fromEnv = process.env[params.env]?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  const configured = readVkChannelSection(params.section)?.[params.key];
+  return typeof configured === "string" && configured.trim() ? configured.trim() : undefined;
+}

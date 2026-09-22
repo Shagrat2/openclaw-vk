@@ -19,6 +19,7 @@ import {
   type ResolvedVkAccount,
 } from "./accounts.js";
 import { VkConfigSchema } from "./config-schema.js";
+import { vkDiag } from "./diagnostics.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
 import { getVkRuntime } from "./runtime.js";
@@ -166,6 +167,15 @@ const vkSecurityAdapter = {
   }) => (resolveVkRuntimeGroupPolicy({ cfg, account }) === "open" ? [VK_OPEN_GROUP_WARNING] : []),
 };
 
+/** One line per core-routed send; see the note on `outbound` below. */
+function logVkOutbound(
+  stage: string,
+  to: string,
+  fields: { textLen: number; media: boolean; messageId?: string },
+): void {
+  vkDiag("outbound sent", { stage, to, ...fields });
+}
+
 export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   id: "vk",
   meta: {
@@ -254,20 +264,6 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       }
       return trimmed.replace(/^vk:(?:user:|chat:)?/i, "");
     },
-    parseExplicitTarget: ({ raw }) => {
-      const normalized = raw.trim().replace(/^vk:(?:user:|chat:)?/i, "");
-      if (!normalized) {
-        return null;
-      }
-      const peerId = Number(normalized);
-      if (Number.isNaN(peerId)) {
-        return null;
-      }
-      return {
-        to: normalized,
-        chatType: isVkGroupPeerId(peerId) ? ("group" as const) : ("direct" as const),
-      };
-    },
     inferTargetChatType: ({ to }) => {
       const normalized = to.trim().replace(/^vk:(?:user:|chat:)?/i, "");
       const peerId = Number(normalized);
@@ -309,6 +305,10 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
       }),
   },
   outbound: {
+    // Sends routed by the core — a queued follow-up's reply, `openclaw message
+    // send` — arrive here, not through the inbound dispatcher's `deliver`, which is
+    // where every other reply is logged. Without a line of their own they leave no
+    // trace: on 17.09 a delivered follow-up reply was taken for a lost one.
     deliveryMode: "direct",
     // The core hands outbound sends no cancellation of their own, so the
     // account's stop signal stands in: a gateway stop then reaches a download,
@@ -326,6 +326,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
       });
+      logVkOutbound("sendPayload", to, {
+        textLen: payload.text?.length ?? 0,
+        media: Boolean(payload.mediaUrl || payload.mediaUrls?.length),
+        messageId: result?.messageId,
+      });
       return result
         ? { channel: "vk", ...result }
         : { channel: "vk", messageId: "", chatId: to };
@@ -335,6 +340,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         cfg,
         accountId: accountId ?? undefined,
         replyTo: replyToId ?? undefined,
+      });
+      logVkOutbound("sendFormattedText", to, {
+        textLen: text.length,
+        media: false,
+        messageId: results.at(-1)?.messageId,
       });
       return results.map((result) => ({ channel: "vk" as const, ...result }));
     },
@@ -347,6 +357,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
       });
+      logVkOutbound("sendFormattedMedia", to, {
+        textLen: text.length,
+        media: true,
+        messageId: result.messageId,
+      });
       return { channel: "vk", ...result };
     },
     sendText: async ({ cfg, to, text, accountId, replyToId }) => {
@@ -355,9 +370,27 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         accountId: accountId ?? undefined,
         replyTo: replyToId ?? undefined,
       });
+      logVkOutbound("sendText", to, { textLen: text.length, media: false, messageId: result.messageId });
       return { channel: "vk", ...result };
     },
     sendMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, replyToId, forceDocument }) => {
+      // `mediaUrl` is optional in the core contract. Without it there is nothing
+      // to upload, and passing undefined down would fail inside the uploader —
+      // so the caption goes out as a plain message instead of the reply
+      // disappearing.
+      if (!mediaUrl) {
+        const textOnly = await sendMessageVk(to, text, {
+          cfg,
+          accountId: accountId ?? undefined,
+          replyTo: replyToId ?? undefined,
+        });
+        logVkOutbound("sendMedia", to, {
+          textLen: text?.length ?? 0,
+          media: false,
+          messageId: textOnly.messageId,
+        });
+        return { channel: "vk", ...textOnly };
+      }
       const result = await sendFormattedMediaVk(to, text, mediaUrl, {
         cfg,
         accountId: accountId ?? undefined,
@@ -365,6 +398,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         mediaLocalRoots,
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
+      });
+      logVkOutbound("sendMedia", to, {
+        textLen: text?.length ?? 0,
+        media: true,
+        messageId: result.messageId,
       });
       return { channel: "vk", ...result };
     },
@@ -472,6 +510,8 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         config: ctx.cfg as CoreConfig,
         runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
+        // The gateway owns restarts and backoff; the plugin only publishes what
+        // it sees on its long poll. The sink is created above, on account entry.
         setStatus,
       });
 
