@@ -1171,12 +1171,13 @@ export async function handleVkInbound(params: {
                   // Build the full draft line (like Telegram). Passing undefined
                   // leaves the compositor with nothing to render; startImmediately
                   // shows the step at once instead of waiting out the start gate.
-                  // A tool step overwrites the draft with its own list, so the
-                  // answer text left there by a previous block is gone. Forget
-                  // it: otherwise an empty final would keep the step list as the
-                  // "answer".
-                  draftAnswerSource = null;
-                  await progressDraft.compositor.pushToolProgress(
+                  // A tool step that the compositor renders overwrites the draft
+                  // with its own list, so the answer text left there by a previous
+                  // block is gone. Forget it only then: otherwise an empty final
+                  // would keep the step list as the "answer". A step it does not
+                  // render (a non-working tool, an update phase) leaves the answer
+                  // in the draft, and forgetting it would let cleanup delete it.
+                  const redrawn = await progressDraft.compositor.pushToolProgress(
                     buildChannelProgressDraftLineForEntry(vkStreamingEntry, {
                       event: "tool",
                       itemId: payload?.itemId,
@@ -1187,6 +1188,7 @@ export async function handleVkInbound(params: {
                     }),
                     { toolName, startImmediately: true },
                   );
+                  if (redrawn) draftAnswerSource = null;
                 }
               },
               onCompactionStart: async () => {

@@ -444,5 +444,15 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       });
       expect(texts()).toEqual(["Ответ блоками."]);
     });
+
+    it("keeps the answer when a later tool start does not redraw the draft", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Ответ блоками." }, { kind: "block" });
+        // `message` is not a working tool for the compositor: nothing is redrawn.
+        await replyOptions.onToolStart?.({ name: "message", phase: "start" });
+      });
+      expect(texts()).toEqual(["Ответ блоками."]);
+    });
   });
 });
