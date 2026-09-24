@@ -51,6 +51,7 @@ import {
   sendMessageVk,
   sendPayloadVk,
   sendTypingVk,
+  splitVkMarkdownAttachments,
 } from "./send.js";
 import { renderVkMarkdownChunks } from "./format.js";
 import {
@@ -887,12 +888,17 @@ export async function handleVkInbound(params: {
           // as work goes on, and at the end that same bubble becomes the answer.
           // Media and buttons keep their old path — they cannot go into a
           // draft.
+          // Markdown links the send path turns into attachments (a picture,
+          // a local file) cannot live in the draft either: rendered there they
+          // became a link to nowhere and the attachment was never sent.
+          const markdownAttachments = splitVkMarkdownAttachments(normalized.text ?? "");
           const isTextBlock = Boolean(
             progressDraft &&
               !isFinal &&
               normalized.text?.trim() &&
               !normalized.mediaUrl &&
               !(normalized.mediaUrls?.length ?? 0) &&
+              markdownAttachments.attachments.length === 0 &&
               !resolvedButtons,
           );
           if (progressDraft && isTextBlock) {
@@ -971,25 +977,28 @@ export async function handleVkInbound(params: {
           // must not replace it — neither delete it when empty nor overwrite it
           // with a truncated copy. Only the final's media still has to go out.
           const keepsDraftAnswer =
-            progressDraft !== null && ownsDraftOutcome && draftKeepsAnswer(normalized.text ?? "");
+            progressDraft !== null &&
+            ownsDraftOutcome &&
+            draftKeepsAnswer(markdownAttachments.text);
           if (keepsDraftAnswer && outboundPayload.text?.trim()) {
             vkDiag("truncated final dropped, draft holds the answer", {
               len: outboundPayload.text.length,
             });
-            outboundPayload.text = "";
+            // The final's own attachments still go out.
+            outboundPayload.text = markdownAttachments.attachments.join("\n");
           }
           if (progressDraft && ownsDraftOutcome) {
             const draftMsgId = progressDraft.currentMessageId();
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
-            const finalText = keepsDraftAnswer ? undefined : normalized.text?.trim();
+            const finalText = keepsDraftAnswer ? undefined : markdownAttachments.text.trim();
             // Media no longer cancels the replacement: the progress draft is
             // rewritten with the answer text, and voice messages follow as
             // separate messages. Any spoken answer used to bypass the
             // replacement — the draft was simply deleted, progress vanished and
             // the answer arrived as a new message.
             if (draftMsgId !== undefined && finalText && !resolvedButtons) {
-              const chunks = renderVkMarkdownChunks(normalized.text ?? "");
+              const chunks = renderVkMarkdownChunks(markdownAttachments.text);
               // The replacement used to work only for single-message answers,
               // so long output (narration plus result) left the draft as a wall
               // and delivered the answer separately. Now the first chunk
@@ -1027,6 +1036,19 @@ export async function handleVkInbound(params: {
                         `vk: step-progress tail chunk failed: ${String(err)}`,
                       );
                     }
+                  }
+                  // Attachments from markdown links go the ordinary way, as
+                  // on a reply without a draft; only the links are sent, so
+                  // no caption repeats the text already in the draft.
+                  if (markdownAttachments.attachments.length > 0) {
+                    await deliverVkReply({
+                      payload: { text: markdownAttachments.attachments.join("\n") },
+                      peerId: message.peerId,
+                      accountId: account.accountId,
+                      statusSink,
+                      abortSignal,
+                      log: runtime.log,
+                    });
                   }
                   // Voice messages go last and without text: the text is
                   // already in the replaced draft, so a caption would only

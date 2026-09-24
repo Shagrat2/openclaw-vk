@@ -46,7 +46,12 @@ const chat = vi.hoisted(() => ({
   payloadCalls: [] as Array<Record<string, unknown>>,
 }));
 
-vi.mock("./send.js", () => ({
+// Only the calls that reach VK are replaced; the rest of send.js — the markdown
+// attachment parser in particular — is the real one.
+vi.mock("./send.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./send.js")>();
+  return {
+  ...actual,
   sendMessageVk: vi.fn(async (to: string, text: string) => {
     const index = chat.sendMessageCalls++;
     if (chat.failSendMessageFrom !== null && index >= chat.failSendMessageFrom) {
@@ -76,18 +81,23 @@ vi.mock("./send.js", () => ({
       throw new Error("VK API error 10: upload failed");
     }
     const id = chat.nextId++;
+    // As the real sendPayloadVk does: markdown attachment links leave the text
+    // and travel as attachments.
+    const parsed = actual.splitVkMarkdownAttachments(String(payload.text ?? ""));
     const media = [
       ...(typeof payload.mediaUrl === "string" ? [payload.mediaUrl] : []),
       ...((payload.mediaUrls as string[] | undefined) ?? []),
+      ...parsed.attachments,
     ];
-    chat.messages.push({ id, text: String(payload.text ?? ""), media });
+    chat.messages.push({ id, text: parsed.text, media });
     return { messageId: String(id), chatId: to };
   }),
   markMessageReadVk: vi.fn(async () => undefined),
   sendTypingVk: vi.fn(async () => undefined),
   resolveVkOwnGroup: vi.fn(async () => ({ id: 239104331, name: "Карамелька" })),
   clearVkInstances: vi.fn(),
-}));
+  };
+});
 
 // ── The agent run: each test scripts what the core delivers ─────────────────
 
@@ -305,6 +315,65 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       expect(joined).toContain("ОГРОМНЫЙ");
       expect(joined).toContain("КОНЕЦ");
       expect(texts().some((t) => t.includes(LABEL))).toBe(false);
+    });
+  });
+
+  // ── P1-3: markdown attachments of an answer written into the draft ───────
+
+  describe("markdown attachments in an answer written into the draft", () => {
+    it("sends a markdown image as an attachment, not as a link in the draft", async () => {
+      const image = "![chart](https://example.com/c.png)";
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: `График: ${image}` }, { kind: "final" });
+      });
+      expect(texts().some((t) => t.includes("График"))).toBe(true);
+      expect(texts().some((t) => t.includes("!chart") || t.includes("c.png"))).toBe(false);
+      const carriers = chat.payloadCalls.filter(
+        (p) =>
+          p.mediaUrl === "https://example.com/c.png" ||
+          ((p.mediaUrls as string[] | undefined) ?? []).includes("https://example.com/c.png") ||
+          String(p.text ?? "").includes(image),
+      );
+      expect(carriers).toHaveLength(1);
+      // The caption is already in the draft; the attachment goes without it.
+      expect(String(carriers[0]?.text ?? "").replace(image, "").trim()).toBe("");
+    });
+
+    it("sends a local file link as a document", async () => {
+      const file = "[отчёт.pdf](/tmp/report.pdf)";
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: `Отчёт готов: ${file}` }, { kind: "final" });
+      });
+      expect(texts().some((t) => t.includes("Отчёт готов"))).toBe(true);
+      expect(texts().some((t) => t.includes("/tmp/report.pdf"))).toBe(false);
+      expect(chat.payloadCalls.some((p) => String(p.text ?? "").includes(file))).toBe(true);
+    });
+
+    it("leaves an ordinary web link in the draft as a link", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver(
+          { text: "Подробнее: [страница](https://example.com/page)" },
+          { kind: "final" },
+        );
+      });
+      expect(chat.payloadCalls).toHaveLength(0);
+      expect(chat.messages).toHaveLength(1);
+      expect(chat.messages[0]?.text).toContain("страница");
+      expect(JSON.stringify(chat.messages[0]?.formatData)).toContain("https://example.com/page");
+    });
+
+    it("does not write a block with a markdown image into the draft", async () => {
+      const image = "![chart](https://example.com/c.png)";
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: `Промежуточный график: ${image}` }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "Итог." }, { kind: "final" });
+      });
+      expect(texts().some((t) => t.includes("!chart"))).toBe(false);
+      expect(chat.payloadCalls.some((p) => String(p.text ?? "").includes(image))).toBe(true);
     });
   });
 });

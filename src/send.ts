@@ -720,8 +720,11 @@ function isLikelyVkAttachmentTitle(value: string): boolean {
 function resolveVkMarkdownAttachmentPayload(text: string): {
   text: string;
   mediaRefs: VkOutboundMediaReference[];
+  /** The markdown links that were taken out, as written. */
+  sources: string[];
 } {
   const mediaRefs: VkOutboundMediaReference[] = [];
+  const sources: string[] = [];
   const stripped = text.replace(MARKDOWN_LINK_RE, (fullMatch, bang: string, label: string, rawUrl: string) => {
     const candidate = rawUrl.trim();
     const shouldExtract =
@@ -733,6 +736,7 @@ function resolveVkMarkdownAttachmentPayload(text: string): {
       return fullMatch;
     }
     const trimmedLabel = label.trim();
+    sources.push(fullMatch);
     mediaRefs.push({
       url: candidate,
       ...(bang !== "!" && isLikelyVkAttachmentTitle(trimmedLabel)
@@ -752,7 +756,24 @@ function resolveVkMarkdownAttachmentPayload(text: string): {
   return {
     text: normalizedText,
     mediaRefs: dedupeVkMediaReferences(mediaRefs),
+    sources,
   };
+}
+
+/**
+ * Split an answer into its text and the markdown links the send path turns
+ * into attachments (`![…](url)`, `[file.pdf](/path)`), exactly as
+ * `sendPayloadVk` decides it. For callers that put the text somewhere of their
+ * own — the step draft — and still have to deliver the attachments: sending the
+ * returned `attachments` joined as a payload's text goes the ordinary way and
+ * leaves no caption behind.
+ */
+export function splitVkMarkdownAttachments(text: string): {
+  text: string;
+  attachments: string[];
+} {
+  const parsed = resolveVkMarkdownAttachmentPayload(text);
+  return { text: parsed.text, attachments: parsed.sources };
 }
 
 function resolveVkPayloadParts(

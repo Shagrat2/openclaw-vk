@@ -314,6 +314,9 @@ vi.mock("./send.js", () => ({
   // editMessageVk backs the edit-in-place finalize; the rest are no-ops here.
   editMessageVk: mockEditMessageVk,
   sendMessageVk: vi.fn().mockResolvedValue({ messageId: "9", chatId: "0" }),
+  // No markdown attachments in these tests; the real parser is exercised in
+  // inbound.draft.sdk.test.ts.
+  splitVkMarkdownAttachments: (text: string) => ({ text, attachments: [] }),
   deleteMessageVk: vi.fn().mockResolvedValue(undefined),
   clearVkInstances: vi.fn(),
   resolveVkOwnGroup: mockResolveVkOwnGroup,
