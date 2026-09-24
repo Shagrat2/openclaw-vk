@@ -1024,43 +1024,45 @@ export async function handleVkInbound(params: {
                   runtime.log?.(
                     `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
-                  // The tail of a long answer goes as ordinary messages: VK
-                  // cannot hold more than ~4096 characters in one bubble.
-                  for (const chunk of chunks.slice(1)) {
-                    try {
+                  // The answer's head is out: the draft now carries it.
+                  statusSink?.({ lastOutboundAt: Date.now() });
+                  // The rest of the answer: tail chunks, markdown attachments,
+                  // voice. A failure here is a partial delivery and must reach
+                  // the core like any other send failure — swallowing it made
+                  // `deliver` succeed and the status reaction say "done" while
+                  // the recipient got the start of the answer only. Parts that
+                  // did go out are not sent again.
+                  try {
+                    // The tail of a long answer goes as ordinary messages: VK
+                    // cannot hold more than ~4096 characters in one bubble.
+                    for (const chunk of chunks.slice(1)) {
                       await sendMessageVk(String(message.peerId), chunk.text, {
                         accountId: account.accountId,
                       });
-                    } catch (err) {
-                      runtime.error?.(
-                        `vk: step-progress tail chunk failed: ${String(err)}`,
-                      );
                     }
-                  }
-                  // Attachments from markdown links go the ordinary way, as
-                  // on a reply without a draft; only the links are sent, so
-                  // no caption repeats the text already in the draft.
-                  if (markdownAttachments.attachments.length > 0) {
-                    await deliverVkReply({
-                      payload: { text: markdownAttachments.attachments.join("\n") },
-                      peerId: message.peerId,
-                      accountId: account.accountId,
-                      statusSink,
-                      abortSignal,
-                      log: runtime.log,
-                    });
-                  }
-                  // Voice messages go last and without text: the text is
-                  // already in the replaced draft, so a caption would only
-                  // duplicate it.
-                  if (hasMedia) {
-                    const mediaList = normalized.mediaUrls?.length
-                      ? normalized.mediaUrls
-                      : normalized.mediaUrl
-                        ? [normalized.mediaUrl]
-                        : [];
-                    for (const media of mediaList) {
-                      try {
+                    // Attachments from markdown links go the ordinary way, as
+                    // on a reply without a draft; only the links are sent, so
+                    // no caption repeats the text already in the draft.
+                    if (markdownAttachments.attachments.length > 0) {
+                      await deliverVkReply({
+                        payload: { text: markdownAttachments.attachments.join("\n") },
+                        peerId: message.peerId,
+                        accountId: account.accountId,
+                        statusSink,
+                        abortSignal,
+                        log: runtime.log,
+                      });
+                    }
+                    // Voice messages go last and without text: the text is
+                    // already in the replaced draft, so a caption would only
+                    // duplicate it.
+                    if (hasMedia) {
+                      const mediaList = normalized.mediaUrls?.length
+                        ? normalized.mediaUrls
+                        : normalized.mediaUrl
+                          ? [normalized.mediaUrl]
+                          : [];
+                      for (const media of mediaList) {
                         await deliverVkReply({
                           payload: { ...normalized, text: "", mediaUrl: media, mediaUrls: undefined },
                           peerId: message.peerId,
@@ -1069,12 +1071,12 @@ export async function handleVkInbound(params: {
                           abortSignal,
                           log: runtime.log,
                         });
-                      } catch (err) {
-                        runtime.error?.(`vk: step-progress voice tail failed: ${String(err)}`);
                       }
                     }
+                  } catch (err) {
+                    runtime.error?.(`vk: step-progress answer tail failed: ${String(err)}`);
+                    throw err;
                   }
-                  statusSink?.({ lastOutboundAt: Date.now() });
                   return;
                 }
                 // Edit failed — drop the draft and deliver the answer normally so

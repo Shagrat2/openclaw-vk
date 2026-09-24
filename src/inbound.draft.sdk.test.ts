@@ -376,4 +376,54 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       expect(chat.payloadCalls.some((p) => String(p.text ?? "").includes(image))).toBe(true);
     });
   });
+
+  // ── P1-4: a failed tail must reach the core ─────────────────────────────
+
+  describe("tail of an answer written into the draft", () => {
+    const long = `${"Длинный ответ. ".repeat(600)}Конец.`;
+
+    it("rejects deliver when a text tail chunk fails", async () => {
+      let outcome: unknown = "not run";
+      chat.failSendMessageFrom = 1; // the draft itself is send #0
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        outcome = await dispatcherOptions.deliver({ text: long }, { kind: "final" }).then(
+          () => "resolved",
+          (err: unknown) => err,
+        );
+      });
+      expect(outcome).toBeInstanceOf(Error);
+    });
+
+    it("rejects deliver when the media after the text fails", async () => {
+      let outcome: unknown = "not run";
+      chat.failSendPayload = true;
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        outcome = await dispatcherOptions
+          .deliver({ text: "Ответ с голосом.", ...voice }, { kind: "final" })
+          .then(
+            () => "resolved",
+            (err: unknown) => err,
+          );
+      });
+      expect(outcome).toBeInstanceOf(Error);
+      // What did go out is not sent again.
+      expect(texts().filter((t) => t === "Ответ с голосом.")).toHaveLength(1);
+    });
+
+    it("resolves when the whole tail is delivered", async () => {
+      let outcome: unknown = "not run";
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        outcome = await dispatcherOptions.deliver({ text: long, ...voice }, { kind: "final" }).then(
+          () => "resolved",
+          (err: unknown) => err,
+        );
+      });
+      expect(outcome).toBe("resolved");
+      expect(texts().join("")).toContain("Конец.");
+      expect(chat.messages.some((m) => m.media.includes(voice.mediaUrl))).toBe(true);
+    });
+  });
 });
