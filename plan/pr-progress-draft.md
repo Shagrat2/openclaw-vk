@@ -49,3 +49,14 @@
 После раскатки смотреть в ленте: `draft kept as answer`, `block overflows draft`,
 `answer tail failed`, `vk final reply failed`, `step-progress draft removed`.
 Дальше — перенос в ветку PR (агент), повторное ревью, PR.
+
+## Ветка PR 24.09 вечер
+
+Коммиты `51329de` (P1 + уборка + сброс при перерисовке, тест на настоящем ядре в `test:sdk`),
+`5100be3` (цитата replyTo, клавиатура после кнопки — обычным путём), `536bf14` (vkDiag),
+`eb5fe80` (CHANGELOG v2026.9.7, README, SCENARIOS). Проверки на ядрах 8.1 и 9.6 зелёные.
+Повторное ревью — перед отправкой.
+
+- [ ] После PR принести в прод `main`: `replyTo` черновика (группа, кнопка), `&& !payloadCommand`
+  при вписывании финала, трассировка через `vkDiag` (строки `step-progress …` будут видны только
+  при `diagnostics.level` ≥ redacted — у нас `full`, ок).

@@ -108,6 +108,29 @@ describe("createVkProgressDraftCompositor", () => {
     expect(mockSendMessage).toHaveBeenCalledTimes(2);
   });
 
+  it("deletes the old draft before starting a fresh one when an edit fails", async () => {
+    const handle = make();
+    await handle.overwrite("a"); // send → id 55
+    mockEditMessage.mockResolvedValueOnce(false);
+    await handle.overwrite("b"); // edit fails → the stale message must not stay behind
+    expect(mockDeleteMessage).toHaveBeenCalledWith("42", 55, expect.anything());
+    mockEditMessage.mockRejectedValueOnce(new Error("VK API error 909"));
+    mockSendMessage.mockResolvedValueOnce({ messageId: "56", chatId: "42" });
+    await handle.overwrite("c"); // fresh draft → id 56
+    await handle.overwrite("d"); // edit throws → deleted too
+    expect(mockDeleteMessage).toHaveBeenCalledWith("42", 56, expect.anything());
+  });
+
+  it("stops drafting for the turn when a send returns no usable message id", async () => {
+    const handle = make();
+    mockSendMessage.mockResolvedValueOnce({ messageId: "0", chatId: "42" });
+    expect(await handle.overwrite("шаг 1")).toBe(false);
+    expect(await handle.overwrite("шаг 2")).toBe(false);
+    expect(await handle.overwrite("шаг 3")).toBe(false);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockEditMessage).not.toHaveBeenCalled();
+  });
+
   it("removes the draft via deleteMessageVk and clears the id", async () => {
     const handle = make();
     await handle.overwrite("a");

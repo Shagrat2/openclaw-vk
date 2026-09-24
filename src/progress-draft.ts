@@ -118,8 +118,23 @@ export function createVkProgressDraftCompositor(
   // against a duplicate when the label was already added above.
   const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.entry);
 
+  // A send that went out without a usable message id leaves a message this turn
+  // can neither edit nor delete; drafting again would add one per step.
+  let unusableSend = false;
+
+  // Drops a draft message this turn can no longer edit, so no stale "working"
+  // message is left behind. Best effort: a failed delete is only reported.
+  const dropStaleDraft = async (id: number): Promise<void> => {
+    try {
+      await deleteMessageVk(params.to, id, params.account);
+      params.log?.(`vk: step-progress stale draft removed msgId=${id}`);
+    } catch (err) {
+      params.onError?.(err);
+    }
+  };
+
   const overwrite = async (rawText: string): Promise<boolean> => {
-    if (closed) {
+    if (closed || unusableSend) {
       return false;
     }
     const label = resolveProgressLabel();
@@ -133,23 +148,28 @@ export function createVkProgressDraftCompositor(
         });
         const id = Number(result.messageId);
         messageId = Number.isFinite(id) && id > 0 ? id : undefined;
+        if (messageId === undefined) unusableSend = true;
         params.log?.(`vk: step-progress draft sent msgId=${messageId ?? "?"} len=${text.length}`);
         return messageId !== undefined;
       }
       const ok = await editMessageVk(params.to, messageId, text, params.account);
       params.log?.(`vk: step-progress draft edited msgId=${messageId} ok=${ok} len=${text.length}`);
       if (!ok) {
-        // Edit window elapsed or message gone — forget it so the next render
-        // starts a fresh draft instead of silently dropping progress.
+        // Edit window elapsed or message gone — drop it and forget it so the
+        // next render starts a fresh draft instead of silently dropping progress.
+        const stale = messageId;
         messageId = undefined;
+        await dropStaleDraft(stale);
       }
       return ok;
     } catch (err) {
       // A throw leaves the same dead id behind as a `false` result would, so it
-      // is forgotten here too — otherwise the draft freezes on that message and
-      // the documented fresh-send fallback never fires.
+      // is dropped and forgotten here too — otherwise the draft freezes on that
+      // message and the documented fresh-send fallback never fires.
+      const stale = messageId;
       messageId = undefined;
       params.onError?.(err);
+      if (stale !== undefined) await dropStaleDraft(stale);
       return false;
     }
   };
