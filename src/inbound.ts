@@ -715,7 +715,6 @@ export async function handleVkInbound(params: {
       entry: vkStreamingEntry,
       mode: progressStreamMode,
       seed: String(message.conversationMessageId),
-      log: runtime.log,
       replyTo: draftReplyTo,
       onError: (err) => {
         runtime.log?.(
@@ -723,9 +722,10 @@ export async function handleVkInbound(params: {
         );
       },
     });
-    runtime.log?.(
-      `vk: step-progress draft enabled (mode=${progressStreamMode}) cmid=${redactVkId(message.conversationMessageId)}`,
-    );
+    vkDiag("step-progress draft enabled", {
+      mode: progressStreamMode,
+      cmid: message.conversationMessageId,
+    });
   }
 
   await startTypingOnce();
@@ -1057,9 +1057,11 @@ export async function handleVkInbound(params: {
                 const toolName = payload?.name?.trim();
                 if (statusReactions) await statusReactions.setTool(toolName);
                 if (progressDraft) {
-                  runtime.log?.(
-                    `vk: step-progress tool name=${toolName ?? "?"} phase=${payload?.phase ?? "?"} cmid=${redactVkId(message.conversationMessageId)}`,
-                  );
+                  vkDiag("step-progress tool", {
+                    tool: toolName ?? "?",
+                    phase: payload?.phase ?? "?",
+                    cmid: message.conversationMessageId,
+                  });
                   // Build the full draft line (like Telegram). Passing undefined
                   // leaves the compositor with nothing to render; startImmediately
                   // shows the step at once instead of waiting out the start gate.

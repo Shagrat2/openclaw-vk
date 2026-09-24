@@ -23,6 +23,9 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   createChannelProgressDraftCompositor: mockCreateCompositor,
 }));
 
+// Draft writes are traced through the channel diagnostics, which need the host.
+vi.mock("./diagnostics.js", () => ({ vkDiag: vi.fn() }));
+
 vi.mock("./send.js", () => ({
   sendMessageVk: mockSendMessage,
   editMessageVk: mockEditMessage,

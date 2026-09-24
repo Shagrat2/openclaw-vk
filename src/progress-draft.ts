@@ -13,6 +13,7 @@ import {
  * does not depend on the core version.
  */
 type ChannelProgressDraftCompositor = ReturnType<typeof createChannelProgressDraftCompositor>;
+import { vkDiag } from "./diagnostics.js";
 import { deleteMessageVk, editMessageVk, sendMessageVk } from "./send.js";
 import type { CoreConfig, ResolvedVkAccount } from "./types.js";
 
@@ -52,8 +53,6 @@ export type VkProgressDraftParams = {
    */
   replyTo?: string;
   onError?: (err: unknown) => void;
-  /** Optional diagnostic logger — traces draft send/edit/remove to gateway.log. */
-  log?: (msg: string) => void;
 };
 
 /**
@@ -146,11 +145,11 @@ export function createVkProgressDraftCompositor(
         if (messageId !== undefined) {
           quoted = true;
         }
-        params.log?.(`vk: step-progress draft sent msgId=${messageId ?? "?"} len=${text.length}`);
+        vkDiag("step-progress draft sent", { msgId: messageId ?? 0, len: text.length });
         return messageId !== undefined;
       }
       const ok = await editMessageVk(params.to, messageId, text, params.account);
-      params.log?.(`vk: step-progress draft edited msgId=${messageId} ok=${ok} len=${text.length}`);
+      vkDiag("step-progress draft edited", { msgId: messageId, ok, len: text.length });
       if (!ok) {
         // Edit window elapsed or message gone — forget it so the next render
         // starts a fresh draft instead of silently dropping progress.
@@ -175,7 +174,7 @@ export function createVkProgressDraftCompositor(
     messageId = undefined;
     try {
       await deleteMessageVk(params.to, id, params.account);
-      params.log?.(`vk: step-progress draft removed msgId=${id}`);
+      vkDiag("step-progress draft removed", { msgId: id });
     } catch (err) {
       params.onError?.(err);
     }
