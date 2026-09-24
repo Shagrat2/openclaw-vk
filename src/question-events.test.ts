@@ -22,6 +22,16 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
 
 const state = vi.hoisted(() => ({
   config: {} as Record<string, unknown>,
+  pairingStore: [] as string[],
+}));
+// The inbound gate's pairing read, as the core does it: the store counts only
+// under dmPolicy "pairing".
+vi.mock("openclaw/plugin-sdk/channel-pairing", () => ({
+  createChannelPairingController: () => ({ readStoreForDmPolicy: async () => state.pairingStore }),
+}));
+vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
+  readStoreAllowFromForDmPolicy: async ({ dmPolicy, readStore }: { dmPolicy: string; readStore: () => Promise<string[]> }) =>
+    dmPolicy === "pairing" ? await readStore() : [],
 }));
 vi.mock("./runtime.js", () => ({
   getVkRuntime: () => ({ config: { current: () => state.config } }),
@@ -65,7 +75,8 @@ function snackbar(answer: ReturnType<typeof vi.fn>): string | undefined {
 }
 
 beforeEach(() => {
-  state.config = { channels: { vk: { token: "t" } } };
+  state.config = { channels: { vk: { token: "t", dmPolicy: "allowlist", allowFrom: [String(DM)] } } };
+  state.pairingStore = [];
   resolveOption.mockReset();
   sendMessageVk.mockReset().mockResolvedValue({ messageId: "1", chatId: String(DM) });
   runtimeEnv.log.mockReset();
@@ -103,7 +114,7 @@ describe("handleVkQuestionEvent", () => {
     });
     expect(args).not.toHaveProperty("customInput");
     // The authorizer is re-run by the core right before the answer is written.
-    expect(args.authorize()).toBe(true);
+    expect(await args.authorize()).toBe(true);
     expect(snackbar(answer)).toBe("Ответ принят: Увеличить ×2");
   });
 
@@ -113,7 +124,24 @@ describe("handleVkQuestionEvent", () => {
     await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv });
     const { authorize } = resolveOption.mock.calls[0][0];
     clearVkQuestionDeliveries();
-    expect(authorize()).toBe(false);
+    expect(await authorize()).toBe(false);
+  });
+
+  it("the authorizer turns false when the person leaves the DM allowlist meanwhile", async () => {
+    resolveOption.mockResolvedValue({ status: "answered", questionId: "q1", optionValue: "A" });
+    const { event } = pressEvent();
+    await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv });
+    const { authorize } = resolveOption.mock.calls[0][0];
+    state.config = { channels: { vk: { token: "t", dmPolicy: "allowlist", allowFrom: [] } } };
+    expect(await authorize()).toBe(false);
+  });
+
+  it("a DM press from someone no longer allowed is refused without asking the core", async () => {
+    state.config = { channels: { vk: { token: "t", dmPolicy: "allowlist", allowFrom: ["1"] } } };
+    const { event, answer } = pressEvent();
+    await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv });
+    expect(resolveOption).not.toHaveBeenCalled();
+    expect(snackbar(answer)).toBe("Ответить на этот вопрос может только тот, кому он задан");
   });
 
   it("refuses a press from someone else's direct chat without asking the core", async () => {
@@ -209,35 +237,63 @@ describe("handleVkQuestionEvent", () => {
 describe("isVkQuestionAnswerer", () => {
   const ask = (config: Record<string, unknown>, userId: number, peerId = CHAT) =>
     isVkQuestionAnswerer({ config: config as never, accountId: "default", peerId, userId });
+  const dm = (vk: Record<string, unknown>, userId = DM) => ask({ channels: { vk } }, userId, DM);
 
-  it("in a direct chat only its other side", () => {
-    expect(ask({ channels: { vk: {} } }, DM, DM)).toBe(true);
-    expect(ask({ channels: { vk: {} } }, 1, DM)).toBe(false);
+  it("in a direct chat only its other side, and only while the DM policy admits them", async () => {
+    expect(await dm({ dmPolicy: "open" })).toBe(true);
+    expect(await dm({ dmPolicy: "open" }, 1)).toBe(false);
+    expect(await dm({ dmPolicy: "allowlist", allowFrom: [`vk:${DM}`] })).toBe(true);
+    expect(await dm({ dmPolicy: "allowlist", allowFrom: ["1"] })).toBe(false);
+    expect(await dm({ dmPolicy: "allowlist", allowFrom: ["*"] })).toBe(true);
+    expect(await dm({ dmPolicy: "disabled", allowFrom: ["*"] })).toBe(false);
   });
 
-  it("in a group chat a sender on the group allowlist", () => {
+  it("pairing: an approved sender from the store answers, an unknown one does not", async () => {
+    expect(await dm({})).toBe(false);
+    state.pairingStore = [String(DM)];
+    expect(await dm({})).toBe(true);
+    // The store does not widen an allowlist policy, as on the inbound gate.
+    expect(await dm({ dmPolicy: "allowlist" })).toBe(false);
+  });
+
+  it("an unreadable pairing store admits nobody extra", async () => {
+    const failing = async () => {
+      throw new Error("store down");
+    };
+    expect(
+      await isVkQuestionAnswerer({
+        config: { channels: { vk: { allowFrom: [] } } } as never,
+        accountId: "default",
+        peerId: DM,
+        userId: DM,
+        readStoreAllowFrom: failing,
+      }),
+    ).toBe(false);
+  });
+
+  it("in a group chat a sender on the group allowlist", async () => {
     const config = { channels: { vk: { groupPolicy: "allowlist", groupAllowFrom: ["vk:42"] } } };
-    expect(ask(config, 42)).toBe(true);
-    expect(ask(config, 43)).toBe(false);
+    expect(await ask(config, 42)).toBe(true);
+    expect(await ask(config, 43)).toBe(false);
   });
 
-  it("a per-chat allowlist overrides the account one", () => {
+  it("a per-chat allowlist overrides the account one", async () => {
     const config = {
       channels: { vk: { groupAllowFrom: ["42"], groups: { [String(CHAT)]: { allowFrom: ["43"] } } } },
     };
-    expect(ask(config, 43)).toBe(true);
-    expect(ask(config, 42)).toBe(false);
+    expect(await ask(config, 43)).toBe(true);
+    expect(await ask(config, 42)).toBe(false);
   });
 
-  it("an empty allowlist admits everyone only in an open group", () => {
-    expect(ask({ channels: { vk: { groupPolicy: "open" } } }, 7)).toBe(true);
-    expect(ask({ channels: { vk: {} } }, 7)).toBe(false);
+  it("an empty allowlist admits everyone only in an open group", async () => {
+    expect(await ask({ channels: { vk: { groupPolicy: "open" } } }, 7)).toBe(true);
+    expect(await ask({ channels: { vk: {} } }, 7)).toBe(false);
   });
 
-  it("nobody in a disabled group", () => {
-    expect(ask({ channels: { vk: { groupPolicy: "disabled", groupAllowFrom: ["*"] } } }, 7)).toBe(false);
+  it("nobody in a disabled group", async () => {
+    expect(await ask({ channels: { vk: { groupPolicy: "disabled", groupAllowFrom: ["*"] } } }, 7)).toBe(false);
     expect(
-      ask({ channels: { vk: { groupAllowFrom: ["*"], groups: { "*": { enabled: false } } } } }, 7),
+      await ask({ channels: { vk: { groupAllowFrom: ["*"], groups: { "*": { enabled: false } } } } }, 7),
     ).toBe(false);
   });
 });

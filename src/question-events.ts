@@ -6,11 +6,15 @@
  * answered exactly once, with a snackbar saying what happened.
  *
  * Who may answer: in a direct chat only its other side — the question was put
- * to them; in a group chat only a sender the account's group allowlist admits,
- * and in an open group anyone in it. The check runs before the press is passed
+ * to them — and only while the DM policy still admits them (`dmPolicy`,
+ * `allowFrom`, the pairing store), as for an incoming message; in a group chat
+ * only a sender the account's group allowlist admits, and in an open group
+ * anyone in it. The check runs before the press is passed
  * on and again as the resolver's `authorize`, right before the answer is
  * written, so access lost in between cannot answer.
  */
+import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
+import { readStoreAllowFromForDmPolicy } from "openclaw/plugin-sdk/channel-policy";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { resolveVkAccount } from "./accounts.js";
@@ -55,17 +59,57 @@ function snackbarText(text: string): string {
   return chars.length <= SNACKBAR_MAX_CHARS ? text : `${chars.slice(0, SNACKBAR_MAX_CHARS - 1).join("")}…`;
 }
 
+/** Senders approved through pairing, read the way the inbound gate reads them. */
+async function readVkDmStoreAllowFrom(accountId: string, dmPolicy: string): Promise<string[]> {
+  const pairing = createChannelPairingController({
+    core: getVkRuntime(),
+    channel: "vk",
+    accountId,
+  });
+  return await readStoreAllowFromForDmPolicy({
+    provider: "vk",
+    accountId,
+    dmPolicy: dmPolicy as never,
+    readStore: pairing.readStoreForDmPolicy,
+  });
+}
+
 /** May `userId` answer a question delivered to `peerId`, under the current config? */
-export function isVkQuestionAnswerer(params: {
+export async function isVkQuestionAnswerer(params: {
   config: CoreConfig;
   accountId: string;
   peerId: number;
   userId: number;
-}): boolean {
-  if (!isVkGroupPeerId(params.peerId)) {
-    return params.userId === params.peerId;
-  }
+  /** Pairing-store allowlist; defaults to the core's pairing store. */
+  readStoreAllowFrom?: (dmPolicy: string) => Promise<string[]>;
+}): Promise<boolean> {
   const account = resolveVkAccount({ cfg: params.config, accountId: params.accountId });
+  if (!isVkGroupPeerId(params.peerId)) {
+    if (params.userId !== params.peerId) {
+      return false;
+    }
+    // The same DM gate an incoming message passes: someone removed from the
+    // allowlist while their question was pending does not answer it.
+    const dmPolicy = account.config.dmPolicy ?? "pairing";
+    if (dmPolicy === "disabled") {
+      return false;
+    }
+    if (dmPolicy === "open") {
+      return true;
+    }
+    let storeAllowFrom: string[] = [];
+    try {
+      storeAllowFrom = await (params.readStoreAllowFrom ??
+        ((policy) => readVkDmStoreAllowFrom(params.accountId, policy)))(dmPolicy);
+    } catch {
+      // An unreadable store admits nobody extra; the config allowlist still counts.
+    }
+    const allowFrom = normalizeVkAllowlist([
+      ...(account.config.allowFrom ?? []),
+      ...storeAllowFrom,
+    ]);
+    return resolveVkAllowlistMatch({ allowFrom, senderId: params.userId }).allowed;
+  }
   const groupConfig =
     account.config.groups?.[String(params.peerId)] ?? account.config.groups?.["*"];
   if (groupConfig?.enabled === false || account.config.groupPolicy === "disabled") {
@@ -105,14 +149,14 @@ export async function handleVkQuestionEvent(params: {
   };
   const isOpenHere = () =>
     findOpenVkQuestionDelivery({ questionId, accountId, peerId: event.peerId }) !== undefined;
-  const mayAnswer = () =>
+  const mayAnswer = async () =>
     isOpenHere() &&
-    isVkQuestionAnswerer({
+    (await isVkQuestionAnswerer({
       config: readVkRuntimeConfig(getVkRuntime()),
       accountId,
       peerId: event.peerId,
       userId: event.userId,
-    });
+    }));
 
   vkDiag("question button", {
     questionId,
@@ -124,7 +168,7 @@ export async function handleVkQuestionEvent(params: {
     await reply(TEXT.closed);
     return true;
   }
-  if (!mayAnswer()) {
+  if (!(await mayAnswer())) {
     runtime.log?.(
       `vk: question ${questionId} press refused for user=${redactVkId(event.userId)} peer=${redactVkId(event.peerId)}`,
     );
