@@ -169,6 +169,16 @@ vi.mock("./accounts.js", () => ({
   resolveVkAccount: mockResolveVkAccount,
   listVkAccountIds: mockListVkAccountIds,
   resolveDefaultVkAccountId: mockResolveDefaultVkAccountId,
+  describeMissingVkToken: (account: { accountId: string; tokenUnresolved?: string }) =>
+    `VK token SecretRef ${account.tokenUnresolved} for account "${account.accountId}" is not resolved`,
+}));
+
+// The contract imports SDK subpaths that CI does not install; its own tests cover it.
+const mockSecretTargetRegistryEntries = vi.hoisted(() => [{ id: "channels.vk.token" }]);
+const mockCollectRuntimeConfigAssignments = vi.hoisted(() => vi.fn());
+vi.mock("./secret-contract.js", () => ({
+  secretTargetRegistryEntries: mockSecretTargetRegistryEntries,
+  collectRuntimeConfigAssignments: mockCollectRuntimeConfigAssignments,
 }));
 
 vi.mock("./config-schema.js", () => ({
@@ -1276,6 +1286,13 @@ describe("gateway", () => {
     });
   });
 
+  it("hands the core its secret contract", () => {
+    expect(vkPlugin.secrets).toEqual({
+      secretTargetRegistryEntries: mockSecretTargetRegistryEntries,
+      collectRuntimeConfigAssignments: mockCollectRuntimeConfigAssignments,
+    });
+  });
+
   describe("startAccount", () => {
     it("calls probeVkBot and monitorVkProvider", async () => {
       const setStatus = vi.fn();
@@ -1322,6 +1339,21 @@ describe("gateway", () => {
       await expect(vkPlugin.gateway!.startAccount(ctx as never)).rejects.toThrow(
         "non-empty community access token",
       );
+    });
+
+    it("refuses to start on an unresolved SecretRef and names it, without calling VK", async () => {
+      const ctx = {
+        account: { accountId: "default", token: "", tokenUnresolved: "exec:openclaw-keychain:vk-group-token" },
+        cfg: {},
+        runtime: {},
+        log: { info: vi.fn() },
+      };
+
+      await expect(vkPlugin.gateway!.startAccount(ctx as never)).rejects.toThrow(
+        'VK token SecretRef exec:openclaw-keychain:vk-group-token for account "default" is not resolved',
+      );
+      expect(mockProbeVkBot).not.toHaveBeenCalled();
+      expect(mockMonitorVkProvider).not.toHaveBeenCalled();
     });
 
     it("continues if probe fails", async () => {

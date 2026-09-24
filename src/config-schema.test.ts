@@ -261,3 +261,33 @@ describe("VkAccountSchema transport", () => {
     expect(result.success).toBe(false);
   });
 });
+
+// ── SecretRef token ──────────────────────────────────────────────────────────
+
+describe("token as a SecretRef", () => {
+  const ok = (token: unknown) => VkConfigSchema.safeParse({ token }).success;
+
+  it("accepts a string and every reference source the host resolves", () => {
+    expect(ok("vk1.a.xxx")).toBe(true);
+    expect(ok({ source: "exec", provider: "openclaw-keychain", id: "vk-group-token" })).toBe(true);
+    expect(ok({ source: "env", provider: "default", id: "VK_GROUP_TOKEN" })).toBe(true);
+    expect(ok({ source: "store", provider: "default", id: "VK_GROUP_TOKEN" })).toBe(true);
+    expect(ok({ source: "file", provider: "secrets-file", id: "/vk/token" })).toBe(true);
+  });
+
+  it("rejects a malformed reference the host would reject too", () => {
+    expect(ok({ source: "exec" })).toBe(false);
+    expect(ok({ source: "vault", provider: "default", id: "X" })).toBe(false);
+    expect(ok({ source: "env", provider: "default", id: "lowercase" })).toBe(false);
+    expect(ok({ source: "exec", provider: "Bad Provider", id: "x" })).toBe(false);
+    expect(ok({ source: "exec", provider: "p", id: "x", extra: true })).toBe(false);
+    expect(ok(42)).toBe(false);
+  });
+
+  it("accepts a reference in a named account", () => {
+    const result = VkConfigSchema.safeParse({
+      accounts: { work: { token: { source: "exec", provider: "openclaw-keychain", id: "vk-work" } } },
+    });
+    expect(result.success).toBe(true);
+  });
+});

@@ -10,6 +10,7 @@ const entryPoints = [
   "setup-entry.ts",
   "api.ts",
   "doctor-contract-api.ts",
+  "secret-contract-api.ts",
   ...globSync("src/*.ts", { cwd: root }).filter(
     (file) => !file.endsWith(".test.ts") && file !== "src/test-helpers.ts",
   ).sort(),

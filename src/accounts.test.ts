@@ -15,6 +15,7 @@ vi.mock("openclaw/plugin-sdk/account-id", () => ({
 }));
 
 import {
+  describeMissingVkToken,
   listEnabledVkAccounts,
   listVkAccountIds,
   resolveDefaultVkAccountId,
@@ -309,5 +310,61 @@ describe("transport section", () => {
       accountId: "sales",
     });
     expect(result.config.transport).toEqual({ silenceMs: 90_000 });
+  });
+});
+
+// ── SecretRef token ──────────────────────────────────────────────────────────
+
+describe("SecretRef token", () => {
+  const ref = { source: "exec", provider: "openclaw-keychain", id: "vk-group-token" };
+
+  it("an unresolved reference does not crash: empty token, the reference is named", () => {
+    const account = resolveVkAccount({ cfg: { channels: { vk: { token: ref } } } as CoreConfig });
+    expect(account.token).toBe("");
+    expect(account.tokenSource).toBe("none");
+    expect(account.tokenUnresolved).toBe("exec:openclaw-keychain:vk-group-token");
+    expect(describeMissingVkToken(account)).toBe(
+      'VK token SecretRef exec:openclaw-keychain:vk-group-token for account "default" is not resolved ' +
+        "(check the secrets provider: openclaw secrets audit)",
+    );
+  });
+
+  it("the account with a reference stays listed, so the core can report it unavailable", () => {
+    expect(listVkAccountIds({ channels: { vk: { token: ref } } } as CoreConfig)).toEqual(["default"]);
+  });
+
+  it("a reference in a named account overrides the root string", () => {
+    const account = resolveVkAccount({
+      cfg: { channels: { vk: { token: "root", accounts: { work: { token: ref } } } } } as CoreConfig,
+      accountId: "work",
+    });
+    expect(account.tokenUnresolved).toBe("exec:openclaw-keychain:vk-group-token");
+  });
+
+  it("VK_TOKEN and tokenFile still win over an unresolved reference", () => {
+    process.env.VK_TOKEN = "env-token";
+    const fromEnv = resolveVkAccount({ cfg: { channels: { vk: { token: ref } } } as CoreConfig });
+    expect(fromEnv).toMatchObject({ token: "env-token", tokenSource: "env" });
+    expect(fromEnv.tokenUnresolved).toBeUndefined();
+    delete process.env.VK_TOKEN;
+
+    mockTryReadSecretFileSync.mockReturnValue("file-token");
+    const fromFile = resolveVkAccount({ cfg: { channels: { vk: { token: ref, tokenFile: "/t" } } } as CoreConfig });
+    expect(fromFile).toMatchObject({ token: "file-token", tokenSource: "tokenFile" });
+  });
+
+  it("a partial reference and a non-string value do not crash either", () => {
+    const partial = resolveVkAccount({ cfg: { channels: { vk: { token: { source: "env" } } } } as CoreConfig });
+    expect(partial.tokenUnresolved).toBe("env:?:?");
+    const odd = resolveVkAccount({ cfg: { channels: { vk: { token: 42 } } } as unknown as CoreConfig });
+    expect(odd).toMatchObject({ token: "", tokenUnresolved: "value is not a string" });
+    expect(listVkAccountIds({ channels: { vk: { token: 42, accounts: { a: {} } } } } as unknown as CoreConfig)).toEqual([
+      "default",
+      "a",
+    ]);
+  });
+
+  it("without a reference the message is the old one", () => {
+    expect(describeMissingVkToken({ accountId: "default" })).toBe("VK token not configured");
   });
 });

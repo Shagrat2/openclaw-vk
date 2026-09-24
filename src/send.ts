@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { enqueueKeyedTask } from "openclaw/plugin-sdk/core";
 import { VK, getRandomId } from "vk-io";
-import { resolveVkAccount } from "./accounts.js";
+import { describeMissingVkToken, resolveVkAccount } from "./accounts.js";
 import { describeVkSourceKind, resolveVkDiagLevel, vkDiag, vkDiagFailure } from "./diagnostics.js";
 import { readVkErrorCode, readVkErrorMessage, readVkErrorSystemCode } from "./vk-errors.js";
 import {
@@ -819,7 +819,7 @@ async function resolveSendTarget(params: { cfg?: CoreConfig; accountId?: string;
   const cfg = params.cfg ?? readVkRuntimeConfig(runtime);
   const account = resolveVkAccount({ cfg, accountId: params.accountId });
   if (!account.token) {
-    throw new Error("VK token not configured");
+    throw new Error(describeMissingVkToken(account));
   }
 
   const normalizedTo = normalizeVkTargetId(params.to);

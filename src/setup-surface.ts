@@ -96,8 +96,11 @@ export const vkSetupWizard: ChannelSetupWizard = {
         const resolved = resolveVkAccount({ cfg, accountId });
         return {
           accountConfigured: Boolean(resolved.token.trim()),
+          // A SecretRef token is an object; it counts as configured, not as a string to trim.
           hasConfiguredValue: Boolean(
-            resolved.config.token?.trim() || resolved.config.tokenFile?.trim(),
+            (typeof resolved.config.token === "string"
+              ? resolved.config.token.trim()
+              : resolved.config.token) || resolved.config.tokenFile?.trim(),
           ),
           resolvedValue: resolved.token.trim() || undefined,
           envValue:

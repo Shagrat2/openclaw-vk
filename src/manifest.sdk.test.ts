@@ -97,4 +97,18 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     // manifest has never listed.
     expect(validate({ streaming: { mode: "progress" }, accounts: { work: { token: "tok", dmPolicy: "open" } } })).toBe(true);
   });
+  it("accepts the token as a string or a SecretRef, at channel level and under an account", () => {
+    const ref = { source: "exec", provider: "openclaw-keychain", id: "vk-group-token" };
+    for (const token of ["tok", ref, { source: "env", provider: "default", id: "VK_GROUP_TOKEN" }]) {
+      expect(validate({ token })).toBe(true);
+      expect(validate({ accounts: { work: { token } } })).toBe(true);
+    }
+  });
+
+  it("rejects a malformed SecretRef token, at either level", () => {
+    for (const token of [{ source: "exec" }, { source: "exec", provider: "p", id: "x", extra: 1 }, 42]) {
+      expect(validate({ token })).toBe(false);
+      expect(validate({ accounts: { work: { token } } })).toBe(false);
+    }
+  });
 });

@@ -87,11 +87,30 @@ const VkAudioSchema = z
   .strict()
   .optional();
 
+/**
+ * Community token: a string, or a SecretRef `{ source, provider, id }` the host
+ * resolves before the plugin reads the config (see `secret-contract.ts`).
+ *
+ * Mirrors the SDK's `buildSecretInputSchema()`, which cannot be reused here: it
+ * is built on the host's zod 4, and this schema on the plugin's own zod.
+ */
+const SECRET_PROVIDER_RE = /^[a-z][a-z0-9_-]{0,63}$/;
+const ENV_SECRET_ID_RE = /^[A-Z][A-Z0-9_]{0,127}$/;
+const VkSecretInputSchema = z.union([
+  z.string(),
+  z.discriminatedUnion("source", [
+    z.object({ source: z.literal("env"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string().regex(ENV_SECRET_ID_RE) }).strict(),
+    z.object({ source: z.literal("store"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string().regex(ENV_SECRET_ID_RE) }).strict(),
+    z.object({ source: z.literal("file"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string() }).strict(),
+    z.object({ source: z.literal("exec"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string() }).strict(),
+  ]),
+]);
+
 const VkAccountSchemaBase = z
   .object({
     name: z.string().optional(),
     enabled: z.boolean().optional(),
-    token: z.string().optional(),
+    token: VkSecretInputSchema.optional(),
     tokenFile: z.string().optional(),
     dmPolicy: DmPolicySchema.optional(),
     transport: VkTransportSchema,

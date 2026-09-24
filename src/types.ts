@@ -9,10 +9,18 @@ type GroupPolicy = "open" | "disabled" | "allowlist";
 export const VK_CONTEXT_VISIBILITY_MODES = ["all", "allowlist", "allowlist_quote"] as const;
 export type VkContextVisibility = (typeof VK_CONTEXT_VISIBILITY_MODES)[number];
 
+/** Reference to a secret the host resolves before the plugin reads the config. */
+export type VkSecretRef = {
+  source: string;
+  provider?: string;
+  id?: string;
+};
+
 export type VkAccountConfig = {
   name?: string;
   enabled?: boolean;
-  token?: string;
+  /** Community token, or a SecretRef the host resolves into one. */
+  token?: string | VkSecretRef;
   tokenFile?: string;
   dmPolicy?: DmPolicy;
   allowFrom?: Array<string | number>;
@@ -49,7 +57,10 @@ export type ResolvedVkAccount = {
   accountId: string;
   enabled: boolean;
   name?: string;
+  /** Empty when the token is missing or its SecretRef was not resolved. */
   token: string;
+  /** `source:provider:id` of a SecretRef the host left unresolved. */
+  tokenUnresolved?: string;
   tokenSource: "env" | "tokenFile" | "config" | "none";
   config: VkAccountConfig;
 };

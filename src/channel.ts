@@ -13,12 +13,14 @@ import type { ChannelStatusIssue } from "openclaw/plugin-sdk/channel-contract";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
 import {
+  describeMissingVkToken,
   listVkAccountIds,
   resolveDefaultVkAccountId,
   resolveVkAccount,
   type ResolvedVkAccount,
 } from "./accounts.js";
 import { VkConfigSchema } from "./config-schema.js";
+import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import { vkDiag } from "./diagnostics.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
@@ -218,6 +220,10 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   },
   reload: { configPrefixes: ["channels.vk"] },
   configSchema: buildChannelConfigSchema(VkConfigSchema),
+  secrets: {
+    secretTargetRegistryEntries,
+    collectRuntimeConfigAssignments,
+  },
   config: {
     ...vkConfigAdapter,
     isConfigured: (account) => Boolean(account.token?.trim()),
@@ -469,6 +475,9 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         accountId: account.accountId,
         setStatus: ctx.setStatus,
       });
+      if (account.tokenUnresolved) {
+        throw new Error(describeMissingVkToken(account));
+      }
       const token = account.token.trim();
       if (!token) {
         throw new Error(

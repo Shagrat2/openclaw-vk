@@ -35,6 +35,7 @@
     "dist",
     "api.ts",
     "doctor-contract-api.ts",
+    "secret-contract-api.ts",
     "index.ts",
     "setup-entry.ts",
     "openclaw.plugin.json",
