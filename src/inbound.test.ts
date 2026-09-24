@@ -1788,6 +1788,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       4242,
       expect.stringContaining("сложился из блоков"),
       expect.anything(),
+      expect.anything(),
     );
     mockCurrentMessageId.mockReturnValue(undefined);
   });
@@ -1951,6 +1952,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       expect.anything(),
       4242,
       expect.stringContaining("сложился из блоков"),
+      expect.anything(),
       expect.anything(),
     );
     mockCurrentMessageId.mockReturnValue(undefined);
