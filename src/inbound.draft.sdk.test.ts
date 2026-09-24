@@ -455,4 +455,70 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       expect(texts()).toEqual(["Ответ блоками."]);
     });
   });
+
+  // ── A question from the core holds the turn: it must stay its own message ─
+
+  describe("question from the core (ask_user / AskUserQuestion) during a turn", () => {
+    const QID = `ask_${"d".repeat(32)}`;
+    const question = {
+      text: "Question for you:\n\nАпскейл\nКакой размер?\n1. ×2\n2. ×4",
+      presentationTextMode: "fallback",
+      presentation: {
+        blocks: [
+          { type: "text", text: "Какой размер?" },
+          {
+            type: "buttons",
+            buttons: [
+              { label: "×2", action: { type: "question", questionId: QID, optionValue: "×2" } },
+              { label: "×4", action: { type: "question", questionId: QID, optionValue: "×4" } },
+            ],
+          },
+        ],
+      },
+      channelData: { askUser: { questionId: QID, optionValues: ["×2", "×4"] } },
+    };
+
+    for (const kind of ["block", "tool"] as const) {
+      it(`a ${kind} question goes out as its own message with its presentation, not into the draft`, async () => {
+        await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+          await replyOptions.onToolStart?.(toolStart());
+          await dispatcherOptions.deliver(question, { kind });
+          // The next tool step redraws the draft; the question must survive it.
+          await replyOptions.onToolStart?.(toolStart("render"));
+          await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+        });
+        const sent = chat.payloadCalls.find((payload) => payload.channelData);
+        // Handed to sendPayloadVk whole: it builds the keyboard from these.
+        expect(sent?.channelData).toEqual(question.channelData);
+        expect(sent?.presentation).toEqual(question.presentation);
+        // Not labelled as progress: it is a question, not a step.
+        expect(String(sent?.text).startsWith(LABEL)).toBe(false);
+        // The step list above the question is gone; the steps after it and
+        // the answer land below it, in the order they happened.
+        expect(texts()).toEqual([question.text, "Готово."]);
+      });
+    }
+
+    it("steps after the question are drawn in a fresh draft below it", async () => {
+      let during: string[] = [];
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver(question, { kind: "tool" });
+        await replyOptions.onToolStart?.(toolStart("render"));
+        during = texts();
+      });
+      expect(during).toHaveLength(2);
+      expect(during[0]).toBe(question.text);
+      expect(during[1]?.startsWith(LABEL)).toBe(true);
+    });
+
+    it("the answer blocks already in the draft stay above the question", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Сначала посмотрю варианты." }, { kind: "block" });
+        await dispatcherOptions.deliver(question, { kind: "block" });
+      });
+      expect(texts()).toEqual(["Сначала посмотрю варианты.", question.text]);
+    });
+  });
 });

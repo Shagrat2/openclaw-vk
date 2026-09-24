@@ -42,6 +42,8 @@ import {
   resolveVkInboundResolvedMedia,
 } from "./media.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
+import { readVkAskUserQuestionId } from "./question.js";
+import { normalizeVkAllowlist, resolveVkAllowlistMatch } from "./send-support.js";
 import { getVkRuntime } from "./runtime.js";
 import {
   clearVkInstances,
@@ -92,13 +94,6 @@ function isVkGroupChat(peerId: number): boolean {
   return peerId >= VK_GROUP_CHAT_OFFSET;
 }
 
-function normalizeVkAllowlist(allowFrom: Array<string | number> | undefined): string[] {
-  if (!allowFrom) {
-    return [];
-  }
-  return allowFrom.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean);
-}
-
 /** The core's precedence: account, then channel (merged into the account), then channel defaults. */
 function resolveVkContextVisibility(accountConfig: VkAccountConfig, config: unknown): VkContextVisibility {
   const defaults = (config as { channels?: { defaults?: { contextVisibility?: VkContextVisibility } } })
@@ -142,21 +137,6 @@ function collectVkForwardImages(forwards: readonly VkInboundForward[]): VkInboun
     ...(forward.attachments ?? []).filter((attachment) => attachment.kind === "image"),
     ...collectVkForwardImages(forward.forwards ?? []),
   ]);
-}
-
-function resolveVkAllowlistMatch(params: { allowFrom: string[]; senderId: number }): {
-  allowed: boolean;
-} {
-  const senderStr = String(params.senderId);
-  if (params.allowFrom.length === 0) {
-    return { allowed: false };
-  }
-  if (params.allowFrom.includes("*")) {
-    return { allowed: true };
-  }
-  return {
-    allowed: params.allowFrom.some((entry) => entry === senderStr || entry === `vk:${senderStr}`),
-  };
 }
 
 type VkInboundMediaKind = NonNullable<ChannelInboundMediaInput["kind"]>;
@@ -863,6 +843,13 @@ export async function handleVkInbound(params: {
             delete outboundPayload.replyToId;
           }
           const resolvedButtons = resolveVkButtonsFromPayload(normalized);
+          // A question from the core (ask_user / AskUserQuestion) holds the
+          // turn until it is answered, so it must stay a message of its own
+          // with its buttons: never written into the step draft (the next tool
+          // step would overwrite it), never labelled as progress, never folded
+          // into the final. `sendPayloadVk` gives it the keyboard.
+          const isQuestion = readVkAskUserQuestionId(normalized) !== undefined;
+          const hasControls = Boolean(resolvedButtons) || isQuestion;
           const isFinal = info?.kind === "final";
           // ── A voice supplement is not an answer ──────────────────────────
           // The core may follow a delivered answer with a SECOND final that
@@ -899,7 +886,7 @@ export async function handleVkInbound(params: {
               !normalized.mediaUrl &&
               !(normalized.mediaUrls?.length ?? 0) &&
               markdownAttachments.attachments.length === 0 &&
-              !resolvedButtons,
+              !hasControls,
           );
           if (progressDraft && isTextBlock) {
             // Blocks are CHUNKS of the answer, not its accumulated version (the
@@ -944,6 +931,13 @@ export async function handleVkInbound(params: {
             // A block with media or buttons goes as its own message. Freeze
             // the answer part in the draft first, so it stays above it.
             await sealDraftAnswer();
+            if (isQuestion) {
+              // The turn waits on this question and goes on after the answer.
+              // A step list left above it would keep being redrawn there, and
+              // the final answer would land above the question it follows.
+              // Drop it: the next step starts a fresh draft below the question.
+              await progressDraft.remove();
+            }
           }
 
           // ── Intermediate block WITH MEDIA → own message, but labelled ────
@@ -960,7 +954,13 @@ export async function handleVkInbound(params: {
           // без метки, и шаги было бы не отличить от ответа.
           // A plain text block that could not go into the draft is part of the
           // answer, not progress: it carries no "working" header.
-          if (progressDraft && !isFinal && !isTextBlock && outboundPayload.text?.trim()) {
+          if (
+            progressDraft &&
+            !isFinal &&
+            !isTextBlock &&
+            !isQuestion &&
+            outboundPayload.text?.trim()
+          ) {
             const label = resolveVkProgressLabel(vkStreamingEntry);
             if (label && !outboundPayload.text.startsWith(label)) {
               outboundPayload.text = `${label} ${outboundPayload.text}`;
@@ -997,7 +997,7 @@ export async function handleVkInbound(params: {
             // separate messages. Any spoken answer used to bypass the
             // replacement — the draft was simply deleted, progress vanished and
             // the answer arrived as a new message.
-            if (draftMsgId !== undefined && finalText && !resolvedButtons) {
+            if (draftMsgId !== undefined && finalText && !hasControls) {
               const chunks = renderVkMarkdownChunks(markdownAttachments.text);
               // The replacement used to work only for single-message answers,
               // so long output (narration plus result) left the draft as a wall
