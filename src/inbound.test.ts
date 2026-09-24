@@ -186,18 +186,33 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", () => ({
   resolveChannelPreviewStreamMode: mockResolveStreamMode,
   // Return the raw input as the "line" so tests can assert what was built.
   buildChannelProgressDraftLineForEntry: (_entry: unknown, input: unknown) => input,
-  // The core decides whether a final is truncated and which text wins.
-  isPotentialTruncatedFinal: (text: string) => text.trim().length === 0,
+  // The core decides whether a final is truncated and which text wins. Mirrors
+  // the core (channel-outbound): only a final that ends in an ellipsis after at
+  // least 48 characters counts as truncated, and only a candidate that extends
+  // it by a real continuation wins — an empty final never selects anything.
+  isPotentialTruncatedFinal: (text: string) => {
+    const trimmed = text.trimEnd();
+    const untruncated = trimmed.replace(/(?<!\s)(?:\s*(?:\.{3}|\u2026))+$/u, "").trimEnd();
+    return untruncated.length >= 48 && untruncated !== trimmed;
+  },
   selectLongerFinalText: ({
     finalText,
     candidateTexts,
   }: {
     finalText: string;
     candidateTexts: readonly (string | undefined)[];
-  }) =>
-    [finalText, ...candidateTexts]
-      .filter((t): t is string => Boolean(t))
-      .sort((a, b) => b.length - a.length)[0],
+  }) => {
+    const final = finalText.trimEnd();
+    const untruncated = final.replace(/(?<!\s)(?:\s*(?:\.{3}|\u2026))+$/u, "").trimEnd();
+    if (untruncated.length < 48 || untruncated === final) return undefined;
+    for (const candidate of candidateTexts) {
+      const text = candidate?.trimEnd();
+      if (!text || text.length <= final.length || !text.startsWith(untruncated)) continue;
+      const continuation = text.slice(untruncated.length).trimStart();
+      if (continuation.length >= 24 && /^[\p{L}\p{N}]/u.test(continuation)) return text;
+    }
+    return undefined;
+  },
   createReplyPrefixOptions: mockCreateReplyPrefixOptions,
   createTypingCallbacks: mockCreateTypingCallbacks,
   logTypingFailure: mockLogTypingFailure,
