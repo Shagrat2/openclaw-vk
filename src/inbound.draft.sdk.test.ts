@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * The step draft through the REAL core: `channel-outbound` (compositor, stream
@@ -162,6 +162,12 @@ const helpers: typeof import("./test-helpers.js") | null = sdkInstalled
   : null;
 const channel: typeof import("./channel.js") | null = sdkInstalled
   ? await import("./channel.js")
+  : null;
+const questionModule: typeof import("./question.js") | null = sdkInstalled
+  ? await import("./question.js")
+  : null;
+const coreQuestions = sdkInstalled
+  ? await import("openclaw/plugin-sdk/question-gateway-runtime")
   : null;
 
 const LABEL = "⏳ Работаю";
@@ -626,3 +632,98 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
     });
   });
 });
+
+// ── A typed answer to an open question never becomes a turn ─────────────────
+
+describe.skipIf(!inbound || !channel || !questionModule || !coreQuestions)(
+  "typed answer to a question sent as an outbound send (ask_user over MCP)",
+  () => {
+    const QID = `ask_${"c".repeat(32)}`;
+    const question = {
+      text: "Question for you:\n\nФон\nКакой фон?\n1. Белый\n2. Чёрный\n3. Серый",
+      presentationTextMode: "fallback",
+      presentation: {
+        blocks: [
+          {
+            type: "buttons",
+            buttons: ["Белый", "Чёрный", "Серый"].map((label) => ({
+              label,
+              action: { type: "question", questionId: QID, optionValue: label },
+            })),
+          },
+        ],
+      },
+      channelData: { askUser: { questionId: QID } },
+    };
+    const resolveOption = vi.fn();
+    let dispatched: string[] = [];
+
+    const incoming = (text: string) =>
+      inbound!.handleVkInbound({
+        message: helpers!.makeMessage({ conversationMessageId: 43, messageId: "m2", text }),
+        account: helpers!.makeAccount({ config: { dmPolicy: "open", allowFrom: ["*"] } }),
+        config: progressCfg() as never,
+        runtime: helpers!.createVkRuntimeEnv(),
+      });
+
+    beforeEach(async () => {
+      chat.messages = [];
+      chat.payloadCalls = [];
+      dispatched = [];
+      resolveOption.mockReset();
+      const vkRuntime = helpers!.makeVkRuntime();
+      vi.mocked(vkRuntime.config.current).mockReturnValue(progressCfg() as never);
+      runtimeModule!.setVkRuntime(vkRuntime);
+      questionModule!.clearVkQuestionDeliveries();
+      // The core's runtime, except the call that needs a hosted gateway.
+      questionModule!.resetVkQuestionRuntimeForTest({
+        runtime: { ...coreQuestions!.questionGatewayRuntime, resolveOption } as never,
+      });
+      // The question goes out the production way, during a turn.
+      await runTurn(async () => {
+        const outbound = channel!.vkPlugin.outbound!;
+        const cfg = progressCfg();
+        const normalized = outbound.normalizePayload!({ payload: question, cfg } as never) ?? question;
+        await outbound.sendPayload!({ cfg, to: "vk:123456", payload: normalized, accountId: "default" } as never);
+      });
+      run.scenario = async () => {
+        dispatched.push("turn");
+      };
+    });
+
+    afterEach(() => {
+      questionModule!.clearVkQuestionDeliveries();
+      questionModule!.resetVkQuestionRuntimeForTest();
+    });
+
+    it("«3» answers the question and does not reach the core as a turn", async () => {
+      resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Серый" });
+      await incoming("3");
+      expect(resolveOption).toHaveBeenCalledTimes(1);
+      expect(resolveOption.mock.calls[0][0]).toMatchObject({ questionId: QID, optionValue: "Серый" });
+      expect(dispatched).toEqual([]);
+    });
+
+    it("an option's text answers too", async () => {
+      resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Чёрный" });
+      await incoming("чёрный");
+      expect(resolveOption.mock.calls[0][0].optionValue).toBe("Чёрный");
+      expect(dispatched).toEqual([]);
+    });
+
+    it("a message that is not an answer goes on as a turn", async () => {
+      await incoming("подожди, а зачем фон?");
+      expect(resolveOption).not.toHaveBeenCalled();
+      expect(dispatched).toEqual(["turn"]);
+    });
+
+    it("an answer the core refuses (already answered) goes on as a turn", async () => {
+      resolveOption.mockResolvedValue({ status: "already-terminal", reason: "already-terminal" });
+      await incoming("2");
+      expect(dispatched).toEqual(["turn"]);
+      // Closed here now: the next «2» is not even tried.
+      await incoming("2");
+      expect(resolveOption).toHaveBeenCalledTimes(1);
+    });
+  },
+);

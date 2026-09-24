@@ -171,11 +171,15 @@ async function resolveOverFakeGateway(params: Record<string, any>) {
   if (record.status !== "pending") {
     return { status: "already-terminal", reason: "already-terminal" };
   }
-  const question = record.questions[0]!;
+  // As the core's resolver: one question, not multi-select, not secret.
+  const question = record.questions.length === 1 ? record.questions[0] : undefined;
+  if (!question || (question as { multiSelect?: boolean }).multiSelect || question.isSecret) {
+    throw new Error("question button resolution requires one tappable question");
+  }
   if (params.customInput) {
     return { status: "custom-input", questionId: question.questionId };
   }
-  const optionValue = question.options[params.optionIndex]?.label;
+  const optionValue = params.optionValue ?? question.options[params.optionIndex]?.label;
   if (params.authorize && !(await params.authorize())) {
     return { status: "denied" };
   }
@@ -248,6 +252,17 @@ function buttonsOf(message: ChatMessage) {
   return (keyboard.buttons as Array<Array<{ action: { label: string; payload: string } }>>).map(
     (row) => row[0]!.action,
   );
+}
+
+/** Ivan types a message in the chat; true when the plugin took it as the answer. */
+function type(text: string, senderId = DM) {
+  return sdk!.events.answerVkQuestionByText({
+    accountId: "default",
+    peerId: DM,
+    senderId,
+    text,
+    runtime: sdk!.helpers.createVkRuntimeEnv(),
+  });
 }
 
 async function press(payload: string, userId = DM) {
@@ -417,6 +432,78 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     expect(message.keyboard).toBeUndefined();
     expect(sdk!.question.readVkAskUserQuestionId(deliveredPayloads[0])).toBeUndefined();
     expect(await sdk!.harness.claimPendingAgentQuestionAnswer({ sessionKey: SESSION, text: "s3cret" })).toBe(true);
+    expect(await answer).toMatchObject({ status: "answered" });
+  });
+
+  // ── Typed answers taken by the plugin (ask_user over MCP never reaches the
+  //    core's own claim while the run holds the session) ─────────────────────
+
+  it("a typed «2» taken by the plugin answers the second option; the core's claim then finds nothing", async () => {
+    const answer = ask([UPSCALE]);
+    const message = await promptMessage();
+
+    expect(await type("2")).toBe(true);
+
+    expect(await answer).toEqual({ status: "answered", answers: { answers: { size: ["×2"] } } });
+    await waitFor(() => (message.keyboard === undefined ? true : undefined), "the buttons to go");
+    expect(message.text.endsWith("\n\n✅ Ответ: ×2")).toBe(true);
+    // No double answer: were the same text to reach the core, it has no
+    // pending question left to claim it for.
+    expect(await sdk!.harness.claimPendingAgentQuestionAnswer({ sessionKey: SESSION, text: "2" })).toBe(false);
+    // And the plugin no longer takes «2» in this chat.
+    expect(await type("2")).toBe(false);
+  });
+
+  it("'Свой вариант', then free text: the plugin takes it as the answer", async () => {
+    const answer = ask([UPSCALE]);
+    const message = await promptMessage();
+    await press(buttonsOf(message)[3]!.payload);
+
+    expect(await type("3000 пикселей")).toBe(true);
+    expect(await answer).toEqual({ status: "answered", answers: { answers: { size: ["3000 пикселей"] } } });
+  });
+
+  it("a question without options takes any typed text", async () => {
+    const answer = ask([{ ...UPSCALE, isOther: false, options: [] }]);
+    const message = await promptMessage();
+    expect(message.keyboard).toBeUndefined();
+
+    expect(await type("до пятницы")).toBe(true);
+    expect(await answer).toEqual({ status: "answered", answers: { answers: { size: ["до пятницы"] } } });
+  });
+
+  it("fixed options: a stray message is not an answer and stays an ordinary message", async () => {
+    const answer = ask([{ ...UPSCALE, isOther: false }]);
+    await promptMessage();
+    expect(await type("а зачем это?")).toBe(false);
+    expect(await type("оставить")).toBe(true);
+    expect(await answer).toEqual({ status: "answered", answers: { answers: { size: ["Оставить"] } } });
+  });
+
+  it("someone else's typed answer is not taken", async () => {
+    const answer = ask([UPSCALE]);
+    await promptMessage();
+    expect(await type("2", 777)).toBe(false);
+    expect(await type("2")).toBe(true);
+    await answer;
+  });
+
+  it("several questions: the plugin leaves the text to the core, which parses the lines", async () => {
+    const color = {
+      id: "color",
+      header: "Фон",
+      question: "Какой фон?",
+      isOther: false,
+      isSecret: false,
+      multiSelect: false,
+      options: [{ label: "Белый" }, { label: "Прозрачный" }],
+    };
+    const answer = ask([UPSCALE, color]);
+    await promptMessage();
+    expect(await type("×4\nПрозрачный")).toBe(false);
+    expect(
+      await sdk!.harness.claimPendingAgentQuestionAnswer({ sessionKey: SESSION, text: "×4\nПрозрачный" }),
+    ).toBe(true);
     expect(await answer).toMatchObject({ status: "answered" });
   });
 });

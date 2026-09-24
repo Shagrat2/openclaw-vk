@@ -13,11 +13,12 @@
  * where each question was delivered so a press can be checked against it. The
  * send path (`send.ts`) and the button handler (`question-events.ts`) use it.
  *
- * Text answers are not handled here on purpose: the core claims a plain reply to
- * a pending question at ingress (`runReplyQuestionInput`, before steering and
- * queueing), parses "2", an option label or free text itself, and checks the
- * answerer against the question's creator. Doing it again in the plugin would
- * answer twice and skip that check.
+ * Typed answers are parsed here too (`parseVkQuestionTextAnswer`, the core's
+ * rules) and resolved by `question-events.ts`. The core's own ingress claim
+ * (`runReplyQuestionInput`) does not reach `ask_user` over MCP: it looks the
+ * question up among the harness's pending questions, where only a native
+ * `AskUserQuestion` lands, and a message sent while the run holds the session
+ * waits in the queue until the question has expired (live, 24.09.2026).
  */
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 import { vkDiag } from "./diagnostics.js";
@@ -292,19 +293,91 @@ export type VkQuestionDelivery = {
 /** A day, as the core keeps a finished question's deliveries. */
 const DELIVERY_RETENTION_MS = 24 * 60 * 60 * 1_000;
 
-type Entry = { deliveries: VkQuestionDelivery[]; terminal: boolean; timer: ReturnType<typeof setTimeout> };
+type Entry = {
+  deliveries: VkQuestionDelivery[];
+  terminal: boolean;
+  /** What a typed answer is checked against; absent → only buttons answer. */
+  prompt?: VkQuestionPrompt;
+  /** False once the core refused a typed answer for this record's shape. */
+  textAnswerable: boolean;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 const deliveries = new Map<string, Entry>();
 
-export function rememberVkQuestionDelivery(questionId: string, delivery: VkQuestionDelivery): void {
+export function rememberVkQuestionDelivery(
+  questionId: string,
+  delivery: VkQuestionDelivery,
+  prompt?: VkQuestionPrompt,
+): void {
   let entry = deliveries.get(questionId);
   if (!entry) {
     const timer = setTimeout(() => deliveries.delete(questionId), DELIVERY_RETENTION_MS);
     timer.unref?.();
-    entry = { deliveries: [], terminal: false, timer };
+    entry = { deliveries: [], terminal: false, textAnswerable: true, timer };
     deliveries.set(questionId, entry);
   }
+  entry.prompt ??= prompt;
   entry.deliveries.push(delivery);
+}
+
+/** The core refused a typed answer for this question (several questions, multi-select). */
+export function markVkQuestionNotTextAnswerable(questionId: string): void {
+  const entry = deliveries.get(questionId);
+  if (entry) {
+    entry.textAnswerable = false;
+  }
+}
+
+/**
+ * The open question a typed message in this chat may answer: the latest one
+ * delivered there, still open and still answerable by text.
+ */
+export function findOpenVkQuestionForChat(params: {
+  accountId: string;
+  peerId: number;
+}): { questionId: string; prompt: VkQuestionPrompt } | undefined {
+  let found: { questionId: string; prompt: VkQuestionPrompt } | undefined;
+  for (const [questionId, entry] of deliveries) {
+    if (
+      !entry.terminal &&
+      entry.textAnswerable &&
+      entry.prompt &&
+      entry.deliveries.some(
+        (delivery) => delivery.accountId === params.accountId && delivery.peerId === params.peerId,
+      )
+    ) {
+      found = { questionId, prompt: entry.prompt };
+    }
+  }
+  return found;
+}
+
+/**
+ * A typed reply as the answer it gives, by the core's rules
+ * (`normalizeAgentHarnessUserInputAnswer`): a number 1..N picks that option,
+ * an option's text (any case) picks it, and free text counts only when the
+ * question has no options or allows its own answer. Otherwise undefined — the
+ * message is not an answer and goes on as an ordinary message.
+ */
+export function parseVkQuestionTextAnswer(prompt: VkQuestionPrompt, text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const options = prompt.options;
+  const indexed = /^\d+$/.test(trimmed) ? options[Number(trimmed) - 1] : undefined;
+  if (indexed) {
+    return indexed;
+  }
+  const exact = options.find((option) => option.toLowerCase() === trimmed.toLowerCase());
+  if (exact) {
+    return exact;
+  }
+  if (options.length > 0 && !prompt.customInput) {
+    return undefined;
+  }
+  return trimmed;
 }
 
 export function markVkQuestionTerminal(questionId: string): void {

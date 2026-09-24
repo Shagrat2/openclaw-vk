@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleVkQuestionEvent, isVkQuestionAnswerer, type VkQuestionEvent } from "./question-events.js";
+import {
+  answerVkQuestionByText,
+  handleVkQuestionEvent,
+  isVkQuestionAnswerer,
+  type VkQuestionEvent,
+} from "./question-events.js";
 import {
   clearVkQuestionDeliveries,
   findOpenVkQuestionDelivery,
+  findOpenVkQuestionForChat,
   rememberVkQuestionDelivery,
   resetVkQuestionRuntimeForTest,
 } from "./question.js";
@@ -295,5 +301,86 @@ describe("isVkQuestionAnswerer", () => {
     expect(
       await ask({ channels: { vk: { groupAllowFrom: ["*"], groups: { "*": { enabled: false } } } } }, 7),
     ).toBe(false);
+  });
+});
+
+describe("answerVkQuestionByText", () => {
+  const TQ = `ask_${"2".repeat(32)}`;
+  const typed = (text: string, senderId = DM, peerId = DM) =>
+    answerVkQuestionByText({ accountId: "default", peerId, senderId, text, runtime: runtimeEnv });
+
+  beforeEach(() => {
+    rememberVkQuestionDelivery(
+      TQ,
+      { accountId: "default", peerId: DM, messageId: 90 },
+      { questionId: TQ, options: ["Белый", "Чёрный"], customInput: true },
+    );
+  });
+
+  it("a typed number answers with that option's label, and the message is consumed", async () => {
+    resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Чёрный" });
+    expect(await typed("2")).toBe(true);
+    const args = resolveOption.mock.calls[0][0];
+    expect(args).toMatchObject({
+      questionId: TQ,
+      optionValue: "Чёрный",
+      senderId: String(DM),
+      cfg: state.config,
+    });
+    expect(args).not.toHaveProperty("optionIndex");
+    expect(await args.authorize()).toBe(true);
+  });
+
+  it("free text goes as it is where the question allows its own answer", async () => {
+    resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Бирюзовый" });
+    expect(await typed("  Бирюзовый ")).toBe(true);
+    expect(resolveOption.mock.calls[0][0].optionValue).toBe("Бирюзовый");
+  });
+
+  it("a stray message to a question with fixed options is left alone", async () => {
+    clearVkQuestionDeliveries();
+    rememberVkQuestionDelivery(
+      TQ,
+      { accountId: "default", peerId: DM, messageId: 90 },
+      { questionId: TQ, options: ["Белый", "Чёрный"], customInput: false },
+    );
+    expect(await typed("а что это за вопрос?")).toBe(false);
+    expect(resolveOption).not.toHaveBeenCalled();
+  });
+
+  it("no open question in this chat: an ordinary message", async () => {
+    expect(await typed("2", 1, 1)).toBe(false);
+    expect(resolveOption).not.toHaveBeenCalled();
+  });
+
+  it("a sender who may not answer: an ordinary message, the core is not asked", async () => {
+    state.config = { channels: { vk: { token: "t", dmPolicy: "allowlist", allowFrom: ["1"] } } };
+    expect(await typed("2")).toBe(false);
+    expect(resolveOption).not.toHaveBeenCalled();
+  });
+
+  it("already answered or expired: an ordinary message, and the question closes here", async () => {
+    resolveOption.mockResolvedValue({ status: "already-terminal", reason: "already-terminal" });
+    expect(await typed("2")).toBe(false);
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: DM })).toBeUndefined();
+  });
+
+  it("denied at the write: an ordinary message", async () => {
+    resolveOption.mockResolvedValue({ status: "denied" });
+    expect(await typed("2")).toBe(false);
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: DM })?.questionId).toBe(TQ);
+  });
+
+  it("a record a typed answer cannot settle: once refused, not tried again", async () => {
+    resolveOption.mockRejectedValue(new Error("question button resolution requires one tappable question"));
+    expect(await typed("2")).toBe(false);
+    expect(runtimeEnv.log).toHaveBeenCalledWith(expect.stringContaining("typed answer not accepted"));
+    expect(await typed("1")).toBe(false);
+    expect(resolveOption).toHaveBeenCalledTimes(1);
+  });
+
+  it("without the core's question runtime: an ordinary message", async () => {
+    resetVkQuestionRuntimeForTest({ runtime: undefined });
+    expect(await typed("2")).toBe(false);
   });
 });

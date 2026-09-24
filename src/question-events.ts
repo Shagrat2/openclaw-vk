@@ -26,9 +26,12 @@ import {
 } from "./send-support.js";
 import {
   findOpenVkQuestionDelivery,
+  findOpenVkQuestionForChat,
   loadVkQuestionRuntime,
+  markVkQuestionNotTextAnswerable,
   markVkQuestionTerminal,
   parseVkQuestionCallback,
+  parseVkQuestionTextAnswer,
 } from "./question.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { sendMessageVk } from "./send.js";
@@ -199,9 +202,9 @@ export async function handleVkQuestionEvent(params: {
         await reply(TEXT.answered(result.optionValue));
         return true;
       case "custom-input":
-        // The typed answer arrives as an ordinary message; the core claims it
-        // for the pending question at ingress. Buttons stay: a person who
-        // changes their mind can still press one.
+        // The typed answer arrives as an ordinary message and is taken by
+        // `answerVkQuestionByText` before it reaches the core. Buttons stay: a
+        // person who changes their mind can still press one.
         await reply(TEXT.customInputSnackbar);
         try {
           await sendMessageVk(String(event.peerId), TEXT.customInputMessage, { accountId });
@@ -222,5 +225,82 @@ export async function handleVkQuestionEvent(params: {
     runtime.error?.(`vk: question ${questionId} answer failed: ${String(error)}`);
     await reply(TEXT.failed);
     return true;
+  }
+}
+
+/**
+ * A typed message in a chat with an open question: the answer to it, if it is one.
+ *
+ * Returns true when the message answered the question — the caller then must
+ * not pass it on as a turn or as steering: it has been consumed. False leaves
+ * the message to the ordinary path: no open question here, the text is not an
+ * answer by the core's rules (a stray word to a question with fixed options),
+ * the sender may not answer, or the core refused it (already answered,
+ * expired, a shape a typed answer cannot resolve).
+ *
+ * Needed because the core's own ingress claim misses `ask_user` over MCP: it
+ * looks in the harness's pending questions, where only a native
+ * `AskUserQuestion` lands, and a message sent during the run waits in the
+ * session queue until the question has expired (24.09.2026, ask_2fb0d4be…).
+ */
+export async function answerVkQuestionByText(params: {
+  accountId: string;
+  peerId: number;
+  senderId: number;
+  text: string;
+  runtime: RuntimeEnv;
+}): Promise<boolean> {
+  const { accountId, peerId, senderId, runtime } = params;
+  const open = findOpenVkQuestionForChat({ accountId, peerId });
+  if (!open) {
+    return false;
+  }
+  const { questionId, prompt } = open;
+  const answer = parseVkQuestionTextAnswer(prompt, params.text);
+  if (answer === undefined) {
+    vkDiag("question text not an answer", { questionId });
+    return false;
+  }
+  const mayAnswer = async () =>
+    findOpenVkQuestionDelivery({ questionId, accountId, peerId }) !== undefined &&
+    (await isVkQuestionAnswerer({
+      config: readVkRuntimeConfig(getVkRuntime()),
+      accountId,
+      peerId,
+      userId: senderId,
+    }));
+  if (!(await mayAnswer())) {
+    return false;
+  }
+  const questionRuntime = await loadVkQuestionRuntime();
+  if (!questionRuntime) {
+    return false;
+  }
+  try {
+    // `optionValue` carries any non-empty answer to the record as it is: a
+    // declared label, or the person's own text where the question allows it.
+    const result = await questionRuntime.resolveOption({
+      cfg: readVkRuntimeConfig(getVkRuntime()) as OpenClawConfig,
+      questionId,
+      senderId: String(senderId),
+      clientDisplayName: `VK question (${senderId})`,
+      optionValue: answer,
+      authorize: mayAnswer,
+    });
+    vkDiag("question text resolved", { questionId, status: result.status });
+    if (result.status === "answered") {
+      return true;
+    }
+    if (result.status === "already-terminal") {
+      markVkQuestionTerminal(questionId);
+    }
+    return false;
+  } catch (error) {
+    // The resolver refuses records a single answer cannot settle (several
+    // questions, multi-select, a secret) before writing anything. Stop trying
+    // for this one; the message goes on as usual.
+    markVkQuestionNotTextAnswerable(questionId);
+    runtime.log?.(`vk: question ${questionId} typed answer not accepted: ${String(error)}`);
+    return false;
   }
 }

@@ -2353,7 +2353,7 @@ async function sendVkQuestionPayload(params: {
   const questionId = params.question.questionId;
   // Remembered before registering: the core finalizes an already-finished
   // question synchronously inside `registerChannelDelivery`.
-  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId });
+  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId }, params.question);
   runtime.registerChannelDelivery({
     questionId,
     deliveryId: `vk:${accountId}:${peerId}:${messageId}`,

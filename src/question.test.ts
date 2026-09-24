@@ -3,12 +3,15 @@ import {
   buildVkQuestionKeyboard,
   clearVkQuestionDeliveries,
   findOpenVkQuestionDelivery,
+  findOpenVkQuestionForChat,
   formatVkQuestionStatusLine,
   handOffVkDraftsBeforeQuestion,
   loadVkQuestionRuntime,
+  markVkQuestionNotTextAnswerable,
   markVkQuestionTerminal,
   normalizeVkQuestionPayload,
   parseVkQuestionCallback,
+  parseVkQuestionTextAnswer,
   readVkAskUserQuestionId,
   readVkQuestionPrompt,
   registerVkDraftQuestionHandoff,
@@ -348,5 +351,65 @@ describe("draft handoff before a question", () => {
     expect(next).toHaveBeenCalled();
     a();
     b();
+  });
+});
+
+describe("parseVkQuestionTextAnswer — the core's rules", () => {
+  const fixed = { questionId: QID, options: ["Белый", "Чёрный", "Серый"], customInput: false };
+  const withOther = { ...fixed, customInput: true };
+  const free = { questionId: QID, options: [], customInput: false };
+
+  it("a number picks that option, one-based", () => {
+    expect(parseVkQuestionTextAnswer(fixed, "2")).toBe("Чёрный");
+    expect(parseVkQuestionTextAnswer(fixed, " 3 ")).toBe("Серый");
+  });
+
+  it("an option's text picks it, in any case, as the declared label", () => {
+    expect(parseVkQuestionTextAnswer(fixed, "чёрный")).toBe("Чёрный");
+  });
+
+  it("anything else is not an answer when the options are fixed", () => {
+    expect(parseVkQuestionTextAnswer(fixed, "0")).toBeUndefined();
+    expect(parseVkQuestionTextAnswer(fixed, "4")).toBeUndefined();
+    expect(parseVkQuestionTextAnswer(fixed, "а что это вообще?")).toBeUndefined();
+    expect(parseVkQuestionTextAnswer(fixed, "   ")).toBeUndefined();
+  });
+
+  it("free text counts where the question allows its own answer", () => {
+    expect(parseVkQuestionTextAnswer(withOther, "  Бирюзовый ")).toBe("Бирюзовый");
+    expect(parseVkQuestionTextAnswer(withOther, "1")).toBe("Белый");
+    expect(parseVkQuestionTextAnswer(withOther, "7")).toBe("7");
+  });
+
+  it("any text answers a question without options", () => {
+    expect(parseVkQuestionTextAnswer(free, "2")).toBe("2");
+    expect(parseVkQuestionTextAnswer(free, "до пятницы")).toBe("до пятницы");
+  });
+});
+
+describe("findOpenVkQuestionForChat", () => {
+  const prompt = { questionId: QID, options: ["A"], customInput: false };
+  const QID2 = `ask_${"b".repeat(32)}`;
+
+  it("finds the latest open question delivered to that chat", () => {
+    rememberVkQuestionDelivery(QID, { accountId: "default", peerId: 7, messageId: 1 }, prompt);
+    rememberVkQuestionDelivery(QID2, { accountId: "default", peerId: 7, messageId: 2 }, { ...prompt, questionId: QID2 });
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: 7 })?.questionId).toBe(QID2);
+    markVkQuestionTerminal(QID2);
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: 7 })).toEqual({ questionId: QID, prompt });
+  });
+
+  it("skips other chats, closed questions and ones a typed answer cannot settle", () => {
+    rememberVkQuestionDelivery(QID, { accountId: "default", peerId: 7, messageId: 1 }, prompt);
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: 8 })).toBeUndefined();
+    expect(findOpenVkQuestionForChat({ accountId: "other", peerId: 7 })).toBeUndefined();
+    markVkQuestionNotTextAnswerable(QID);
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: 7 })).toBeUndefined();
+    markVkQuestionNotTextAnswerable(QID2);
+  });
+
+  it("a delivery remembered without a prompt answers only by buttons", () => {
+    rememberVkQuestionDelivery(QID, { accountId: "default", peerId: 7, messageId: 1 });
+    expect(findOpenVkQuestionForChat({ accountId: "default", peerId: 7 })).toBeUndefined();
   });
 });

@@ -43,6 +43,7 @@ import {
 } from "./media.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { readVkAskUserQuestionId, registerVkDraftQuestionHandoff } from "./question.js";
+import { answerVkQuestionByText } from "./question-events.js";
 import { normalizeVkAllowlist, resolveVkAllowlistMatch } from "./send-support.js";
 import { getVkRuntime } from "./runtime.js";
 import {
@@ -477,6 +478,34 @@ export async function handleVkInbound(params: {
   }
 
   vkDiag("inbound passed gates", { peerId: message.peerId });
+
+  // ── A typed answer to an open question from the core ─────────────────────
+  // Taken here, before the core sees the message: while the run waits on the
+  // question the session is busy and the core only queues new messages, so
+  // its own claim of a typed answer would come after the question expired.
+  // An answer is consumed: no turn, no steering. Anything else — no open
+  // question, not an answer, refused — carries on as an ordinary message.
+  const plainText = message.text?.trim() ?? "";
+  if (
+    plainText &&
+    !payloadCommand &&
+    (message.attachments?.length ?? 0) === 0 &&
+    (message.forwards?.length ?? 0) === 0 &&
+    (await answerVkQuestionByText({
+      accountId: account.accountId,
+      peerId: message.peerId,
+      senderId: message.senderId,
+      text: plainText,
+      runtime,
+    }))
+  ) {
+    try {
+      await markMessageReadVk(String(message.peerId), message.messageId, account);
+    } catch (err) {
+      runtime.log?.(`vk: mark read failed after a question answer: ${String(err)}`);
+    }
+    return;
+  }
 
   // Build route and dispatch
   const peerId = String(message.peerId);
