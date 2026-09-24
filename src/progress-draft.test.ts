@@ -130,6 +130,31 @@ describe("createVkProgressDraftCompositor", () => {
     expect(handle.currentMessageId()).toBe(56);
   });
 
+  it("quotes on the first draft message only, and only when asked to", async () => {
+    const quoting = make({ replyTo: "777" });
+    await quoting.overwrite("шаг 1"); // send → id 55, quoted
+    await quoting.overwrite("шаг 2"); // edit, no send
+    quoting.detach();
+    mockSendMessage.mockResolvedValueOnce({ messageId: "56", chatId: "42" });
+    await quoting.overwrite("продолжение"); // a continuation below: no quote
+    expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    expect(mockSendMessage.mock.calls[0]?.[2]).toMatchObject({ replyTo: "777" });
+    expect(mockSendMessage.mock.calls[1]?.[2]).not.toHaveProperty("replyTo");
+
+    mockSendMessage.mockClear();
+    await make().overwrite("личка");
+    expect(mockSendMessage.mock.calls[0]?.[2]).not.toHaveProperty("replyTo");
+  });
+
+  it("keeps the quote for the next draft when the first send failed", async () => {
+    const handle = make({ replyTo: "777" });
+    mockSendMessage.mockRejectedValueOnce(new Error("VK API error 10"));
+    expect(await handle.overwrite("шаг 1")).toBe(false);
+    await handle.overwrite("шаг 1");
+    expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    expect(mockSendMessage.mock.calls[1]?.[2]).toMatchObject({ replyTo: "777" });
+  });
+
   it("remove is a no-op when there is no draft yet", async () => {
     const handle = make();
     await handle.remove();

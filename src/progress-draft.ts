@@ -45,6 +45,12 @@ export type VkProgressDraftParams = {
   mode: ChannelProgressDraftMode;
   /** Stable per-turn seed so the compositor can distinguish turns. */
   seed: string;
+  /**
+   * Message the draft quotes, when the ordinary reply would quote it (a group
+   * chat, a button press). Only the first draft message of the turn carries it,
+   * as only the first message of an ordinary reply does.
+   */
+  replyTo?: string;
   onError?: (err: unknown) => void;
   /** Optional diagnostic logger — traces draft send/edit/remove to gateway.log. */
   log?: (msg: string) => void;
@@ -110,6 +116,9 @@ export function createVkProgressDraftCompositor(
   // Once the turn has finalized we stop touching VK, so a straggler compositor
   // render can't create a brand-new message after the answer is delivered.
   let closed = false;
+  // Only the first draft message of the turn quotes; a draft started below a
+  // frozen answer part is a continuation.
+  let quoted = false;
 
   // The live draft label (`streaming.progress.label`). The compositor puts it
   // on the step renders it produces, but text blocks are written straight
@@ -130,9 +139,13 @@ export function createVkProgressDraftCompositor(
         const result = await sendMessageVk(params.to, text, {
           cfg: params.cfg,
           accountId: params.accountId,
+          ...(params.replyTo && !quoted ? { replyTo: params.replyTo } : {}),
         });
         const id = Number(result.messageId);
         messageId = Number.isFinite(id) && id > 0 ? id : undefined;
+        if (messageId !== undefined) {
+          quoted = true;
+        }
         params.log?.(`vk: step-progress draft sent msgId=${messageId ?? "?"} len=${text.length}`);
         return messageId !== undefined;
       }

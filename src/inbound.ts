@@ -703,6 +703,10 @@ export async function handleVkInbound(params: {
     draftAnswerSource = null;
   };
   if (progressDraftEnabled) {
+    // The draft quotes what the ordinary reply would quote: the incoming
+    // message in a group chat and the message with the pressed button. In a
+    // direct chat, as there, nothing is quoted.
+    const draftReplyTo = payloadCommand || isGroup ? message.messageId : undefined;
     progressDraft = createVkProgressDraftCompositor({
       to: String(message.peerId),
       account,
@@ -712,6 +716,7 @@ export async function handleVkInbound(params: {
       mode: progressStreamMode,
       seed: String(message.conversationMessageId),
       log: runtime.log,
+      replyTo: draftReplyTo,
       onError: (err) => {
         runtime.log?.(
           `vk: progress-draft error for cmid=${redactVkId(message.conversationMessageId)}: ${String(err)}`,
@@ -875,9 +880,9 @@ export async function handleVkInbound(params: {
           // the draft message INTO the answer instead of dropping it and sending
           // a new one. The first chunk rewrites the draft, the rest of a long
           // answer follows as ordinary messages, and media (a picture, a voice
-          // message) follows last. An answer with buttons goes the normal
-          // delivery path: the keyboard is sent with a new message, which an
-          // edit cannot do.
+          // message) follows last. An answer with buttons, or an answer to a
+          // button press, goes the normal delivery path: the keyboard is sent or
+          // cleared with a new message, which an edit cannot do.
           //
           // The answer is already in the draft (block streaming): the final
           // must not replace it — neither delete it when empty nor overwrite it
@@ -898,7 +903,7 @@ export async function handleVkInbound(params: {
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
             const finalText = keepsDraftAnswer ? undefined : markdownAttachments.text.trim();
-            if (draftMsgId !== undefined && finalText && !resolvedButtons) {
+            if (draftMsgId !== undefined && finalText && !resolvedButtons && !payloadCommand) {
               const chunks = renderVkMarkdownChunks(markdownAttachments.text);
               if (chunks.length >= 1) {
                 progressDraft.compositor.markFinalReplyStarted();

@@ -440,6 +440,59 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
     });
   });
 
+  // ── Quote and keyboard: the same as a reply without a draft ─────────────
+
+  describe("quote and keyboard", () => {
+    const GROUP = { peerId: 2_000_000_001, isGroup: true, messageId: "555" };
+
+    it("quotes the incoming message in a group, and the answer written into the draft keeps it", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Ответ в беседе." }, { kind: "final" });
+      }, GROUP);
+      expect(chat.messages).toHaveLength(1);
+      expect(chat.messages[0]).toMatchObject({ text: "Ответ в беседе.", replyTo: "555" });
+    });
+
+    it("quotes only the first part when the answer outgrows one draft", async () => {
+      const first = `ПЕРВЫЙ ${"а".repeat(2500)}`;
+      const second = `ВТОРОЙ ${"б".repeat(2500)}`;
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: first }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: second }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "", ...voice }, { kind: "final" });
+      }, GROUP);
+      const drafts = chat.messages.filter((m) => m.media.length === 0);
+      expect(drafts.map((m) => m.replyTo)).toEqual(["555", undefined]);
+    });
+
+    it("quotes nothing in a direct chat", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Ответ в личке." }, { kind: "final" });
+      });
+      expect(chat.messages).toHaveLength(1);
+      expect(chat.messages[0]?.replyTo).toBeUndefined();
+    });
+
+    it("answers a button press the ordinary way: the keyboard is cleared, the draft removed", async () => {
+      await runTurn(
+        async ({ replyOptions, dispatcherOptions }) => {
+          await replyOptions.onToolStart?.(toolStart());
+          await dispatcherOptions.deliver({ text: "Режим включён." }, { kind: "final" });
+        },
+        { messagePayload: { oc: "/think high" }, messageId: "777" },
+      );
+      expect(chat.messages).toHaveLength(1);
+      expect(chat.messages[0]).toMatchObject({
+        text: "Режим включён.",
+        replyTo: "777",
+        clearKeyboard: true,
+      });
+    });
+  });
+
   // ── P2: a turn that ends without a final ────────────────────────────────
 
   describe("turn without a final", () => {
