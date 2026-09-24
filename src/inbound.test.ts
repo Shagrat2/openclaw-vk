@@ -241,6 +241,8 @@ const mockCreateVkProgressDraft = vi.hoisted(() =>
     currentMessageId: mockCurrentMessageId,
     overwrite: mockDraftOverwrite,
     remove: mockDraftRemove,
+    // Like the real handle: the message is let go of, nothing is deleted.
+    detach: vi.fn(() => mockCurrentMessageId.mockReturnValue(undefined)),
     close: mockDraftClose,
   })),
 );
@@ -279,6 +281,9 @@ vi.mock("./send.js", () => ({
   // editMessageVk backs the edit-in-place finalize.
   editMessageVk: mockEditMessageVk,
   sendMessageVk: vi.fn().mockResolvedValue({ messageId: "9", chatId: "0" }),
+  // No markdown attachments in these tests; the real parser is exercised in
+  // inbound.draft.sdk.test.ts.
+  splitVkMarkdownAttachments: (text: string) => ({ text, attachments: [] }),
   resolveVkOwnGroup: mockResolveVkOwnGroup,
 }));
 
@@ -1752,6 +1757,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       4242,
       expect.stringContaining("сложился из блоков"),
       expect.anything(),
+      expect.anything(),
     );
     mockCurrentMessageId.mockReturnValue(undefined);
   });
@@ -1910,6 +1916,7 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       expect.anything(),
       4242,
       expect.stringContaining("сложился из блоков"),
+      expect.anything(),
       expect.anything(),
     );
     mockCurrentMessageId.mockReturnValue(undefined);

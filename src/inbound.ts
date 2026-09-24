@@ -15,7 +15,6 @@ import {
   buildChannelProgressDraftLineForEntry,
   createReplyPrefixOptions,
   createTypingCallbacks,
-  isPotentialTruncatedFinal,
   logTypingFailure,
   resolveChannelPreviewStreamMode,
   selectLongerFinalText,
@@ -55,6 +54,7 @@ import {
   sendMessageVk,
   sendPayloadVk,
   sendTypingVk,
+  splitVkMarkdownAttachments,
 } from "./send.js";
 import type { ResolvedVkAccount } from "./types.js";
 import type {
@@ -635,11 +635,73 @@ export async function handleVkInbound(params: {
   }
 
   let progressDraft: VkProgressDraftHandle | null = null;
-  // The ANSWER text currently sitting in the draft (not the step list). It
-  // lives for the whole turn rather than one delivery: blocks arrive before the
-  // final. Reset when the draft is overwritten with tool steps — otherwise the
-  // step list itself would be kept as the "answer".
-  let draftAnswerText: string | null = null;
+  // The ANSWER currently sitting in the draft (not the step list), as the
+  // markdown the blocks arrived in. It lives for the whole turn rather than one
+  // delivery: blocks arrive before the final. Reset when the draft is
+  // overwritten with tool steps — otherwise the step list itself would be kept
+  // as the "answer".
+  let draftAnswerSource: string | null = null;
+  /**
+   * Whether the answer already in the draft outlives this final.
+   *
+   * With block streaming the core drops the final's text once the blocks went
+   * out (`shouldDropFinalPayloads` in the agent runner) and delivers only the
+   * media left over — so an empty final is the normal ending of a block-streamed
+   * answer, not "no answer". The core's `selectLongerFinalText` answers a
+   * different question: it returns nothing unless the final is a truncated
+   * prefix (`isPotentialTruncatedFinal`), and for an empty final that is never
+   * the case. Relying on it for the empty case deleted the only copy of the
+   * answer and left the recipient with a voice note alone.
+   */
+  const draftKeepsAnswer = (finalText: string): boolean => {
+    if (draftAnswerSource === null) {
+      return false;
+    }
+    const trimmed = finalText.trim();
+    if (!trimmed) {
+      return true;
+    }
+    return (
+      selectLongerFinalText({ finalText: trimmed, candidateTexts: [draftAnswerSource] }) !==
+      undefined
+    );
+  };
+  /**
+   * Rewrite the draft into the finished answer: the same text, formatted, and
+   * WITHOUT the progress label — `overwrite` always prepends it, so a finished
+   * answer would otherwise keep a "working" header forever.
+   */
+  const keepDraftAsAnswer = async (): Promise<void> => {
+    const source = draftAnswerSource;
+    const draftMsgId = progressDraft?.currentMessageId();
+    if (source === null || draftMsgId === undefined) {
+      return;
+    }
+    const [chunk] = renderVkMarkdownChunks(source);
+    try {
+      await editMessageVk(String(message.peerId), draftMsgId, chunk?.text ?? source, account, {
+        formatData: chunk?.formatData,
+      });
+      vkDiag("draft kept as answer", { len: (chunk?.text ?? source).length });
+    } catch (err) {
+      runtime.log?.(`vk: draft finalize failed: ${String(err)}`);
+    }
+  };
+  /**
+   * Freeze the answer part sitting in the draft and let go of that message, so
+   * whatever comes next — a block that no longer fits, a picture — lands BELOW
+   * it instead of overwriting it. Without this the next block rewrote the draft
+   * and the text already in it was gone, or it stayed above a part that came
+   * after it.
+   */
+  const sealDraftAnswer = async (): Promise<void> => {
+    if (!progressDraft || draftAnswerSource === null) {
+      return;
+    }
+    await keepDraftAsAnswer();
+    progressDraft.detach();
+    draftAnswerSource = null;
+  };
   if (progressDraftEnabled) {
     progressDraft = createVkProgressDraftCompositor({
       to: String(message.peerId),
@@ -730,30 +792,40 @@ export async function handleVkInbound(params: {
           // as work goes on, and at the end that same bubble becomes the answer.
           // Media and buttons keep their old path — they cannot go into a
           // draft.
-          if (
+          // Markdown links the send path turns into attachments (a picture,
+          // a local file) cannot live in the draft either: rendered there they
+          // became a link to nowhere and the attachment was never sent.
+          const markdownAttachments = splitVkMarkdownAttachments(normalized.text ?? "");
+          const isTextBlock = Boolean(
             progressDraft &&
-            !isFinal &&
-            normalized.text?.trim() &&
-            !normalized.mediaUrl &&
-            !(normalized.mediaUrls?.length ?? 0) &&
-            !resolvedButtons
-          ) {
+              !isFinal &&
+              normalized.text?.trim() &&
+              !normalized.mediaUrl &&
+              !(normalized.mediaUrls?.length ?? 0) &&
+              markdownAttachments.attachments.length === 0 &&
+              !resolvedButtons,
+          );
+          if (progressDraft && isTextBlock) {
             // Blocks are CHUNKS of the answer, not its accumulated version (the
             // core splits the stream through a block chunker). The draft is
             // rewritten in full, so we accumulate ourselves: otherwise an empty
             // final would keep only the last paragraph as the "answer" while the
             // voice-over carried the whole text.
-            const accumulated = draftAnswerText
-              ? `${draftAnswerText}\n\n${normalized.text.trim()}`
-              : normalized.text.trim();
-            const chunks = renderVkMarkdownChunks(accumulated);
-            if (chunks.length > 1) {
-              // The accumulated text no longer fits one VK message. From here
-              // the draft cannot become the answer — send this block the usual
-              // way and forget the accumulation so no stub is kept.
-              draftAnswerText = null;
+            const blockText = normalized.text!.trim();
+            let accumulated = draftAnswerSource
+              ? `${draftAnswerSource}\n\n${blockText}`
+              : blockText;
+            let chunks = renderVkMarkdownChunks(accumulated);
+            if (chunks.length > 1 && draftAnswerSource !== null) {
+              // The answer no longer fits one VK message. What is in the draft
+              // is a finished part of it: freeze it there and start a new
+              // draft with this block, below the frozen part.
               vkDiag("block overflows draft", { len: accumulated.length });
-            } else {
+              await sealDraftAnswer();
+              accumulated = blockText;
+              chunks = renderVkMarkdownChunks(accumulated);
+            }
+            if (chunks.length === 1) {
               // The label is added by the draft itself (the single write point).
               const draftText = chunks[0]?.text ?? accumulated;
               // `overwrite` never rejects — it reports the outcome, so a failed
@@ -761,13 +833,21 @@ export async function handleVkInbound(params: {
               // meant a VK edit failure on a blocks-plus-empty-final turn left
               // the person with nothing at all.
               if (await progressDraft.overwrite(draftText)) {
-                draftAnswerText = draftText;
+                draftAnswerSource = accumulated;
                 vkDiag("block into draft", { len: draftText.length });
                 return;
               }
               runtime.log?.("vk: block → draft failed, sending it the usual way");
-              draftAnswerText = null;
+            } else {
+              // A single block longer than one VK message: it goes the usual
+              // way, split into several.
+              vkDiag("block overflows draft", { len: accumulated.length });
             }
+            draftAnswerSource = null;
+          } else if (progressDraft && !isFinal) {
+            // A block with media or buttons goes as its own message. Freeze
+            // the answer part in the draft first, so it stays above it.
+            await sealDraftAnswer();
           }
 
           // ── Intermediate block WITH MEDIA → own message, but labelled ────
@@ -781,7 +861,9 @@ export async function handleVkInbound(params: {
           // The label goes into `outboundPayload`, not `normalized`: what is sent
           // is the copy taken above (where the quote target is decided), so a
           // label written into the original would never reach the recipient.
-          if (progressDraft && !isFinal && outboundPayload.text?.trim()) {
+          // A plain text block that could not go into the draft is part of the
+          // answer, not progress: it carries no "working" header.
+          if (progressDraft && !isFinal && !isTextBlock && outboundPayload.text?.trim()) {
             const label = resolveVkProgressLabel(vkStreamingEntry);
             if (label && !outboundPayload.text.startsWith(label)) {
               outboundPayload.text = `${label} ${outboundPayload.text}`;
@@ -789,19 +871,35 @@ export async function handleVkInbound(params: {
           }
 
           // ── Edit-in-place finalize (Telegram-style single bubble) ──────────
-          // When a step draft is live and the final answer carries text and no
-          // buttons, edit the draft message INTO the answer instead of dropping
-          // it and sending a new one. The first chunk rewrites the draft, the
-          // rest of a long answer follows as ordinary messages, and media (a
-          // picture, a voice message) follows last. An answer with buttons falls
-          // through to the normal delivery path.
+          // When a step draft is live and the final answer carries text, edit
+          // the draft message INTO the answer instead of dropping it and sending
+          // a new one. The first chunk rewrites the draft, the rest of a long
+          // answer follows as ordinary messages, and media (a picture, a voice
+          // message) follows last. An answer with buttons goes the normal
+          // delivery path: the keyboard is sent with a new message, which an
+          // edit cannot do.
+          //
+          // The answer is already in the draft (block streaming): the final
+          // must not replace it — neither delete it when empty nor overwrite it
+          // with a truncated copy. Only the final's media still has to go out.
+          const keepsDraftAnswer =
+            progressDraft !== null &&
+            ownsDraftOutcome &&
+            draftKeepsAnswer(markdownAttachments.text);
+          if (keepsDraftAnswer && outboundPayload.text?.trim()) {
+            vkDiag("truncated final dropped, draft holds the answer", {
+              len: outboundPayload.text.length,
+            });
+            // The final's own attachments still go out.
+            outboundPayload.text = markdownAttachments.attachments.join("\n");
+          }
           if (progressDraft && ownsDraftOutcome) {
             const draftMsgId = progressDraft.currentMessageId();
             const hasMedia =
               Boolean(normalized.mediaUrl) || (normalized.mediaUrls?.length ?? 0) > 0;
-            const finalText = normalized.text?.trim();
+            const finalText = keepsDraftAnswer ? undefined : markdownAttachments.text.trim();
             if (draftMsgId !== undefined && finalText && !resolvedButtons) {
-              const chunks = renderVkMarkdownChunks(normalized.text ?? "");
+              const chunks = renderVkMarkdownChunks(markdownAttachments.text);
               if (chunks.length >= 1) {
                 progressDraft.compositor.markFinalReplyStarted();
                 let edited = false;
@@ -819,44 +917,61 @@ export async function handleVkInbound(params: {
                 progressDraft.compositor.markFinalReplyDelivered();
                 progressDraft.close();
                 if (edited) {
+                  // The draft IS the answer now: let go of it, so the cleanup
+                  // at the end of the turn cannot delete it.
+                  progressDraft.detach();
                   runtime.log?.(
                     `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
-                  // The tail of a long answer goes as ordinary messages: VK
-                  // cannot hold more than ~4096 characters in one bubble.
-                  for (const chunk of chunks.slice(1)) {
-                    try {
+                  // The answer's head is out: the draft now carries it.
+                  statusSink?.({ lastOutboundAt: Date.now() });
+                  // The rest of the answer: tail chunks, markdown attachments,
+                  // voice. A failure here is a partial delivery and must reach
+                  // the core like any other send failure — swallowing it made
+                  // `deliver` succeed and the status reaction say "done" while
+                  // the recipient got the start of the answer only. Parts that
+                  // did go out are not sent again.
+                  try {
+                    // The tail of a long answer goes as ordinary messages: VK
+                    // cannot hold more than ~4096 characters in one bubble.
+                    for (const chunk of chunks.slice(1)) {
                       await sendMessageVk(String(message.peerId), chunk.text, {
                         accountId: account.accountId,
                       });
-                    } catch (err) {
-                      runtime.error?.(
-                        `vk: step-progress tail chunk failed: ${String(err)}`,
-                      );
                     }
-                  }
-                  // Media goes last and without text: the text is already in
-                  // the rewritten draft, so a caption would only duplicate it.
-                  if (hasMedia) {
-                    const mediaList = normalized.mediaUrls?.length
-                      ? normalized.mediaUrls
-                      : normalized.mediaUrl
-                        ? [normalized.mediaUrl]
-                        : [];
-                    for (const media of mediaList) {
-                      try {
+                    // Attachments from markdown links go the ordinary way, as
+                    // on a reply without a draft; only the links are sent, so
+                    // no caption repeats the text already in the draft.
+                    if (markdownAttachments.attachments.length > 0) {
+                      await deliverVkReply({
+                        payload: { text: markdownAttachments.attachments.join("\n") },
+                        peerId: message.peerId,
+                        accountId: account.accountId,
+                        statusSink,
+                      });
+                    }
+                    // Voice messages go last and without text: the text is
+                    // already in the replaced draft, so a caption would only
+                    // duplicate it.
+                    if (hasMedia) {
+                      const mediaList = normalized.mediaUrls?.length
+                        ? normalized.mediaUrls
+                        : normalized.mediaUrl
+                          ? [normalized.mediaUrl]
+                          : [];
+                      for (const media of mediaList) {
                         await deliverVkReply({
                           payload: { ...normalized, text: "", mediaUrl: media, mediaUrls: undefined },
                           peerId: message.peerId,
                           accountId: account.accountId,
                           statusSink,
                         });
-                      } catch (err) {
-                        runtime.error?.(`vk: step-progress media tail failed: ${String(err)}`);
                       }
                     }
+                  } catch (err) {
+                    runtime.error?.(`vk: step-progress answer tail failed: ${String(err)}`);
+                    throw err;
                   }
-                  statusSink?.({ lastOutboundAt: Date.now() });
                   return;
                 }
                 // Edit failed — drop the draft and deliver the answer normally so
@@ -870,47 +985,33 @@ export async function handleVkInbound(params: {
               progressDraft.compositor.markFinalReplyStarted();
             }
           }
-          await deliverVkReply({
-            payload: outboundPayload,
-            peerId: message.peerId,
-            accountId: account.accountId,
-            statusSink,
-            clearKeyboard:
-              payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
-          });
+          const leftToSend =
+            Boolean(outboundPayload.text?.trim()) ||
+            Boolean(outboundPayload.mediaUrl) ||
+            (outboundPayload.mediaUrls?.length ?? 0) > 0 ||
+            Boolean(resolvedButtons);
+          // A kept draft may leave nothing else to deliver; an empty send would
+          // report "no result" and needlessly reset the VK client.
+          if (!keepsDraftAnswer || leftToSend) {
+            await deliverVkReply({
+              payload: outboundPayload,
+              peerId: message.peerId,
+              accountId: account.accountId,
+              statusSink,
+              clearKeyboard:
+                payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
+            });
+          }
           if (progressDraft && ownsDraftOutcome && !draftHandled) {
             progressDraft.compositor.markFinalReplyDelivered();
             progressDraft.close();
             // The draft is dropped only when the answer arrived some other
-            // way. When the final is empty and the draft already holds the
-            // answer text (the model delivered it as blocks along the way),
-            // deleting it destroys the only copy of the answer and the recipient
-            // is left with a voice message alone. Some models put the whole
-            // text in the final, others send the final empty.
-            //
-            // "Empty" is the core's question, not ours: `selectLongerFinalText`
-            // compares the final against what the draft already holds and
-            // returns the better text, and `isPotentialTruncatedFinal` catches
-            // the case where the final is present but plainly cut short.
-            const draftMsgId = progressDraft.currentMessageId();
-            const finalText = normalized.text?.trim() ?? "";
-            const keptAnswer =
-              draftAnswerText && (!finalText || isPotentialTruncatedFinal(finalText))
-                ? selectLongerFinalText({
-                    finalText,
-                    candidateTexts: [draftAnswerText],
-                  })
-                : undefined;
-            if (keptAnswer && draftMsgId !== undefined) {
-              // The draft is the answer — but rewrite it WITHOUT the progress
-              // label. `overwrite` always prepends the label, so a finished
-              // answer would keep a "working" header forever.
-              try {
-                await editMessageVk(String(message.peerId), draftMsgId, keptAnswer, account);
-                vkDiag("draft kept as answer", { len: keptAnswer.length });
-              } catch (err) {
-                runtime.log?.(`vk: draft finalize failed: ${String(err)}`);
-              }
+            // way. When the draft already holds the answer text (the model
+            // delivered it as blocks along the way), deleting it destroys the
+            // only copy of the answer and the recipient is left with a voice
+            // message alone — see `draftKeepsAnswer`.
+            if (keepsDraftAnswer) {
+              await sealDraftAnswer();
             } else {
               await progressDraft.remove();
             }
@@ -957,12 +1058,13 @@ export async function handleVkInbound(params: {
                   // Build the full draft line (like Telegram). Passing undefined
                   // leaves the compositor with nothing to render; startImmediately
                   // shows the step at once instead of waiting out the start gate.
-                  // A tool step overwrites the draft with its own list, so the
-                  // answer text left there by a previous block is gone. Forget
-                  // it: otherwise an empty final would keep the step list as the
-                  // "answer".
-                  draftAnswerText = null;
-                  await progressDraft.compositor.pushToolProgress(
+                  // A tool step that the compositor renders overwrites the draft
+                  // with its own list, so the answer text left there by a previous
+                  // block is gone. Forget it only then: otherwise an empty final
+                  // would keep the step list as the "answer". A step it does not
+                  // render (a non-working tool, an update phase) leaves the answer
+                  // in the draft, and forgetting it would let cleanup delete it.
+                  const redrawn = await progressDraft.compositor.pushToolProgress(
                     buildChannelProgressDraftLineForEntry(vkStreamingEntry, {
                       event: "tool",
                       itemId: payload?.itemId,
@@ -973,6 +1075,7 @@ export async function handleVkInbound(params: {
                     }),
                     { toolName, startImmediately: true },
                   );
+                  if (redrawn) draftAnswerSource = null;
                 }
               },
               onCompactionStart: async () => {
@@ -999,8 +1102,16 @@ export async function handleVkInbound(params: {
       try {
         progressDraft.compositor.cancel();
         progressDraft.close();
-        // On a failed turn no final deliver ran, so drop the dangling step draft.
-        if (dispatchError) {
+        // Whatever the draft still holds when the turn ends was not taken by a
+        // final — the turn ended without one (NO_REPLY, an answer sent through
+        // the `message` tool, an abort) or failed. Answer text streamed into it
+        // is kept as the answer; a bare step list is dropped rather than left
+        // saying "working" forever. Telegram does the same at this point
+        // (finalizePendingAnswerBlockDraft, then cleanupDrafts). A draft the
+        // final took is already detached, so `remove` does not touch it.
+        if (draftAnswerSource !== null) {
+          await sealDraftAnswer();
+        } else if (progressDraft.currentMessageId() !== undefined) {
           await progressDraft.remove();
         }
       } catch (err) {

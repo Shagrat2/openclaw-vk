@@ -23,7 +23,7 @@ import type { CoreConfig, ResolvedVkAccount } from "./types.js";
  *
  * The hard part — the delayed-start gate, dedup, truncation and multi-line
  * rendering — lives in the core `createChannelProgressDraftCompositor`
- * (openclaw/plugin-sdk/channel-message). This module only supplies the two
+ * (openclaw/plugin-sdk/channel-outbound). This module only supplies the two
  * VK-specific primitives the compositor drives:
  *   - `update(text)`      → lazily create the draft (messages.send) then edit it
  *                           in place (messages.edit) on every subsequent render;
@@ -91,6 +91,11 @@ export type VkProgressDraftHandle = {
   /** Remove the draft message entirely (best-effort). */
   remove(): Promise<void>;
   /**
+   * Let go of the current message without deleting it: it now holds a finished
+   * part of the answer. The next render starts a fresh draft below it.
+   */
+  detach(): void;
+  /**
    * Seal the draft: after this, `overwrite` is a no-op so a late compositor
    * render can never spawn a fresh message once the turn has finalized.
    */
@@ -106,11 +111,11 @@ export function createVkProgressDraftCompositor(
   // render can't create a brand-new message after the answer is delivered.
   let closed = false;
 
-  // The live draft label (`streaming.progress.label`). The core does not add it
-  // on any path — verified from a trace: the draft length on tool steps did not
-  // change with a label configured. So we add it here, at the single write
-  // point, to cover both steps and text chunks. The startsWith check guards
-  // against a duplicate when the label was already added above.
+  // The live draft label (`streaming.progress.label`). The compositor puts it
+  // on the step renders it produces, but text blocks are written straight
+  // through `overwrite` and never pass the compositor, so the label is added
+  // here, at the single write point. The startsWith check keeps a step render
+  // that already carries it from getting it twice.
   const resolveProgressLabel = (): string | undefined => resolveVkProgressLabel(params.entry);
 
   const overwrite = async (rawText: string): Promise<boolean> => {
@@ -177,6 +182,9 @@ export function createVkProgressDraftCompositor(
     currentMessageId: () => messageId,
     overwrite,
     remove,
+    detach: () => {
+      messageId = undefined;
+    },
     close: () => {
       closed = true;
     },

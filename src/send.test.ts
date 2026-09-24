@@ -30,6 +30,7 @@ import {
   deleteMessageVk,
   editMessageVk,
   sendTypingVk,
+  splitVkMarkdownAttachments,
 } from "./send.js";
 import { makeAccount } from "./test-helpers.js";
 
@@ -241,6 +242,26 @@ beforeEach(() => {
   mockCleanupAudioSegments.mockReset().mockResolvedValue(undefined);
   // Reset constructor counters between tests.
   vi.mocked(VK).mockClear();
+});
+
+describe("splitVkMarkdownAttachments", () => {
+  it("takes out the links the send path turns into attachments, as written", () => {
+    expect(
+      splitVkMarkdownAttachments(
+        "График: ![chart](https://example.com/c.png)\nОтчёт: [отчёт.pdf](/tmp/report.pdf)",
+      ),
+    ).toEqual({
+      text: "График:\nОтчёт:",
+      attachments: ["![chart](https://example.com/c.png)", "[отчёт.pdf](/tmp/report.pdf)"],
+    });
+  });
+
+  it("leaves an ordinary web link in the text", () => {
+    expect(splitVkMarkdownAttachments("См. [страница](https://example.com/page)")).toEqual({
+      text: "См. [страница](https://example.com/page)",
+      attachments: [],
+    });
+  });
 });
 
 describe("sendMessageVk", () => {

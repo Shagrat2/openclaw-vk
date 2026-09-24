@@ -74,7 +74,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:sdk": "vitest run src/diagnostics.sdk.test.ts src/manifest.sdk.test.ts"
+    "test:sdk": "vitest run src/diagnostics.sdk.test.ts src/manifest.sdk.test.ts src/inbound.draft.sdk.test.ts"
   },
   "dependencies": {
     "markdown-to-vk": "^0.3.2",
