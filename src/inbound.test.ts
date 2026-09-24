@@ -275,6 +275,7 @@ const mockCreateVkProgressDraft = vi.hoisted(() =>
     currentMessageId: mockCurrentMessageId,
     overwrite: mockDraftOverwrite,
     remove: mockDraftRemove,
+    detach: vi.fn(),
     close: mockDraftClose,
   })),
 );

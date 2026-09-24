@@ -233,4 +233,78 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
     });
   });
 
+  // ── P1-2: a block that no longer fits must not cost the earlier ones ─────
+
+  describe("blocks that stop fitting into the draft", () => {
+    const first = `ПЕРВЫЙ ${"а".repeat(2500)}`;
+    const second = `ВТОРОЙ ${"б".repeat(2500)}`;
+    const third = "ТРЕТИЙ конец";
+
+    it("delivers every block once and in order, none with the working header", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: first }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: second }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: third }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "", ...voice }, { kind: "final" });
+      });
+      const joined = texts().join("\n");
+      for (const part of ["ПЕРВЫЙ", "ВТОРОЙ", "ТРЕТИЙ"]) {
+        expect(joined.split(part)).toHaveLength(2);
+      }
+      expect(joined.indexOf("ПЕРВЫЙ")).toBeLessThan(joined.indexOf("ВТОРОЙ"));
+      expect(joined.indexOf("ВТОРОЙ")).toBeLessThan(joined.indexOf("ТРЕТИЙ"));
+      expect(texts().some((t) => t.includes(LABEL))).toBe(false);
+    });
+
+    it("keeps the earlier blocks when the overflowing block is followed by an empty final", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: first }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: second }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "", ...voice }, { kind: "final" });
+      });
+      const joined = texts().join("\n");
+      expect(joined).toContain("ПЕРВЫЙ");
+      expect(joined).toContain("ВТОРОЙ");
+      expect(joined.indexOf("ПЕРВЫЙ")).toBeLessThan(joined.indexOf("ВТОРОЙ"));
+      expect(texts().some((t) => t.includes(LABEL))).toBe(false);
+    });
+
+    it("keeps the order when a block with a picture goes between text blocks", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "ДО картинки" }, { kind: "block" });
+        await dispatcherOptions.deliver(
+          { text: "подпись", mediaUrl: "https://example.com/p.png" },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver({ text: "ПОСЛЕ картинки" }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "", ...voice }, { kind: "final" });
+      });
+      const order = chat.messages.map((m) =>
+        m.media.includes("https://example.com/p.png") ? "PIC" : m.text,
+      );
+      const before = order.findIndex((t) => t.includes("ДО картинки"));
+      const pic = order.indexOf("PIC");
+      const after = order.findIndex((t) => t.includes("ПОСЛЕ картинки"));
+      expect(before).toBeGreaterThanOrEqual(0);
+      expect(before).toBeLessThan(pic);
+      expect(pic).toBeLessThan(after);
+      expect(texts().filter((t) => t.includes("ДО картинки"))).toHaveLength(1);
+    });
+
+    it("delivers a single block longer than one VK message without the header", async () => {
+      const huge = `ОГРОМНЫЙ ${"в".repeat(5000)} КОНЕЦ`;
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: huge }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "", ...voice }, { kind: "final" });
+      });
+      const joined = texts().join("");
+      expect(joined).toContain("ОГРОМНЫЙ");
+      expect(joined).toContain("КОНЕЦ");
+      expect(texts().some((t) => t.includes(LABEL))).toBe(false);
+    });
+  });
 });

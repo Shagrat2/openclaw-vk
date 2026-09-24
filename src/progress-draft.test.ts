@@ -116,6 +116,20 @@ describe("createVkProgressDraftCompositor", () => {
     expect(handle.currentMessageId()).toBeUndefined();
   });
 
+  it("detach keeps the message and starts the next render as a new draft", async () => {
+    const handle = make();
+    await handle.overwrite("часть ответа"); // send → id 55
+    handle.detach();
+    expect(handle.currentMessageId()).toBeUndefined();
+    await handle.remove(); // nothing of ours to delete any more
+    expect(mockDeleteMessage).not.toHaveBeenCalled();
+    mockSendMessage.mockResolvedValueOnce({ messageId: "56", chatId: "42" });
+    await handle.overwrite("следующая часть");
+    expect(mockEditMessage).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    expect(handle.currentMessageId()).toBe(56);
+  });
+
   it("remove is a no-op when there is no draft yet", async () => {
     const handle = make();
     await handle.remove();

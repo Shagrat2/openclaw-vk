@@ -91,6 +91,11 @@ export type VkProgressDraftHandle = {
   /** Remove the draft message entirely (best-effort). */
   remove(): Promise<void>;
   /**
+   * Let go of the current message without deleting it: it now holds a finished
+   * part of the answer. The next render starts a fresh draft below it.
+   */
+  detach(): void;
+  /**
    * Seal the draft: after this, `overwrite` is a no-op so a late compositor
    * render can never spawn a fresh message once the turn has finalized.
    */
@@ -177,6 +182,9 @@ export function createVkProgressDraftCompositor(
     currentMessageId: () => messageId,
     overwrite,
     remove,
+    detach: () => {
+      messageId = undefined;
+    },
     close: () => {
       closed = true;
     },

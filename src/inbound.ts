@@ -763,6 +763,21 @@ export async function handleVkInbound(params: {
       runtime.log?.(`vk: draft finalize failed: ${String(err)}`);
     }
   };
+  /**
+   * Freeze the answer part sitting in the draft and let go of that message, so
+   * whatever comes next — a block that no longer fits, a picture — lands BELOW
+   * it instead of overwriting it. Without this the next block rewrote the draft
+   * and the text already in it was gone, or it stayed above a part that came
+   * after it.
+   */
+  const sealDraftAnswer = async (): Promise<void> => {
+    if (!progressDraft || draftAnswerSource === null) {
+      return;
+    }
+    await keepDraftAsAnswer();
+    progressDraft.detach();
+    draftAnswerSource = null;
+  };
   if (progressDraftEnabled) {
     progressDraft = createVkProgressDraftCompositor({
       to: String(message.peerId),
@@ -872,30 +887,35 @@ export async function handleVkInbound(params: {
           // as work goes on, and at the end that same bubble becomes the answer.
           // Media and buttons keep their old path — they cannot go into a
           // draft.
-          if (
+          const isTextBlock = Boolean(
             progressDraft &&
-            !isFinal &&
-            normalized.text?.trim() &&
-            !normalized.mediaUrl &&
-            !(normalized.mediaUrls?.length ?? 0) &&
-            !resolvedButtons
-          ) {
+              !isFinal &&
+              normalized.text?.trim() &&
+              !normalized.mediaUrl &&
+              !(normalized.mediaUrls?.length ?? 0) &&
+              !resolvedButtons,
+          );
+          if (progressDraft && isTextBlock) {
             // Blocks are CHUNKS of the answer, not its accumulated version (the
             // core splits the stream through a block chunker). The draft is
             // rewritten in full, so we accumulate ourselves: otherwise an empty
             // final would keep only the last paragraph as the "answer" while the
             // voice-over carried the whole text.
-            const accumulated = draftAnswerSource
-              ? `${draftAnswerSource}\n\n${normalized.text.trim()}`
-              : normalized.text.trim();
-            const chunks = renderVkMarkdownChunks(accumulated);
-            if (chunks.length > 1) {
-              // The accumulated text no longer fits one VK message. From here
-              // the draft cannot become the answer — send this block the usual
-              // way and forget the accumulation so no stub is kept.
-              draftAnswerSource = null;
+            const blockText = normalized.text!.trim();
+            let accumulated = draftAnswerSource
+              ? `${draftAnswerSource}\n\n${blockText}`
+              : blockText;
+            let chunks = renderVkMarkdownChunks(accumulated);
+            if (chunks.length > 1 && draftAnswerSource !== null) {
+              // The answer no longer fits one VK message. What is in the draft
+              // is a finished part of it: freeze it there and start a new
+              // draft with this block, below the frozen part.
               vkDiag("block overflows draft", { len: accumulated.length });
-            } else {
+              await sealDraftAnswer();
+              accumulated = blockText;
+              chunks = renderVkMarkdownChunks(accumulated);
+            }
+            if (chunks.length === 1) {
               // The label is added by the draft itself (the single write point).
               const draftText = chunks[0]?.text ?? accumulated;
               // `overwrite` never rejects — it reports the outcome, so a failed
@@ -908,8 +928,16 @@ export async function handleVkInbound(params: {
                 return;
               }
               runtime.log?.("vk: block → draft failed, sending it the usual way");
-              draftAnswerSource = null;
+            } else {
+              // A single block longer than one VK message: it goes the usual
+              // way, split into several.
+              vkDiag("block overflows draft", { len: accumulated.length });
             }
+            draftAnswerSource = null;
+          } else if (progressDraft && !isFinal) {
+            // A block with media or buttons goes as its own message. Freeze
+            // the answer part in the draft first, so it stays above it.
+            await sealDraftAnswer();
           }
 
           // ── Intermediate block WITH MEDIA → own message, but labelled ────
@@ -924,7 +952,9 @@ export async function handleVkInbound(params: {
           // 2026.9.6 наружу уходит КОПИЯ нагрузки, снятая выше (там же решается
           // цитирование). Правка оригинала до отправки не доходит — блок ушёл бы
           // без метки, и шаги было бы не отличить от ответа.
-          if (progressDraft && !isFinal && outboundPayload.text?.trim()) {
+          // A plain text block that could not go into the draft is part of the
+          // answer, not progress: it carries no "working" header.
+          if (progressDraft && !isFinal && !isTextBlock && outboundPayload.text?.trim()) {
             const label = resolveVkProgressLabel(vkStreamingEntry);
             if (label && !outboundPayload.text.startsWith(label)) {
               outboundPayload.text = `${label} ${outboundPayload.text}`;
