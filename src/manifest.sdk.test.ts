@@ -92,9 +92,26 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     expect(validate({ audio: { splitTimeoutMs: 1.5 } })).toBe(false);
   });
 
+  it("accepts the progress streaming mode at channel level, with core-owned draft keys", () => {
+    expect(validate({ streaming: { mode: "progress", progress: { label: "Working", maxLines: 8 } } })).toBe(true);
+    expect(validate({ streaming: { mode: "off" } })).toBe(true);
+  });
+
+  // VK implements only the progress draft; another core mode would be a setting
+  // that does nothing.
+  it("rejects a streaming mode VK does not implement", () => {
+    expect(validate({ streaming: { mode: "partial" } })).toBe(false);
+    expect(validate({ streaming: { mode: "block" } })).toBe(false);
+  });
+
+  // The draft is read from `channels.vk.streaming` for every account.
+  it("rejects streaming under an account", () => {
+    expect(validate({ accounts: { work: { token: "tok", streaming: { mode: "progress" } } } })).toBe(false);
+  });
+
   it("still accepts an ordinary account and keys it does not describe", () => {
     // The root stays open: tightening it would fail existing configs on keys the
     // manifest has never listed.
-    expect(validate({ streaming: { mode: "progress" }, accounts: { work: { token: "tok", dmPolicy: "open" } } })).toBe(true);
+    expect(validate({ textChunkLimit: 3000, accounts: { work: { token: "tok", dmPolicy: "open" } } })).toBe(true);
   });
 });

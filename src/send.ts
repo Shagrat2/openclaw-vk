@@ -1671,6 +1671,76 @@ export async function deleteReactionVk(
   });
 }
 
+/**
+ * Edit an already-sent bot message in place. Used by the step-progress draft
+ * (progress-draft.ts) to rewrite a single "live" message with the running list
+ * of execution steps. `messageId` is the value returned as `SendVkResult.messageId`
+ * (the message_id from messages.send). Returns false when the account/target is
+ * unusable so the caller can fall back to a fresh send.
+ */
+export async function editMessageVk(
+  to: string,
+  messageId: number,
+  text: string,
+  account: ResolvedVkAccount,
+  opts: { formatData?: VkPreparedFormattedMessage["formatData"] } = {},
+): Promise<boolean> {
+  if (!account.token) {
+    return false;
+  }
+  const peerId = Number(normalizeVkTargetId(to));
+  if (Number.isNaN(peerId) || !Number.isFinite(messageId) || messageId <= 0) {
+    return false;
+  }
+  const vk = getOrCreateVk(account.token);
+  const editParams: Record<string, unknown> = {
+    peer_id: peerId,
+    message_id: messageId,
+    message: text,
+    keep_forward_messages: 1,
+    keep_snippets: 1,
+  };
+  // format_data carries VK's rich-text runs (markdown). It is a real messages.edit
+  // param but not typed by vk-io, so build the params loosely and cast on the call.
+  if (opts.formatData && opts.formatData.items.length > 0) {
+    editParams.format_data = JSON.stringify(opts.formatData);
+  }
+  await withVkRetry(async () => {
+    await vk.api.messages.edit(
+      editParams as unknown as Parameters<typeof vk.api.messages.edit>[0],
+    );
+  });
+  return true;
+}
+
+/**
+ * Delete a bot message the plugin previously sent (e.g. drop the progress draft
+ * when the final answer is delivered as a separate message). Transient VK
+ * errors are retried; anything else is thrown to the caller, which treats the
+ * delete as best-effort and never lets it block delivery.
+ */
+export async function deleteMessageVk(
+  to: string,
+  messageId: number,
+  account: ResolvedVkAccount,
+): Promise<void> {
+  if (!account.token) {
+    return;
+  }
+  const peerId = Number(normalizeVkTargetId(to));
+  if (Number.isNaN(peerId) || !Number.isFinite(messageId) || messageId <= 0) {
+    return;
+  }
+  const vk = getOrCreateVk(account.token);
+  await withVkRetry(async () => {
+    await vk.api.messages.delete({
+      peer_id: peerId,
+      message_ids: [messageId],
+      delete_for_all: 1,
+    });
+  });
+}
+
 async function sendMessageChunksVk(params: {
   to: string;
   chunks: VkPreparedFormattedMessage[];
