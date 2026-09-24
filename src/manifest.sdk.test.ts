@@ -104,6 +104,14 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     expect(validate({ streaming: { mode: "block" } })).toBe(false);
   });
 
+  // Other channels accept a bare mode or a boolean here; VK reads the object
+  // form only, so a copied `streaming: "progress"` must fail validation rather
+  // than be ignored.
+  it("rejects streaming as a string or a boolean", () => {
+    expect(validate({ streaming: "progress" })).toBe(false);
+    expect(validate({ streaming: true })).toBe(false);
+  });
+
   // The draft is read from `channels.vk.streaming` for every account.
   it("rejects streaming under an account", () => {
     expect(validate({ accounts: { work: { token: "tok", streaming: { mode: "progress" } } } })).toBe(false);

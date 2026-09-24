@@ -1,9 +1,9 @@
-// Local copies of Plugin SDK types that the core stopped exporting.
+// Plugin SDK types for the step-progress draft, kept in one place.
 //
-// Both types existed in `channel-message` / `channel-outbound` up to 2026.7 and
-// were moved into internal modules in 2026.8. They describe data this plugin
-// reads from its own config, so a local copy costs nothing and removes a
-// dependency on a surface the core no longer publishes.
+// The streaming config entry type was published in `channel-message` /
+// `channel-outbound` up to 2026.7 and is internal since 2026.8; it describes
+// data this plugin reads from its own config, so a local copy costs nothing.
+// The mode type is still published and is re-exported rather than copied.
 
 /** Streaming section of the VK channel config, as this plugin reads it. */
 export type StreamingCompatEntry = {
