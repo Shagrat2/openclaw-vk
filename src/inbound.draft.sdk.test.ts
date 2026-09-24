@@ -426,4 +426,23 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       expect(chat.messages.some((m) => m.media.includes(voice.mediaUrl))).toBe(true);
     });
   });
+
+  // ── P2: a turn that ends without a final ────────────────────────────────
+
+  describe("turn without a final", () => {
+    it("removes a draft that holds only steps", async () => {
+      await runTurn(async ({ replyOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+      });
+      expect(chat.messages).toHaveLength(0);
+    });
+
+    it("keeps the answer blocks, without the working header", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Ответ блоками." }, { kind: "block" });
+      });
+      expect(texts()).toEqual(["Ответ блоками."]);
+    });
+  });
 });

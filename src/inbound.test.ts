@@ -275,7 +275,8 @@ const mockCreateVkProgressDraft = vi.hoisted(() =>
     currentMessageId: mockCurrentMessageId,
     overwrite: mockDraftOverwrite,
     remove: mockDraftRemove,
-    detach: vi.fn(),
+    // Like the real handle: the message is let go of, nothing is deleted.
+    detach: vi.fn(() => mockCurrentMessageId.mockReturnValue(undefined)),
     close: mockDraftClose,
   })),
 );

@@ -1021,6 +1021,9 @@ export async function handleVkInbound(params: {
                 progressDraft.compositor.markFinalReplyDelivered();
                 progressDraft.close();
                 if (edited) {
+                  // The draft IS the answer now: let go of it, so the cleanup
+                  // at the end of the turn cannot delete it.
+                  progressDraft.detach();
                   runtime.log?.(
                     `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
@@ -1118,8 +1121,7 @@ export async function handleVkInbound(params: {
             // only copy of the answer and the recipient is left with a voice
             // message alone — see `draftKeepsAnswer`.
             if (keepsDraftAnswer) {
-              await keepDraftAsAnswer();
-              draftAnswerSource = null;
+              await sealDraftAnswer();
             } else {
               await progressDraft.remove();
             }
@@ -1211,8 +1213,16 @@ export async function handleVkInbound(params: {
       try {
         progressDraft.compositor.cancel();
         progressDraft.close();
-        // On a failed turn no final deliver ran, so drop the dangling step draft.
-        if (dispatchError) {
+        // Whatever the draft still holds when the turn ends was not taken by a
+        // final — the turn ended without one (NO_REPLY, an answer sent through
+        // the `message` tool, an abort) or failed. Answer text streamed into it
+        // is kept as the answer; a bare step list is dropped rather than left
+        // saying "working" forever. Telegram does the same at this point
+        // (finalizePendingAnswerBlockDraft, then cleanupDrafts). A draft the
+        // final took is already detached, so `remove` does not touch it.
+        if (draftAnswerSource !== null) {
+          await sealDraftAnswer();
+        } else if (progressDraft.currentMessageId() !== undefined) {
           await progressDraft.remove();
         }
       } catch (err) {
