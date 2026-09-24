@@ -75,8 +75,14 @@ vi.mock("./send.js", async (importOriginal) => {
   deleteMessageVk: vi.fn(async (_to: string, id: number) => {
     chat.messages = chat.messages.filter((m) => m.id !== id);
   }),
-  sendPayloadVk: vi.fn(async (to: string, payload: Record<string, unknown>) => {
+  sendPayloadVk: vi.fn(async (to: string, payload: Record<string, unknown>, opts?: never) => {
     chat.payloadCalls.push(payload);
+    // A question takes the REAL send path — the one that moves the draft out
+    // of its way — down to VK's API, which is the fake chat below.
+    const channelData = payload.channelData as { askUser?: unknown } | undefined;
+    if (channelData?.askUser) {
+      return await actual.sendPayloadVk(to, payload as never, opts);
+    }
     if (chat.failSendPayload) {
       throw new Error("VK API error 10: upload failed");
     }
@@ -98,6 +104,26 @@ vi.mock("./send.js", async (importOriginal) => {
   clearVkInstances: vi.fn(),
   };
 });
+
+// VK's API, for the one real send path above (questions): into the same chat.
+vi.mock("vk-io", () => ({
+  VK: vi.fn().mockImplementation(function () {
+    return {
+      api: {
+        messages: {
+          send: vi.fn(async (params: { message: string }) => {
+            const id = chat.nextId++;
+            chat.messages.push({ id, text: params.message, media: [] });
+            return id;
+          }),
+        },
+      },
+    };
+  }),
+  getRandomId: () => 1,
+  // monitor.ts (through channel.ts) extends it at load; never started here.
+  PollingTransport: class {},
+}));
 
 // ── The agent run: each test scripts what the core delivers ─────────────────
 
@@ -133,6 +159,9 @@ const runtimeModule: typeof import("./runtime.js") | null = sdkInstalled
   : null;
 const helpers: typeof import("./test-helpers.js") | null = sdkInstalled
   ? await import("./test-helpers.js")
+  : null;
+const channel: typeof import("./channel.js") | null = sdkInstalled
+  ? await import("./channel.js")
   : null;
 
 const LABEL = "⏳ Работаю";
@@ -180,7 +209,10 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
     chat.failSendPayload = false;
     chat.payloadCalls = [];
     run.scenario = null;
-    runtimeModule!.setVkRuntime(helpers!.makeVkRuntime());
+    const vkRuntime = helpers!.makeVkRuntime();
+    // The real question send path reads the live config for the VK token.
+    vi.mocked(vkRuntime.config.current).mockReturnValue(progressCfg() as never);
+    runtimeModule!.setVkRuntime(vkRuntime);
   });
 
   it("shows the tool step in the draft (sanity: the real compositor is wired)", async () => {
@@ -510,6 +542,78 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
       expect(during).toHaveLength(2);
       expect(during[0]).toBe(question.text);
       expect(during[1]?.startsWith(LABEL)).toBe(true);
+    });
+
+    /**
+     * `ask_user` over MCP — the production path: the core sends the question
+     * as an outbound send (`normalizePayload` → `sendPayload`), never through
+     * this turn's `deliver`. 24.09 the draft stayed above it and the final
+     * answer was edited into it, above the question.
+     */
+    const sendOutbound = async (payload: Record<string, unknown>) => {
+      const outbound = channel!.vkPlugin.outbound!;
+      const cfg = progressCfg();
+      const normalized = outbound.normalizePayload!({ payload, cfg } as never) ?? payload;
+      await outbound.sendPayload!({ cfg, to: "vk:123456", payload: normalized, accountId: "default" } as never);
+    };
+
+    it("a question sent as an outbound send moves the draft below it too", async () => {
+      let during: string[] = [];
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await sendOutbound(question);
+        during = texts();
+        await replyOptions.onToolStart?.(toolStart("render"));
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      // The bare step list is gone the moment the question goes out.
+      expect(during).toEqual([question.text]);
+      expect(texts()).toEqual([question.text, "Готово."]);
+    });
+
+    it("an outbound question keeps the answer already in the draft, above it", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Сначала посмотрю варианты." }, { kind: "block" });
+        await sendOutbound(question);
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      expect(texts()).toEqual(["Сначала посмотрю варианты.", question.text, "Готово."]);
+    });
+
+    it("an ordinary outbound send leaves the draft alone", async () => {
+      let during: string[] = [];
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await sendOutbound({ text: "🍬 Рендер готов" });
+        during = texts();
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      expect(during).toHaveLength(2);
+      expect(during[0]?.startsWith(LABEL)).toBe(true);
+      expect(during[1]).toBe("🍬 Рендер готов");
+      // The draft took the final, as before: it is the first message.
+      expect(texts()).toEqual(["Готово.", "🍬 Рендер готов"]);
+    });
+
+    it("a question to another chat leaves this turn's draft alone", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        const outbound = channel!.vkPlugin.outbound!;
+        const cfg = progressCfg();
+        await outbound.sendPayload!({ cfg, to: "vk:999", payload: question, accountId: "default" } as never);
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      expect(texts()).toEqual(["Готово.", question.text]);
+    });
+
+    it("after the turn ends, a question no longer touches its (finished) draft", async () => {
+      await runTurn(async ({ replyOptions, dispatcherOptions }) => {
+        await replyOptions.onToolStart?.(toolStart());
+        await dispatcherOptions.deliver({ text: "Готово." }, { kind: "final" });
+      });
+      await sendOutbound(question);
+      expect(texts()).toEqual(["Готово.", question.text]);
     });
 
     it("the answer blocks already in the draft stay above the question", async () => {

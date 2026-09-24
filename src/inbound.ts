@@ -42,7 +42,7 @@ import {
   resolveVkInboundResolvedMedia,
 } from "./media.js";
 import { createVkStatusReactionController } from "./reactions-controller.js";
-import { readVkAskUserQuestionId } from "./question.js";
+import { readVkAskUserQuestionId, registerVkDraftQuestionHandoff } from "./question.js";
 import { normalizeVkAllowlist, resolveVkAllowlistMatch } from "./send-support.js";
 import { getVkRuntime } from "./runtime.js";
 import {
@@ -779,6 +779,28 @@ export async function handleVkInbound(params: {
       `vk: step-progress draft enabled (mode=${progressStreamMode}) cmid=${redactVkId(message.conversationMessageId)}`,
     );
   }
+  // A question from the core in this chat — sent through `deliver` below or
+  // routed by the core as an outbound send (`ask_user` over MCP) — holds this
+  // turn and goes out as its own message. The turn goes on after the answer, so
+  // its draft must not stay above the question: later steps would be redrawn
+  // there and the final answer edited into it. The answer already in the draft
+  // is kept where it is; a bare step list is dropped, and the next step starts
+  // a fresh draft below the question.
+  const unregisterDraftHandoff = progressDraft
+    ? registerVkDraftQuestionHandoff(
+        { accountId: account.accountId, peerId: message.peerId },
+        async () => {
+          if (!progressDraft || turnSettled) {
+            return;
+          }
+          await sealDraftAnswer();
+          if (progressDraft.currentMessageId() !== undefined) {
+            await progressDraft.remove();
+            vkDiag("draft moved below question");
+          }
+        },
+      )
+    : undefined;
 
   await startTypingOnce();
 
@@ -930,14 +952,9 @@ export async function handleVkInbound(params: {
           } else if (progressDraft && !isFinal) {
             // A block with media or buttons goes as its own message. Freeze
             // the answer part in the draft first, so it stays above it.
+            // (A question also drops a bare step list: `sendPayloadVk` calls
+            // this turn's handoff, registered below, on every question path.)
             await sealDraftAnswer();
-            if (isQuestion) {
-              // The turn waits on this question and goes on after the answer.
-              // A step list left above it would keep being redrawn there, and
-              // the final answer would land above the question it follows.
-              // Drop it: the next step starts a fresh draft below the question.
-              await progressDraft.remove();
-            }
           }
 
           // ── Intermediate block WITH MEDIA → own message, but labelled ────
@@ -1211,6 +1228,7 @@ export async function handleVkInbound(params: {
     throw err;
   } finally {
     turnSettled = true;
+    unregisterDraftHandoff?.();
     if (progressDraft) {
       try {
         progressDraft.compositor.cancel();

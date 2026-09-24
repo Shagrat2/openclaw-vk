@@ -3,6 +3,7 @@ import { appendVkQuestionStatus, clearVkInstances, sendPayloadVk } from "./send.
 import {
   clearVkQuestionDeliveries,
   findOpenVkQuestionDelivery,
+  registerVkDraftQuestionHandoff,
   resetVkQuestionRuntimeForTest,
 } from "./question.js";
 
@@ -143,6 +144,26 @@ describe("sendPayloadVk — a question from the core", () => {
       peerId: 7654321,
       messageId: Number(result?.messageId),
     });
+  });
+
+  it("moves this chat's step draft out of the way before the question goes out", async () => {
+    const order: string[] = [];
+    vkApi.send.mockImplementation(async () => {
+      order.push("send");
+      return nextMessageId++;
+    });
+    const unregister = registerVkDraftQuestionHandoff({ accountId: "default", peerId: 7654321 }, async () => {
+      order.push("handoff");
+    });
+    try {
+      await sendPayloadVk("vk:7654321", questionPayload(), { cfg: cfg as never });
+      expect(order).toEqual(["handoff", "send"]);
+      // An ordinary message does not touch the draft.
+      await sendPayloadVk("vk:7654321", { text: "Готово" }, { cfg: cfg as never });
+      expect(order).toEqual(["handoff", "send", "send"]);
+    } finally {
+      unregister();
+    }
   });
 
   it("finalize edits the message: question text, outcome line, no keyboard", async () => {

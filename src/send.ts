@@ -29,6 +29,7 @@ import { loadVkOutboundMedia } from "./media.js";
 import {
   buildVkQuestionKeyboard,
   formatVkQuestionStatusLine,
+  handOffVkDraftsBeforeQuestion,
   loadVkQuestionRuntime,
   markVkQuestionTerminal,
   readVkQuestionPrompt,
@@ -2321,6 +2322,15 @@ async function sendVkQuestionPayload(params: {
 }): Promise<SendVkResult | null> {
   const runtime = await loadVkQuestionRuntime();
   const keyboard = runtime ? buildVkQuestionKeyboard(params.question) : undefined;
+  const { account, peerId } = await resolveSendTarget({
+    cfg: params.opts.cfg,
+    accountId: params.opts.accountId,
+    to: params.to,
+  });
+  const accountId = account.accountId;
+  // The turn waiting on this question moves its step draft out of the way
+  // first, so the question is the last message and what follows lands below.
+  await handOffVkDraftsBeforeQuestion({ accountId, peerId });
   const chunks = prepareVkMessageChunks(params.text);
   const results = await sendMessageChunksVk({
     to: params.to,
@@ -2340,12 +2350,6 @@ async function sendVkQuestionPayload(params: {
   if (!runtime || !last || !lastChunk || !Number.isFinite(messageId) || messageId <= 0) {
     return last;
   }
-  const { account, peerId } = await resolveSendTarget({
-    cfg: params.opts.cfg,
-    accountId: params.opts.accountId,
-    to: params.to,
-  });
-  const accountId = account.accountId;
   const questionId = params.question.questionId;
   // Remembered before registering: the core finalizes an already-finished
   // question synchronously inside `registerChannelDelivery`.

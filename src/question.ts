@@ -336,6 +336,68 @@ export function clearVkQuestionDeliveries(): void {
   deliveries.clear();
 }
 
+// ── Step drafts that a question must move ────────────────────────────────────
+
+/**
+ * What a live turn does with its step draft when a question lands in its chat.
+ *
+ * A question reaches VK two ways: through the turn's own reply dispatcher
+ * (`AskUserQuestion`), or as an outbound send routed by the core (`ask_user`
+ * over MCP — the production path, which never passes the dispatcher). Either
+ * way the draft of the turn waiting on the question must get out of its way:
+ * otherwise later steps keep redrawing it above the question and the final
+ * answer is edited into it, above the question it follows (24.09.2026,
+ * `edited INTO final msgId=10417` over question 10418). So the turn registers
+ * its handoff here, and the question send calls it, whichever path it came by.
+ */
+type VkDraftHandoff = () => Promise<void>;
+
+const draftHandoffs = new Map<string, Set<VkDraftHandoff>>();
+
+function draftKey(accountId: string, peerId: number | string): string {
+  return `${accountId}:${peerId}`;
+}
+
+/** Registers a live turn's handoff for its chat; returns the unregister call. */
+export function registerVkDraftQuestionHandoff(
+  target: { accountId: string; peerId: number | string },
+  handoff: VkDraftHandoff,
+): () => void {
+  const key = draftKey(target.accountId, target.peerId);
+  let set = draftHandoffs.get(key);
+  if (!set) {
+    set = new Set();
+    draftHandoffs.set(key, set);
+  }
+  set.add(handoff);
+  return () => {
+    const current = draftHandoffs.get(key);
+    current?.delete(handoff);
+    if (current?.size === 0) {
+      draftHandoffs.delete(key);
+    }
+  };
+}
+
+/**
+ * Before a question goes out: every live draft in that chat seals the answer it
+ * holds and drops a bare step list. A failing handoff must not stop the
+ * question — it is only logged.
+ */
+export async function handOffVkDraftsBeforeQuestion(target: {
+  accountId: string;
+  peerId: number | string;
+}): Promise<void> {
+  const handoffs = [...(draftHandoffs.get(draftKey(target.accountId, target.peerId)) ?? [])];
+  for (const handoff of handoffs) {
+    try {
+      await handoff();
+    } catch (error) {
+      vkDiag("draft handoff before question failed", { reason: String(error) });
+    }
+  }
+}
+
 // ── The core's question runtime ─────────────────────────────────────────────
 
 let runtimePromise: Promise<QuestionGatewayRuntime | undefined> | undefined;

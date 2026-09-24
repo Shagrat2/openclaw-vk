@@ -4,12 +4,14 @@ import {
   clearVkQuestionDeliveries,
   findOpenVkQuestionDelivery,
   formatVkQuestionStatusLine,
+  handOffVkDraftsBeforeQuestion,
   loadVkQuestionRuntime,
   markVkQuestionTerminal,
   normalizeVkQuestionPayload,
   parseVkQuestionCallback,
   readVkAskUserQuestionId,
   readVkQuestionPrompt,
+  registerVkDraftQuestionHandoff,
   rememberVkQuestionDelivery,
   resetVkQuestionRuntimeForTest,
   VK_QUESTION_CHANNEL_DATA_KEY,
@@ -313,5 +315,38 @@ describe("loadVkQuestionRuntime", () => {
       throw new Error("Cannot find module");
     });
     expect(await loadVkQuestionRuntime()).toBeUndefined();
+  });
+});
+
+describe("draft handoff before a question", () => {
+  it("calls the handoffs of that chat only, and stops after unregister", async () => {
+    const here = vi.fn(async () => {});
+    const other = vi.fn(async () => {});
+    const unregister = registerVkDraftQuestionHandoff({ accountId: "default", peerId: 7 }, here);
+    const unregisterOther = registerVkDraftQuestionHandoff({ accountId: "default", peerId: 8 }, other);
+    await handOffVkDraftsBeforeQuestion({ accountId: "default", peerId: 7 });
+    expect(here).toHaveBeenCalledTimes(1);
+    expect(other).not.toHaveBeenCalled();
+    await handOffVkDraftsBeforeQuestion({ accountId: "other", peerId: 7 });
+    expect(here).toHaveBeenCalledTimes(1);
+    unregister();
+    unregister();
+    await handOffVkDraftsBeforeQuestion({ accountId: "default", peerId: 7 });
+    expect(here).toHaveBeenCalledTimes(1);
+    unregisterOther();
+  });
+
+  it("a failing handoff does not stop the others or the question", async () => {
+    const failing = vi.fn(async () => {
+      throw new Error("VK edit failed");
+    });
+    const next = vi.fn(async () => {});
+    const a = registerVkDraftQuestionHandoff({ accountId: "default", peerId: "7" }, failing);
+    const b = registerVkDraftQuestionHandoff({ accountId: "default", peerId: 7 }, next);
+    await expect(handOffVkDraftsBeforeQuestion({ accountId: "default", peerId: 7 })).resolves.toBeUndefined();
+    expect(failing).toHaveBeenCalled();
+    expect(next).toHaveBeenCalled();
+    a();
+    b();
   });
 });
