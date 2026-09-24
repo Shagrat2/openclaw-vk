@@ -118,6 +118,21 @@ function filterVkForwards(
 }
 
 /**
+ * Media the sender is answerable for: their own attachments, plus the images of
+ * a wall post they shared. A post's audio or voice attachment stays a
+ * placeholder in the text — downloading it would let the core transcribe a
+ * third party's recording into the turn as if the sender had said it, the same
+ * reason forwards give up everything but images.
+ */
+function collectVkOwnMedia(
+  attachments: readonly VkInboundAttachment[] | undefined,
+): VkInboundAttachment[] {
+  return (attachments ?? []).filter(
+    (attachment) => !attachment.fromPost || attachment.kind === "image",
+  );
+}
+
+/**
  * Only the images of forwards are downloaded. A forwarded voice message or audio
  * would be transcribed into the turn as if the sender had said it; those stay a
  * placeholder inside the forward.
@@ -329,16 +344,29 @@ export async function handleVkInbound(params: {
   // filtered in groups only — in a direct chat the sender already passed allowFrom,
   // and an empty group allowlist lets every author through.
   const contextVisibility = resolveVkContextVisibility(account.config, config);
-  const isForwardVisible = (forward: VkInboundForward): boolean => {
+  // An author VK did not give us is NOT an allowed author while the allowlist is
+  // non-empty — the core's isSenderIdAllowed says the same, and the mode then
+  // decides: "allowlist" hides such a quote, "allowlist_quote" may keep it. An
+  // empty allowlist still lets every author through, known or not.
+  const isSupplementalVisible = (
+    kind: "quote" | "forwarded",
+    senderId: number | undefined,
+  ): boolean => {
     if (!isGroup) {
       return true;
     }
     const senderAllowed =
       effectiveGroupSenderAllowFrom.length === 0 ||
-      resolveVkAllowlistMatch({ allowFrom: effectiveGroupSenderAllowFrom, senderId: forward.senderId }).allowed;
-    return evaluateSupplementalContextVisibility({ mode: contextVisibility, kind: "forwarded", senderAllowed })
-      .include;
+      (senderId !== undefined &&
+        resolveVkAllowlistMatch({ allowFrom: effectiveGroupSenderAllowFrom, senderId }).allowed);
+    return evaluateSupplementalContextVisibility({ mode: contextVisibility, kind, senderAllowed }).include;
   };
+  const isForwardVisible = (forward: VkInboundForward): boolean =>
+    isSupplementalVisible("forwarded", forward.senderId);
+  // The quote target is judged by its own author first, as Telegram's
+  // resolveVisibleReplyTarget does: hidden means the whole target — text, author
+  // and ids — and only a visible quote has its forwards filtered on their own.
+  const isQuoteVisible = isSupplementalVisible("quote", message.replyToSenderId);
   const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
   const firstForward = visibleForwards[0];
   const rawBody =
@@ -349,6 +377,11 @@ export async function handleVkInbound(params: {
       forwards: visibleForwards,
     });
   if (!rawBody) {
+    // Only reachable when every forward was hidden: the empty-message check above
+    // already let this one through. Say so, without naming the hidden authors.
+    runtime.log?.(
+      `vk: drop group peerId=${redactVkId(message.peerId)} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
+    );
     return;
   }
 
@@ -500,7 +533,10 @@ export async function handleVkInbound(params: {
 
   const groupSystemPrompt = groupConfig?.systemPrompt?.trim() || undefined;
   const resolvedMedia = await resolveVkInboundResolvedMedia({
-    attachments: [...(message.attachments ?? []), ...collectVkForwardImages(visibleForwards)],
+    attachments: [
+      ...collectVkOwnMedia(message.attachments),
+      ...collectVkForwardImages(visibleForwards),
+    ],
     mediaRuntime: core.channel.media,
     logError: (line) => runtime.log?.(line),
   });
@@ -516,7 +552,7 @@ export async function handleVkInbound(params: {
   );
 
   const replyToSender =
-    message.replyToSenderId === undefined
+    message.replyToSenderId === undefined || !isQuoteVisible
       ? undefined
       : await resolveVkSenderLabel(account, message.replyToSenderId);
 
@@ -545,14 +581,16 @@ export async function handleVkInbound(params: {
     OriginatingTo: `vk:${peerId}`,
     CommandAuthorized: commandGate.commandAuthorized,
     media: media.length > 0 ? media : undefined,
-    ReplyToId: message.replyToMessageId,
-    ReplyToIdFull: message.replyToMessageId,
-    ReplyToSender: replyToSender,
-    ReplyToBody:
-      resolveVkInboundAgentText({
-        text: message.replyToText,
-        forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
-      }) || undefined,
+    ...(isQuoteVisible && {
+      ReplyToId: message.replyToMessageId,
+      ReplyToIdFull: message.replyToMessageId,
+      ReplyToSender: replyToSender,
+      ReplyToBody:
+        resolveVkInboundAgentText({
+          text: message.replyToText,
+          forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
+        }) || undefined,
+    }),
     ...(firstForward && {
       ForwardedFrom: `vk:${firstForward.senderId}`,
       ForwardedFromId: String(firstForward.senderId),
