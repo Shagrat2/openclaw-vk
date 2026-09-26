@@ -22,6 +22,8 @@ const entryPoints = [
   "src/monitor.ts",
   "src/probe.ts",
   "src/progress-draft.ts",
+  "src/question.ts",
+  "src/question-events.ts",
   "src/reactions-controller.ts",
   "src/runtime.ts",
   "src/sanitize.ts",
