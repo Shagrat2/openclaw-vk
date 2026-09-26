@@ -2875,7 +2875,7 @@ describe("forwarded messages", () => {
 
   it("writes forward times in the user's timezone from the config", async () => {
     const runtime = installRuntime();
-    runtime.channel.reply.resolveEnvelopeFormatOptions.mockReturnValue({ timezone: "Asia/Vladivostok" });
+    vi.mocked(runtime.channel.reply.resolveEnvelopeFormatOptions).mockReturnValue({ timezone: "Asia/Vladivostok" });
 
     await handleVkInbound({
       message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, text: "", forwards: [ORDER_FORWARD] }),
