@@ -3,6 +3,10 @@ import { WallAttachment } from "vk-io";
 
 // ── SDK mocks ────────────────────────────────────────────────────────────────
 
+vi.mock("openclaw/plugin-sdk/reply-runtime", () => ({
+  isAbortRequestText: (text: string) => /^\/?(stop|стоп)$/i.test(text.trim()),
+}));
+
 vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
   redactSensitiveText: (text: string) => text,

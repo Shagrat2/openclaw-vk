@@ -21,6 +21,7 @@ import {
 import { VkConfigSchema } from "./config-schema.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
+import { normalizeVkQuestionPayload } from "./question.js";
 import { getVkRuntime } from "./runtime.js";
 import { sanitizeVkPlainText } from "./sanitize.js";
 import {
@@ -317,6 +318,10 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
     textChunkLimit: 4096,
     sanitizeText: ({ text }) => sanitizeVkPlainText(text),
     shouldSkipPlainTextSanitization: ({ payload }) => Boolean(payload.channelData),
+    // A question from the core (`ask_user`, `AskUserQuestion`): its buttons are
+    // moved out of the presentation here, before the core renders it down to
+    // text, so `sendPayload` can put them under the message. See question.ts.
+    normalizePayload: ({ payload }) => normalizeVkQuestionPayload(payload),
     sendPayload: async ({ to, payload, accountId, cfg, mediaLocalRoots, replyToId, forceDocument }) => {
       const result = await sendPayloadVk(to, payload, {
         cfg,
