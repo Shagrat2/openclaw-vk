@@ -2925,7 +2925,7 @@ describe("forwarded messages", () => {
 
   it("keeps a hidden quote out of the reply chain, date or not", async () => {
     const outsider = 999_000;
-    const quoteFrom = (contextVisibility: string) => ({
+    const quoteFrom = (contextVisibility: "allowlist" | "allowlist_quote") => ({
       message: makeMessage({
         peerId: GROUP_PEER_ID,
         senderId: SENDER_ID,
