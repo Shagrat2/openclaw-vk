@@ -8,13 +8,15 @@ vi.mock("openclaw/plugin-sdk/logging-core", () => ({
   redactSensitiveText: (text: string) => text,
 }));
 
-vi.mock("openclaw/plugin-sdk/core", () => ({
+vi.mock("openclaw/plugin-sdk/core", async (importOriginal) => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
   parseStrictPositiveInteger: (v: unknown) => {
     const n = Number.parseInt(String(v ?? ""), 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   },
+  // The real one: forward times are asserted as the core formats them.
+  formatZonedTimestamp: (await importOriginal<typeof import("openclaw/plugin-sdk/core")>()).formatZonedTimestamp,
 }));
 
 vi.mock("openclaw/plugin-sdk/account-id", () => ({
@@ -2752,7 +2754,7 @@ describe("forwarded messages", () => {
     });
 
     const ctx = lastInboundContext(runtime);
-    expect(String(ctx.BodyForAgent)).toMatch(/\[Forwarded from vk:-142153191 at 2026-09-10 \d\d:26 GMT[^\]]*\]/);
+    expect(String(ctx.BodyForAgent)).toContain("[Forwarded from vk:-142153191 at 2026-09-10 00:26 UTC]");
     expect(String(ctx.BodyForAgent)).toContain("Заказ 10316111753 готов к выдаче");
     expect(ctx.CommandBody).toBe("Вот сообщение пересланое чужое");
     expect(ctx.BodyForCommands).toBe("Вот сообщение пересланое чужое");
@@ -2868,7 +2870,7 @@ describe("forwarded messages", () => {
 
     const ctx = lastInboundContext(runtime);
     expect(String(ctx.ReplyToBody)).toContain("Вот сообщение пересланое чужое");
-    expect(String(ctx.ReplyToBody)).toMatch(/\[Forwarded from vk:-142153191 at 2026-09-10 \d\d:26 GMT[^\]]*\]/);
+    expect(String(ctx.ReplyToBody)).toContain("[Forwarded from vk:-142153191 at 2026-09-10 00:26 UTC]");
     expect(String(ctx.ReplyToBody)).toContain("Заказ 10316111753");
     expect(ctx.CommandBody).toBe("что тут?");
   });
@@ -2919,6 +2921,69 @@ describe("forwarded messages", () => {
         body: "<media:image>",
       },
     ]);
+  });
+
+  it("keeps a hidden quote out of the reply chain, date or not", async () => {
+    const outsider = 999_000;
+    const quoteFrom = (contextVisibility: string) => ({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "что это?",
+        replyToMessageId: "0",
+        replyToText: "чужая цитата",
+        replyToSenderId: outsider,
+        replyToTimestamp: 1_789_000_000_000,
+      }),
+      account: makeAccount({
+        config: { dmPolicy: "open", groupPolicy: "open", groupAllowFrom: [String(SENDER_ID)], contextVisibility },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const hidden = installRuntime();
+    await handleVkInbound(quoteFrom("allowlist"));
+    expect(lastInboundContext(hidden).ReplyChain).toBeUndefined();
+    expect(lastInboundContext(hidden).ReplyToBody).toBeUndefined();
+
+    const shown = installRuntime();
+    await handleVkInbound(quoteFrom("allowlist_quote"));
+    expect(lastInboundContext(shown).ReplyChain).toEqual([
+      expect.objectContaining({ body: "чужая цитата", timestamp: 1_789_000_000_000 }),
+    ]);
+  });
+
+  it("drops a hidden forward inside a visible quote from the reply chain", async () => {
+    const runtime = installRuntime();
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text: "что тут?",
+        replyToMessageId: "0",
+        replyToText: "своё сообщение",
+        replyToSenderId: SENDER_ID,
+        replyToTimestamp: 1_789_000_000_000,
+        replyToForwards: [ORDER_FORWARD],
+      }),
+      account: makeAccount({
+        config: {
+          dmPolicy: "open",
+          groupPolicy: "open",
+          groupAllowFrom: [String(SENDER_ID)],
+          contextVisibility: "allowlist",
+        },
+      }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const chain = lastInboundContext(runtime).ReplyChain as Array<{ body?: string }>;
+    expect(chain[0].body).toBe("своё сообщение");
+    expect(chain[0].body).not.toContain("Заказ 10316111753");
   });
 
   it("gives no reply chain for a quote without a date", async () => {

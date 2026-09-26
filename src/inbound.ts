@@ -605,7 +605,7 @@ export async function handleVkInbound(params: {
       ReplyToBody: replyToBody,
       // The same quote with its date: the core renders a chain entry's time in the
       // user's timezone, and the agent gets an anchor to look around in history.
-      // Cores without ReplyChain fall back to the ReplyTo* fields above.
+      // A quote without a date keeps the plain reply target.
       ...(replyToBody &&
         message.replyToTimestamp !== undefined && {
           ReplyChain: [

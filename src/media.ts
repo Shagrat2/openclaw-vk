@@ -2,7 +2,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
-import type { PluginRuntime } from "openclaw/plugin-sdk/core";
+import { formatZonedTimestamp, type PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { VkInboundAttachment, VkInboundForward, VkInboundResolvedMedia } from "./types.js";
 
 const IMAGE_EXTENSIONS = new Set([
@@ -777,47 +777,28 @@ export function resolveVkInboundBodyText(params: {
 }
 
 /**
- * A time the way the core writes the message's own: in the user's timezone
- * (`agents.defaults.userTimezone`), else the host's, else UTC — the same order
- * as the core's envelope. Without options, plain ISO in UTC.
+ * A time in the zone the core writes the message's own in: the configured
+ * `agents.defaults.userTimezone`, else the host's. Minutes are enough for a
+ * forward. Without envelope options, or if the zone cannot be formatted, plain
+ * ISO in UTC as before.
  */
 export function formatVkTimestamp(ms: number, envelope?: EnvelopeFormatOptions): string {
   const date = new Date(ms);
   if (!envelope) {
     return date.toISOString();
   }
-  const zone = resolveVkTimeZone(envelope);
-  let parts: Intl.DateTimeFormatPart[];
-  try {
-    parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: zone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-      timeZoneName: "shortOffset",
-    }).formatToParts(date);
-  } catch {
-    return date.toISOString();
-  }
-  const part = (type: Intl.DateTimeFormatPartTypes) =>
-    parts.find((entry) => entry.type === type)?.value ?? "";
-  return `${part("year")}-${part("month")}-${part("day")} ${part("hour")}:${part("minute")} ${part("timeZoneName")}`;
+  return formatZonedTimestamp(date, { timeZone: resolveVkTimeZone(envelope) }) ?? date.toISOString();
 }
 
+/** `resolveEnvelopeFormatOptions` gives a checked IANA zone, "local" or nothing. */
 function resolveVkTimeZone(envelope: EnvelopeFormatOptions): string | undefined {
   const configured = envelope.timezone?.trim();
   const lowered = configured?.toLowerCase();
-  if (lowered === "utc" || lowered === "gmt") {
-    return "UTC";
-  }
   if (!configured || lowered === "local" || lowered === "host") {
     return undefined;
   }
-  if (lowered === "user") {
-    return envelope.userTimezone?.trim() || undefined;
+  if (lowered === "utc" || lowered === "gmt") {
+    return "UTC";
   }
   return configured;
 }

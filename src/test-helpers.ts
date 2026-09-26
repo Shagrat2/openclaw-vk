@@ -97,7 +97,8 @@ export function makeVkRuntime(opts: {
         resolveSessionFilePath: vi.fn(),
       },
       reply: {
-        resolveEnvelopeFormatOptions: vi.fn().mockReturnValue({}),
+        // An explicit zone keeps prompt times independent of the machine running the tests.
+        resolveEnvelopeFormatOptions: vi.fn().mockReturnValue({ timezone: "UTC" }),
         formatAgentEnvelope: vi
           .fn()
           .mockReturnValue("[VK] from: vk:123456\n\nhello"),

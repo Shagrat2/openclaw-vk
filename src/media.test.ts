@@ -1077,16 +1077,13 @@ describe("forwarded messages — time and ids", () => {
       resolveVkInboundAgentText({ text: "", forwards, envelope: { timezone } });
     expect(text("Europe/Moscow")).toContain("[Forwarded from vk:-142153191 at 2026-09-10 03:26 GMT+3]");
     expect(text("Asia/Vladivostok")).toContain("at 2026-09-10 10:26 GMT+10]");
-    expect(text("utc")).toContain("at 2026-09-10 00:26 GMT+0]");
+    expect(text("utc")).toContain("at 2026-09-10 00:26 UTC]");
   });
 
-  it("takes the user timezone for \"user\" and falls back to ISO on an unknown zone", () => {
+  it("falls back to ISO without envelope options or on a zone that cannot be formatted", () => {
     const ms = 1_789_000_000_000;
-    expect(formatVkTimestamp(ms, { timezone: "user", userTimezone: "Asia/Yekaterinburg" })).toBe(
-      "2026-09-10 05:26 GMT+5",
-    );
-    expect(formatVkTimestamp(ms, { timezone: "Mars/Olympus" })).toBe("2026-09-10T00:26:40.000Z");
     expect(formatVkTimestamp(ms)).toBe("2026-09-10T00:26:40.000Z");
+    expect(formatVkTimestamp(ms, { timezone: "Mars/Olympus" })).toBe("2026-09-10T00:26:40.000Z");
   });
 
   it("names the ids VK gives a forward, so it can be looked up again", () => {
