@@ -350,12 +350,14 @@ export async function handleVkInbound(params: {
   const isQuoteVisible = isSupplementalVisible("quote", message.replyToSenderId);
   const visibleForwards = filterVkForwards(message.forwards, isForwardVisible);
   const firstForward = visibleForwards[0];
+  const envelopeOptions = resolveEnvelopeFormatOptions(config as OpenClawConfig);
   const rawBody =
     payloadCommand ??
     resolveVkInboundAgentText({
       text: message.text,
       attachments: message.attachments,
       forwards: visibleForwards,
+      envelope: envelopeOptions,
     });
   if (!rawBody) {
     // Only reachable when every forward was hidden: the empty-message check above
@@ -526,7 +528,6 @@ export async function handleVkInbound(params: {
       agentId: route.agentId,
     },
   );
-  const envelopeOptions = resolveEnvelopeFormatOptions(config as OpenClawConfig);
   const previousTimestamp = readSessionUpdatedAt({
     storePath,
     sessionKey: route.sessionKey,
@@ -564,6 +565,13 @@ export async function handleVkInbound(params: {
     message.replyToSenderId === undefined || !isQuoteVisible
       ? undefined
       : await resolveVkSenderLabel(account, message.replyToSenderId);
+  const replyToBody = isQuoteVisible
+    ? resolveVkInboundAgentText({
+        text: message.replyToText,
+        forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
+        envelope: envelopeOptions,
+      }) || undefined
+    : undefined;
 
   const ctxPayload = finalizeInboundContext({
     Body: body,
@@ -594,11 +602,23 @@ export async function handleVkInbound(params: {
       ReplyToId: message.replyToMessageId,
       ReplyToIdFull: message.replyToMessageId,
       ReplyToSender: replyToSender,
-      ReplyToBody:
-        resolveVkInboundAgentText({
-          text: message.replyToText,
-          forwards: filterVkForwards(message.replyToForwards, isForwardVisible),
-        }) || undefined,
+      ReplyToBody: replyToBody,
+      // The same quote with its date: the core renders a chain entry's time in the
+      // user's timezone, and the agent gets an anchor to look around in history.
+      // Cores without ReplyChain fall back to the ReplyTo* fields above.
+      ...(replyToBody &&
+        message.replyToTimestamp !== undefined && {
+          ReplyChain: [
+            {
+              messageId: message.replyToMessageId,
+              sender: replyToSender,
+              senderId:
+                message.replyToSenderId !== undefined ? String(message.replyToSenderId) : undefined,
+              timestamp: message.replyToTimestamp,
+              body: replyToBody,
+            },
+          ],
+        }),
     }),
     ...(firstForward && {
       ForwardedFrom: `vk:${firstForward.senderId}`,

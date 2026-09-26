@@ -2752,7 +2752,7 @@ describe("forwarded messages", () => {
     });
 
     const ctx = lastInboundContext(runtime);
-    expect(String(ctx.BodyForAgent)).toContain("[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]");
+    expect(String(ctx.BodyForAgent)).toMatch(/\[Forwarded from vk:-142153191 at 2026-09-10 \d\d:26 GMT[^\]]*\]/);
     expect(String(ctx.BodyForAgent)).toContain("Заказ 10316111753 готов к выдаче");
     expect(ctx.CommandBody).toBe("Вот сообщение пересланое чужое");
     expect(ctx.BodyForCommands).toBe("Вот сообщение пересланое чужое");
@@ -2868,9 +2868,76 @@ describe("forwarded messages", () => {
 
     const ctx = lastInboundContext(runtime);
     expect(String(ctx.ReplyToBody)).toContain("Вот сообщение пересланое чужое");
-    expect(String(ctx.ReplyToBody)).toContain("[Forwarded from vk:-142153191 at 2026-09-10T00:26:40.000Z]");
+    expect(String(ctx.ReplyToBody)).toMatch(/\[Forwarded from vk:-142153191 at 2026-09-10 \d\d:26 GMT[^\]]*\]/);
     expect(String(ctx.ReplyToBody)).toContain("Заказ 10316111753");
     expect(ctx.CommandBody).toBe("что тут?");
+  });
+
+  it("writes forward times in the user's timezone from the config", async () => {
+    const runtime = installRuntime();
+    runtime.channel.reply.resolveEnvelopeFormatOptions.mockReturnValue({ timezone: "Asia/Vladivostok" });
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, text: "", forwards: [ORDER_FORWARD] }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(String(lastInboundContext(runtime).BodyForAgent)).toContain(
+      "[Forwarded from vk:-142153191 at 2026-09-10 10:26 GMT+10]",
+    );
+  });
+
+  it("hands the core a dated quote as a reply chain, keeping the plain reply fields", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "что тогда делали?",
+        replyToMessageId: "10610",
+        replyToText: "<media:image>",
+        replyToSenderId: SENDER_ID,
+        replyToTimestamp: 1_789_000_000_000,
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    const ctx = lastInboundContext(runtime);
+    expect(ctx.ReplyToId).toBe("10610");
+    expect(ctx.ReplyToBody).toBe("<media:image>");
+    expect(ctx.ReplyChain).toEqual([
+      {
+        messageId: "10610",
+        sender: ctx.ReplyToSender,
+        senderId: String(SENDER_ID),
+        timestamp: 1_789_000_000_000,
+        body: "<media:image>",
+      },
+    ]);
+  });
+
+  it("gives no reply chain for a quote without a date", async () => {
+    const runtime = installRuntime();
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        text: "а это?",
+        replyToMessageId: "10610",
+        replyToText: "старое",
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(lastInboundContext(runtime).ReplyChain).toBeUndefined();
   });
 
   it("does not download a forwarded voice message, so it is never transcribed as the sender's", async () => {
