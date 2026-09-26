@@ -379,6 +379,14 @@ describe("answerVkQuestionByText", () => {
     expect(resolveOption).toHaveBeenCalledTimes(1);
   });
 
+  it("a gateway failure is not a property of the question: the next answer is tried again", async () => {
+    resolveOption.mockRejectedValueOnce(new Error("gateway timeout"));
+    expect(await typed("2")).toBe(false);
+    resolveOption.mockResolvedValue({ status: "answered", questionId: TQ, optionValue: "x" });
+    expect(await typed("2")).toBe(true);
+    expect(resolveOption).toHaveBeenCalledTimes(2);
+  });
+
   it("without the core's question runtime: an ordinary message", async () => {
     resetVkQuestionRuntimeForTest({ runtime: undefined });
     expect(await typed("2")).toBe(false);

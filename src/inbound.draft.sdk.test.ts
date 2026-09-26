@@ -717,6 +717,62 @@ describe.skipIf(!inbound || !channel || !questionModule || !coreQuestions)(
       expect(dispatched).toEqual(["turn"]);
     });
 
+    it("a stop word or a control command stays a command, even where any text answers", async () => {
+      // As every ask_user question: its own answer allowed, so free text answers it.
+      const QID2 = `ask_${"d".repeat(32)}`;
+      const own = {
+        ...question,
+        presentation: {
+          blocks: [
+            {
+              type: "buttons",
+              buttons: [
+                ...["Белый", "Чёрный"].map((label) => ({
+                  label,
+                  action: { type: "question", questionId: QID2, optionValue: label },
+                })),
+                { label: "Свой вариант", action: { type: "question", questionId: QID2, intent: "custom-input" } },
+              ],
+            },
+          ],
+        },
+        channelData: { askUser: { questionId: QID2 } },
+      };
+      questionModule!.clearVkQuestionDeliveries();
+      await runTurn(async () => {
+        const outbound = channel!.vkPlugin.outbound!;
+        const cfg = progressCfg();
+        const normalized = outbound.normalizePayload!({ payload: own, cfg } as never) ?? own;
+        await outbound.sendPayload!({ cfg, to: "vk:123456", payload: normalized, accountId: "default" } as never);
+      });
+      resolveOption.mockResolvedValue({ status: "denied" });
+      await incoming("стоп");
+      await incoming("/stop");
+      await incoming("/new");
+      expect(resolveOption).not.toHaveBeenCalled();
+      // Sanity: the same question takes ordinary free text.
+      await incoming("что-то своё");
+      expect(resolveOption.mock.calls[0][0]).toMatchObject({ questionId: QID2, optionValue: "что-то своё" });
+    });
+
+    it("in a group chat typed text is not taken as an answer", async () => {
+      resolveOption.mockResolvedValue({ status: "answered", questionId: "q", optionValue: "Серый" });
+      await inbound!.handleVkInbound({
+        message: helpers!.makeMessage({
+          conversationMessageId: 44,
+          messageId: "m3",
+          text: "3",
+          isGroup: true,
+        }),
+        account: helpers!.makeAccount({
+          config: { dmPolicy: "open", allowFrom: ["*"], groupPolicy: "open" },
+        }),
+        config: progressCfg() as never,
+        runtime: helpers!.createVkRuntimeEnv(),
+      });
+      expect(resolveOption).not.toHaveBeenCalled();
+    });
+
     it("an answer the core refuses (already answered) goes on as a turn", async () => {
       resolveOption.mockResolvedValue({ status: "already-terminal", reason: "already-terminal" });
       await incoming("2");

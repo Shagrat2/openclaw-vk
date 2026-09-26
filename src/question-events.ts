@@ -297,9 +297,13 @@ export async function answerVkQuestionByText(params: {
     return false;
   } catch (error) {
     // The resolver refuses records a single answer cannot settle (several
-    // questions, multi-select, a secret) before writing anything. Stop trying
-    // for this one; the message goes on as usual.
-    markVkQuestionNotTextAnswerable(questionId);
+    // questions, multi-select, a secret) before writing anything: stop trying
+    // for this one. Any other failure — a timeout, a busy gateway — is not a
+    // property of the question, so the next answer is tried again. Either way
+    // the message goes on as usual.
+    if (/one tappable question/.test(String(error))) {
+      markVkQuestionNotTextAnswerable(questionId);
+    }
     runtime.log?.(`vk: question ${questionId} typed answer not accepted: ${String(error)}`);
     return false;
   }

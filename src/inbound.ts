@@ -71,6 +71,7 @@ import {
   resolveEnvelopeFormatOptions,
 } from "openclaw/plugin-sdk/channel-inbound";
 import { hasControlCommand } from "openclaw/plugin-sdk/command-auth-native";
+import { isAbortRequestText } from "openclaw/plugin-sdk/reply-runtime";
 import {
   readSessionUpdatedAt,
   recordSessionMetaFromInbound,
@@ -487,10 +488,17 @@ export async function handleVkInbound(params: {
   // its own claim of a typed answer would come after the question expired.
   // An answer is consumed: no turn, no steering. Anything else — no open
   // question, not an answer, refused — carries on as an ordinary message.
+  // Stop words and control commands keep their meaning: every core question
+  // takes a free-text answer, so without this «стоп» would answer it instead of
+  // aborting the run. In a group chat text is not taken at all — any admitted
+  // member could otherwise answer someone else's question; buttons still work.
   const plainText = message.text?.trim() ?? "";
   if (
     plainText &&
+    !message.isGroup &&
     !payloadCommand &&
+    !isAbortRequestText(plainText) &&
+    !hasControlCommand(plainText, config as OpenClawConfig) &&
     (message.attachments?.length ?? 0) === 0 &&
     (message.forwards?.length ?? 0) === 0 &&
     (await answerVkQuestionByText({
