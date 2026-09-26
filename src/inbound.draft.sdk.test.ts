@@ -491,6 +491,43 @@ describe.skipIf(!inbound || !runtimeModule || !helpers)("step draft through the 
         clearKeyboard: true,
       });
     });
+
+    it("clears the keyboard when a button answer streamed in blocks has an empty final", async () => {
+      await runTurn(
+        async ({ replyOptions, dispatcherOptions }) => {
+          await replyOptions.onToolStart?.(toolStart());
+          await dispatcherOptions.deliver({ text: "Режим" }, { kind: "block" });
+          await dispatcherOptions.deliver({ text: "включён." }, { kind: "block" });
+          await dispatcherOptions.deliver({ text: "" }, { kind: "final" });
+        },
+        { messagePayload: { oc: "/think high" }, messageId: "777" },
+      );
+      expect(chat.messages).toEqual([
+        expect.objectContaining({
+          text: "Режим\n\nвключён.",
+          replyTo: "777",
+          clearKeyboard: true,
+        }),
+      ]);
+      expect(texts().some((text) => text.includes(LABEL))).toBe(false);
+    });
+
+    it("keeps a button answer in the draft if its replacement send fails", async () => {
+      chat.failSendPayload = true;
+      await expect(
+        runTurn(
+          async ({ replyOptions, dispatcherOptions }) => {
+            await replyOptions.onToolStart?.(toolStart());
+            await dispatcherOptions.deliver({ text: "Ответ блоком." }, { kind: "block" });
+            await dispatcherOptions.deliver({ text: "" }, { kind: "final" });
+          },
+          { messagePayload: { oc: "/think high" }, messageId: "777" },
+        ),
+      ).rejects.toThrow("upload failed");
+      expect(chat.messages).toEqual([
+        expect.objectContaining({ text: "Ответ блоком.", replyTo: "777" }),
+      ]);
+    });
   });
 
   // ── P2: a turn that ends without a final ────────────────────────────────

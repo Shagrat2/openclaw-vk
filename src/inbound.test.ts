@@ -1675,6 +1675,46 @@ describe("command gating", () => {
 // ── Step-progress draft ──────────────────────────────────────────────────────
 
 describe("step-progress (channels.vk.streaming.mode=progress)", () => {
+  it("sends a block-streamed callback answer normally and clears its keyboard on an empty final", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions, replyOptions }: any) => {
+        await dispatcherOptions.onReplyStart?.();
+        await replyOptions.onToolStart?.({ name: "Bash" });
+        await dispatcherOptions.deliver({ text: "первая часть" }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "вторая часть" }, { kind: "block" });
+        await dispatcherOptions.deliver({ text: "" }, { kind: "final" });
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({
+        senderId: SENDER_ID,
+        peerId: SENDER_ID,
+        messageId: "button-7",
+        conversationMessageId: 7,
+        text: "high",
+        messagePayload: { oc: "/think high" },
+      }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg({ streaming: { mode: "progress" } }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(mockSendPayloadVk).toHaveBeenCalledExactlyOnceWith(
+      String(SENDER_ID),
+      { text: "первая часть\n\nвторая часть", replyToId: "button-7" },
+      { accountId: "default", clearKeyboard: true },
+    );
+    expect(mockDraftRemove).toHaveBeenCalled();
+    expect(mockSendPayloadVk.mock.invocationCallOrder[0]).toBeLessThan(
+      mockDraftRemove.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+    expect(mockEditMessageVk).not.toHaveBeenCalled();
+  });
+
   it("routes execution steps to the edit-in-place draft and finalizes on the last block", async () => {
     mockResolveStreamMode.mockReturnValue("progress");
     const runtime = installRuntime();
@@ -2242,6 +2282,42 @@ describe("status reaction lifecycle", () => {
       },
     } as unknown as CoreConfig;
   }
+
+  it("marks a swallowed long-answer tail delivery failure as an error", async () => {
+    mockResolveStreamMode.mockReturnValue("progress");
+    mockCurrentMessageId.mockReturnValue(4242);
+    const controller = await installStatusController();
+    const runtime = installRuntime();
+    const { sendMessageVk } = await import("./send.js");
+    vi.mocked(sendMessageVk).mockRejectedValueOnce(new Error("tail send failed"));
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        try {
+          await dispatcherOptions.deliver(
+            { text: "длинный ответ ".repeat(380) },
+            { kind: "final" },
+          );
+        } catch (err) {
+          dispatcherOptions.onError(err, { kind: "final" });
+        }
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: {
+        ...baseCfg({ streaming: { mode: "progress" } }),
+        messages: statusReactionConfig().messages,
+      } as CoreConfig,
+      runtime: createVkRuntimeEnv(),
+    });
+
+    expect(sendMessageVk).toHaveBeenCalled();
+    expect(controller.setError).toHaveBeenCalledOnce();
+    expect(controller.setDone).not.toHaveBeenCalled();
+  });
 
   it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
     const controller = await installStatusController();

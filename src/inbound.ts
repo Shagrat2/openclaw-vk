@@ -192,9 +192,10 @@ async function deliverVkReply(params: {
     clearKeyboard: params.clearKeyboard,
   });
   if (!result) {
-    return;
+    return false;
   }
   params.statusSink?.({ lastOutboundAt: Date.now() });
+  return true;
 }
 
 export async function handleVkInbound(params: {
@@ -531,7 +532,12 @@ export async function handleVkInbound(params: {
     }),
   });
 
+  let dispatchError = false;
   const onDispatchError = (err: unknown, info: { kind: string }) => {
+    // The dispatcher may report a failed delivery here and return normally,
+    // including when only a long answer's tail failed after the edited draft
+    // was sent. Its error callback must also decide the final reaction.
+    dispatchError = true;
     runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
   };
   const typingCallbacks = createTypingCallbacks({
@@ -730,7 +736,6 @@ export async function handleVkInbound(params: {
 
   await startTypingOnce();
 
-  let dispatchError = false;
   // Defensive guard mirroring the bundled channels' isProcessAborted() check
   // (see core message-handler.process / telegram bot). VK has no abortSignal in
   // this scope, so we use a local "settled" flag: once the turn finalizes
@@ -891,12 +896,22 @@ export async function handleVkInbound(params: {
             progressDraft !== null &&
             ownsDraftOutcome &&
             draftKeepsAnswer(markdownAttachments.text);
+          // An edited draft cannot clear the keyboard attached to a pressed
+          // button. If blocks already put the answer there and the core's final
+          // is empty, move that answer into the ordinary final send instead.
+          // Only remove the draft after VK confirms the new message was sent.
+          const callbackTransfersDraftAnswer = keepsDraftAnswer && Boolean(payloadCommand);
           if (keepsDraftAnswer && outboundPayload.text?.trim()) {
             vkDiag("truncated final dropped, draft holds the answer", {
               len: outboundPayload.text.length,
             });
             // The final's own attachments still go out.
             outboundPayload.text = markdownAttachments.attachments.join("\n");
+          }
+          if (callbackTransfersDraftAnswer) {
+            outboundPayload.text = [draftAnswerSource, ...markdownAttachments.attachments]
+              .filter(Boolean)
+              .join("\n");
           }
           if (progressDraft && ownsDraftOutcome) {
             const draftMsgId = progressDraft.currentMessageId();
@@ -997,8 +1012,9 @@ export async function handleVkInbound(params: {
             Boolean(resolvedButtons);
           // A kept draft may leave nothing else to deliver; an empty send would
           // report "no result" and needlessly reset the VK client.
+          let callbackAnswerDelivered = false;
           if (!keepsDraftAnswer || leftToSend) {
-            await deliverVkReply({
+            const delivered = await deliverVkReply({
               payload: outboundPayload,
               peerId: message.peerId,
               accountId: account.accountId,
@@ -1006,6 +1022,7 @@ export async function handleVkInbound(params: {
               clearKeyboard:
                 payloadCommand && info?.kind === "final" && !resolvedButtons ? true : undefined,
             });
+            callbackAnswerDelivered = callbackTransfersDraftAnswer && delivered;
           }
           if (progressDraft && ownsDraftOutcome && !draftHandled) {
             progressDraft.compositor.markFinalReplyDelivered();
@@ -1015,7 +1032,10 @@ export async function handleVkInbound(params: {
             // delivered it as blocks along the way), deleting it destroys the
             // only copy of the answer and the recipient is left with a voice
             // message alone — see `draftKeepsAnswer`.
-            if (keepsDraftAnswer) {
+            if (callbackAnswerDelivered) {
+              draftAnswerSource = null;
+              await progressDraft.remove();
+            } else if (keepsDraftAnswer) {
               await sealDraftAnswer();
             } else {
               await progressDraft.remove();
