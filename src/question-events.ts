@@ -20,7 +20,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { resolveVkAccount } from "./accounts.js";
 import { resolveVkGroupAccess, resolveVkGroupSenderAdmission } from "./group-access.js";
-import { redactVkId, vkDiag } from "./diagnostics.js";
+import { redactVkId, vkDiag, vkDiagFailure } from "./diagnostics.js";
 import {
   isVkGroupPeerId,
   normalizeVkAllowlist,
@@ -34,7 +34,14 @@ import {
   markVkQuestionTerminal,
   parseVkQuestionCallback,
   parseVkQuestionTextAnswer,
+  readVkQuestionMarked,
+  toggleVkQuestionOption,
+  type VkQuestionCallback,
 } from "./question.js";
+import {
+  resolveVkQuestionMarkedOverGateway,
+  resolveVkQuestionTextOverGateway,
+} from "./question-gateway.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { sendMessageVk } from "./send.js";
 import type { CoreConfig } from "./types.js";
@@ -58,6 +65,11 @@ const TEXT = {
   // points to one.
   failedInGroup: "Не получилось передать ответ. Нажмите кнопку ещё раз",
   buttonsOnlyInGroup: "В беседе ответ принимается только кнопками",
+  marked: (labels: string[]) =>
+    labels.length > 0 ? `Отмечено: ${labels.join(", ")}` : "Ничего не отмечено",
+  markNone: "Отметьте хотя бы один вариант, затем «Готово»",
+  severalHint:
+    "Не поняла ответ. Напишите номера вариантов через запятую, например «1, 3»; если вопросов несколько — по строке на каждый. «Стоп» прервёт работу.",
 } as const;
 
 /** VK snackbar text limit. */
@@ -187,6 +199,13 @@ export async function handleVkQuestionEvent(params: {
     return true;
   }
   const failedText = inGroup ? TEXT.failedInGroup : TEXT.failed;
+  if (
+    callback.intent === "toggle" ||
+    callback.intent === "submit" ||
+    (callback.intent === "custom-input" && readVkQuestionMarked(questionId))
+  ) {
+    return await handleVkMultiSelectPress({ ...params, callback, reply, mayAnswer, failedText });
+  }
   const questionRuntime = await loadVkQuestionRuntime();
   if (!questionRuntime) {
     await reply(failedText);
@@ -238,6 +257,79 @@ export async function handleVkQuestionEvent(params: {
 }
 
 /**
+ * A press on a multi-select question: a toggle marks or unmarks its option in
+ * place, "Готово" writes the marked ones. The core then finalizes the prompt
+ * like any answered question, which takes the buttons away.
+ */
+async function handleVkMultiSelectPress(params: {
+  event: VkQuestionEvent;
+  accountId: string;
+  runtime: RuntimeEnv;
+  callback: Extract<VkQuestionCallback, { intent: "toggle" | "submit" | "custom-input" }>;
+  reply: (text: string) => Promise<void>;
+  mayAnswer: () => Promise<boolean>;
+  /** What a failure says: no typed answer is recommended in a group chat. */
+  failedText: string;
+}): Promise<boolean> {
+  const { callback, reply } = params;
+  const { questionId } = callback;
+  try {
+    if (callback.intent === "toggle") {
+      const labels = await toggleVkQuestionOption(questionId, callback.optionIndex);
+      await reply(labels ? TEXT.marked(labels) : TEXT.closed);
+      return true;
+    }
+    if (callback.intent === "custom-input") {
+      // Nothing to tell the core: the typed answer that follows is taken by
+      // `answerVkQuestionByText` and written over the gateway.
+      await reply(TEXT.customInputSnackbar);
+      await sendMessageVk(String(params.event.peerId), TEXT.customInputMessage, {
+        accountId: params.accountId,
+      });
+      return true;
+    }
+    const marked = readVkQuestionMarked(questionId);
+    if (!marked) {
+      await reply(TEXT.closed);
+      return true;
+    }
+    if (marked.labels.length === 0) {
+      await reply(TEXT.markNone);
+      return true;
+    }
+    const result = await resolveVkQuestionMarkedOverGateway({
+      questionId,
+      answerKey: marked.answerKey,
+      labels: marked.labels,
+      senderId: String(params.event.userId),
+      authorize: params.mayAnswer,
+    });
+    vkDiag("question marked resolved", { questionId, status: result.status });
+    switch (result.status) {
+      case "answered":
+        await reply(TEXT.answered(marked.labels.join(", ")));
+        return true;
+      case "denied":
+        await reply(TEXT.notYours);
+        return true;
+      case "already-terminal":
+        markVkQuestionTerminal(questionId);
+        await reply(TEXT.closed);
+        return true;
+      default:
+        await reply(params.failedText);
+        return true;
+    }
+  } catch (error) {
+    // By class and code: a Gateway client error's text names the gateway's
+    // address and the path of the config it read; the text is `full`-only.
+    vkDiagFailure("question answer failed", error, { questionId });
+    await reply(params.failedText);
+    return true;
+  }
+}
+
+/**
  * A typed message in a chat with an open question: the answer to it, if it is one.
  *
  * Returns true when the message answered the question — the caller then must
@@ -265,11 +357,6 @@ export async function answerVkQuestionByText(params: {
     return false;
   }
   const { questionId, prompt } = open;
-  const answer = parseVkQuestionTextAnswer(prompt, params.text);
-  if (answer === undefined) {
-    vkDiag("question text not an answer", { questionId });
-    return false;
-  }
   const mayAnswer = async () =>
     findOpenVkQuestionDelivery({ questionId, accountId, peerId }) !== undefined &&
     (await isVkQuestionAnswerer({
@@ -278,6 +365,19 @@ export async function answerVkQuestionByText(params: {
       peerId,
       userId: senderId,
     }));
+  if (prompt.multiSelect) {
+    // "1, 3", option texts, an own answer: parsed by the core's rules over the
+    // gateway; the single-option parse below would refuse all of them.
+    if (!(await mayAnswer())) {
+      return false;
+    }
+    return await answerVkQuestionOverGateway({ ...params, questionId, mayAnswer });
+  }
+  const answer = parseVkQuestionTextAnswer(prompt, params.text);
+  if (answer === undefined) {
+    vkDiag("question text not an answer", { questionId });
+    return false;
+  }
   if (!(await mayAnswer())) {
     return false;
   }
@@ -306,14 +406,61 @@ export async function answerVkQuestionByText(params: {
     return false;
   } catch (error) {
     // The resolver refuses records a single answer cannot settle (several
-    // questions, multi-select, a secret) before writing anything: stop trying
-    // for this one. Any other failure — a timeout, a busy gateway — is not a
-    // property of the question, so the next answer is tried again. Either way
-    // the message goes on as usual.
+    // questions, multi-select, a secret) before writing anything: those go
+    // over the gateway. Any other failure — a timeout, a busy gateway — is not
+    // a property of the question, so the next answer is tried again and the
+    // message goes on as usual.
     if (/one tappable question/.test(String(error))) {
-      markVkQuestionNotTextAnswerable(questionId);
+      return await answerVkQuestionOverGateway({ ...params, questionId, mayAnswer });
     }
     runtime.log?.(`vk: question ${questionId} typed answer not accepted: ${String(error)}`);
+    return false;
+  }
+}
+
+/**
+ * A typed answer to a record the button resolver refuses. While such a question
+ * is open the core refuses every message in the chat as an answer, so a reply
+ * that is not an answer is consumed with a hint rather than passed on.
+ */
+async function answerVkQuestionOverGateway(params: {
+  accountId: string;
+  peerId: number;
+  senderId: number;
+  text: string;
+  runtime: RuntimeEnv;
+  questionId: string;
+  mayAnswer: () => Promise<boolean>;
+}): Promise<boolean> {
+  const { questionId, runtime } = params;
+  try {
+    const result = await resolveVkQuestionTextOverGateway({
+      questionId,
+      text: params.text,
+      senderId: String(params.senderId),
+      authorize: params.mayAnswer,
+    });
+    vkDiag("question text resolved over gateway", { questionId, status: result.status });
+    switch (result.status) {
+      case "answered":
+        return true;
+      case "not-an-answer":
+        await sendMessageVk(String(params.peerId), TEXT.severalHint, { accountId: params.accountId });
+        return true;
+      case "already-terminal":
+        markVkQuestionTerminal(questionId);
+        return false;
+      case "denied":
+        return false;
+      default:
+        // A secret, or a core without the gateway subpaths: text cannot answer it.
+        markVkQuestionNotTextAnswerable(questionId);
+        runtime.log?.(`vk: question ${questionId} typed answer not accepted: ${result.status}`);
+        return false;
+    }
+  } catch (error) {
+    // As for a press: the Gateway client's error text is `full`-only.
+    vkDiagFailure("question typed answer not accepted", error, { questionId });
     return false;
   }
 }

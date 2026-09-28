@@ -15,11 +15,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  *    ("2", free text), the same parser the ingress runs.
  * REAL, from the plugin: `normalizeVkQuestionPayload`, `sendPayloadVk`,
  * `handleVkQuestionEvent`.
+ * REAL, from the core, for the plugin's own Gateway path (`question-gateway.ts`):
+ *  - `buildAgentHarnessUserInputAnswers`, on the record the core itself
+ *    registered — the parser of "1, 3", option text and a line per question.
  * FAKE: VK's API (a chat the test reads back) and the Gateway RPC — the
  * question store the gateway keeps (`question.request/waitAnswer/resolve/get`)
  * and the one-line `resolveOption` over it, because the core's resolver only
  * talks to a hosted in-process gateway. The fake announces requests and
- * outcomes to the channel runtime exactly as the gateway does.
+ * outcomes to the channel runtime exactly as the gateway does. The plugin's
+ * Gateway client is pointed at the same fake: left alone it would open a
+ * connection to whatever gateway runs on this machine, with its credentials.
  *
  * Skips itself where the `openclaw` peer is not installed.
  */
@@ -75,6 +80,7 @@ const sdk = sdkInstalled
       harness: await import("openclaw/plugin-sdk/agent-harness-runtime"),
       questions: await import("openclaw/plugin-sdk/question-gateway-runtime"),
       question: await import("./question.js"),
+      questionGateway: await import("./question-gateway.js"),
       events: await import("./question-events.js"),
       send: await import("./send.js"),
       runtime: await import("./runtime.js"),
@@ -318,6 +324,15 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     sdk!.question.resetVkQuestionRuntimeForTest({
       runtime: { ...sdk!.questions.questionGatewayRuntime, resolveOption: resolveOverFakeGateway as never },
     });
+    // The plugin's own `question.get` / `question.resolve` go to the same store,
+    // parsed by the core's real answer builder.
+    sdk!.questionGateway.resetVkQuestionGatewayForTest({
+      gateway: {
+        call: async (method, params) =>
+          (await gateway.call(method, {}, params as Record<string, any>)) as Record<string, unknown>,
+        buildAnswers: sdk!.harness.buildAgentHarnessUserInputAnswers as never,
+      },
+    });
   });
 
   afterEach(() => {
@@ -331,6 +346,7 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     gateway.store.clear();
     sdk!.question.clearVkQuestionDeliveries();
     sdk!.question.resetVkQuestionRuntimeForTest();
+    sdk!.questionGateway.resetVkQuestionGatewayForTest();
   });
 
   it("the prompt arrives with the core's text and a button per option plus 'Свой вариант'", async () => {
@@ -448,15 +464,43 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     expect(message.text.endsWith("\n\n✅ Ответ: ×4, Прозрачный")).toBe(true);
   });
 
-  it("multi-select stays text-only; a comma list picks several", async () => {
+  it("multi-select: a toggle per option from the record, «Готово» writes the marked ones", async () => {
     const answer = ask([{ ...UPSCALE, multiSelect: true, isOther: false }]);
     const message = await promptMessage();
-    expect(message.keyboard).toBeUndefined();
-    expect(await sdk!.harness.claimPendingAgentQuestionAnswer({ sessionKey: SESSION, text: "1, 3" })).toBe(true);
+    expect(buttonsOf(message).map((b) => b.label)).toEqual(["Оставить", "×2", "×4", "Готово"]);
+
+    expect(await press(buttonsOf(message)[0]!.payload)).toBe("Отмечено: Оставить");
+    await waitFor(() => (buttonsOf(message)[0]!.label.startsWith("✅") ? true : undefined), "the mark");
+    expect(await press(buttonsOf(message)[2]!.payload)).toBe("Отмечено: Оставить, ×4");
+    // Nothing is written by a toggle.
+    expect([...gateway.store.values()][0]!.record.status).toBe("pending");
+
+    expect(await press(buttonsOf(message)[3]!.payload)).toBe("Ответ принят: Оставить, ×4");
     expect(await answer).toEqual({
       status: "answered",
       answers: { answers: { size: ["Оставить", "×4"] } },
     });
+    await waitFor(() => (message.keyboard === undefined ? true : undefined), "the buttons to go");
+  });
+
+  it("multi-select: a typed «1, 3» is taken by the plugin and parsed by the core's rules", async () => {
+    const answer = ask([{ ...UPSCALE, multiSelect: true, isOther: false }]);
+    await promptMessage();
+    expect(await type("1, 3")).toBe(true);
+    expect(await answer).toEqual({
+      status: "answered",
+      answers: { answers: { size: ["Оставить", "×4"] } },
+    });
+  });
+
+  it("multi-select: a reply that is not an answer gets a hint, and nothing is written", async () => {
+    const answer = ask([{ ...UPSCALE, multiSelect: true, isOther: false }]);
+    await promptMessage();
+    expect(await type("а зачем?")).toBe(true);
+    expect(chat.messages.at(-1)!.text).toContain("«1, 3»");
+    expect([...gateway.store.values()][0]!.record.status).toBe("pending");
+    expect(await type("2")).toBe(true);
+    expect(await answer).toEqual({ status: "answered", answers: { answers: { size: ["×2"] } } });
   });
 
   it("a secret question is plain text with no question id: VK sends it as an ordinary message", async () => {
@@ -521,7 +565,7 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     await answer;
   });
 
-  it("several questions: the plugin leaves the text to the core, which parses the lines", async () => {
+  it("several questions: the plugin answers a line per question; one line for two is not written", async () => {
     const color = {
       id: "color",
       header: "Фон",
@@ -533,10 +577,16 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     };
     const answer = ask([UPSCALE, color]);
     await promptMessage();
-    expect(await type("×4\nПрозрачный")).toBe(false);
-    expect(
-      await sdk!.harness.claimPendingAgentQuestionAnswer({ sessionKey: SESSION, text: "×4\nПрозрачный" }),
-    ).toBe(true);
-    expect(await answer).toMatchObject({ status: "answered" });
+    // The core's builder fills the first question and leaves the second empty:
+    // a partial answer is consumed with a hint, never written.
+    expect(await type("×4")).toBe(true);
+    expect(chat.messages.at(-1)!.text).toContain("по строке на каждый");
+    expect([...gateway.store.values()][0]!.record.status).toBe("pending");
+
+    expect(await type("×4\nПрозрачный")).toBe(true);
+    expect(await answer).toEqual({
+      status: "answered",
+      answers: { answers: { size: ["×4"], color: ["Прозрачный"] } },
+    });
   });
 });
