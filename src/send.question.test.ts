@@ -5,7 +5,9 @@ import {
   findOpenVkQuestionDelivery,
   registerVkDraftQuestionHandoff,
   resetVkQuestionRuntimeForTest,
+  toggleVkQuestionOption,
 } from "./question.js";
+import { resetVkQuestionGatewayForTest } from "./question-gateway.js";
 
 /**
  * The send side of a question: the prompt goes out with its buttons, and the
@@ -97,17 +99,21 @@ function questionPayload(text = PROMPT_TEXT) {
 }
 
 let nextMessageId = 500;
+const gatewayCall = vi.fn();
 
 beforeEach(() => {
   vkApi.send.mockReset().mockImplementation(async () => nextMessageId++);
   vkApi.edit.mockReset().mockResolvedValue(1);
   questionRuntime.registrations = [];
   resetVkQuestionRuntimeForTest();
+  gatewayCall.mockReset().mockRejectedValue(new Error("no gateway in this test"));
+  resetVkQuestionGatewayForTest({ gateway: { call: gatewayCall, buildAnswers: () => ({ answers: {} }) } });
   clearVkInstances();
 });
 
 afterEach(() => {
   clearVkQuestionDeliveries();
+  resetVkQuestionGatewayForTest();
 });
 
 function sentKeyboard(callIndex: number) {
@@ -229,6 +235,127 @@ describe("sendPayloadVk — a question from the core", () => {
     // No buttons to take away: finalized with a plain edit, as before.
     await questionRuntime.registrations[0].finalize("Answered");
     expect(vkApi.edit.mock.calls[0][0]).not.toHaveProperty("keyboard");
+  });
+
+  it("a multi-select gets toggles and «Готово»; a toggle redraws the keyboard in place", async () => {
+    gatewayCall.mockResolvedValue({
+      question: {
+        id: QID,
+        status: "pending",
+        questions: [
+          {
+            questionId: "test_multi",
+            header: "Тест",
+            question: "Какие?",
+            multiSelect: true,
+            options: [{ label: "Первый" }, { label: "Второй" }, { label: "Третий" }],
+          },
+        ],
+      },
+    });
+    const text = "Тестовый вопрос\n1. Первый\n2. Второй\n3. Третий";
+    await sendPayloadVk("7654321", { text, channelData: { askUser: { questionId: QID } } }, { cfg: cfg as never });
+
+    expect(gatewayCall).toHaveBeenCalledWith("question.get", { id: QID });
+    const labels = (keyboard: { buttons: Array<Array<{ action: { label: string } }>> }) =>
+      keyboard.buttons.map((row) => row[0].action.label);
+    expect(labels(sentKeyboard(0))).toEqual(["Первый", "Второй", "Третий", "Готово"]);
+
+    expect(await toggleVkQuestionOption(QID, 1)).toEqual(["Второй"]);
+    expect(await toggleVkQuestionOption(QID, 0)).toEqual(["Первый", "Второй"]);
+    const edit = vkApi.edit.mock.calls.at(-1)?.[0];
+    expect(edit).toMatchObject({ peer_id: 7654321, message: text });
+    expect(labels(JSON.parse(edit.keyboard))).toEqual(["✅ Первый", "✅ Второй", "Третий", "Готово"]);
+    expect(await toggleVkQuestionOption(QID, 1)).toEqual(["Первый"]);
+  });
+
+  it("a multi-select that allows an own answer gets «Свой вариант» above «Готово»", async () => {
+    gatewayCall.mockResolvedValue({
+      question: {
+        id: QID,
+        status: "pending",
+        questions: [
+          {
+            questionId: "q",
+            header: "Фрукты",
+            question: "Какие?",
+            multiSelect: true,
+            isOther: true,
+            options: [{ label: "Яблоко" }, { label: "Слива" }],
+          },
+        ],
+      },
+    });
+    await sendPayloadVk("7654321", { text: "Какие?", channelData: { askUser: { questionId: QID } } }, {
+      cfg: cfg as never,
+    });
+    expect(sentKeyboard(0).buttons.map((row: Array<{ action: { label: string } }>) => row[0].action.label)).toEqual([
+      "Яблоко",
+      "Слива",
+      "✍️ Свой вариант",
+      "Готово",
+    ]);
+  });
+
+  describe("a multi-select that gets no toggles", () => {
+    const multi = (overrides: Record<string, unknown> = {}, record: Record<string, unknown> = {}) => ({
+      question: {
+        id: QID,
+        status: "pending",
+        questions: [
+          {
+            questionId: "m",
+            header: "Тест",
+            question: "Какие?",
+            multiSelect: true,
+            options: [{ label: "Первый" }, { label: "Второй" }],
+            ...overrides,
+          },
+        ],
+        ...record,
+      },
+    });
+    const send = () =>
+      sendPayloadVk("7654321", { text: "Какие?", channelData: { askUser: { questionId: QID } } }, {
+        cfg: cfg as never,
+      });
+
+    it("a secret one", async () => {
+      gatewayCall.mockResolvedValue(multi({ isSecret: true }));
+      await send();
+      expect(gatewayCall).toHaveBeenCalledWith("question.get", { id: QID });
+      expect(vkApi.send.mock.calls[0][0].keyboard).toBeUndefined();
+    });
+
+    it("one no longer pending", async () => {
+      gatewayCall.mockResolvedValue(multi({}, { status: "answered" }));
+      await send();
+      expect(vkApi.send.mock.calls[0][0].keyboard).toBeUndefined();
+    });
+
+    it("one whose options and «Свой вариант» do not fit beside «Готово»", async () => {
+      const nine = Array.from({ length: 9 }, (_, index) => ({ label: `Вариант ${index + 1}` }));
+      gatewayCall.mockResolvedValue(multi({ options: nine, isOther: true }));
+      await send();
+      expect(vkApi.send.mock.calls[0][0].keyboard).toBeUndefined();
+    });
+  });
+
+  it("several questions in one call stay text-only", async () => {
+    gatewayCall.mockResolvedValue({
+      question: {
+        id: QID,
+        status: "pending",
+        questions: [
+          { questionId: "a", header: "A", question: "?", multiSelect: true, options: [{ label: "x" }] },
+          { questionId: "b", header: "B", question: "?", options: [{ label: "y" }] },
+        ],
+      },
+    });
+    await sendPayloadVk("7654321", { text: "1. A?\n2. B?", channelData: { askUser: { questionId: QID } } }, {
+      cfg: cfg as never,
+    });
+    expect(vkApi.send.mock.calls[0][0].keyboard).toBeUndefined();
   });
 
   it("on a core without the question runtime the prompt is plain text, as before", async () => {

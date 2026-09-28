@@ -38,7 +38,10 @@ export const VK_QUESTION_CHANNEL_DATA_KEY = "vkQuestion";
 const MAX_BUTTON_LABEL_CHARS = 40;
 /** VK: at most 10 buttons in an inline keyboard. ask_user allows 2–4 options. */
 const MAX_OPTION_BUTTONS = 9;
+export const VK_QUESTION_MAX_OPTIONS = MAX_OPTION_BUTTONS;
 const CUSTOM_INPUT_LABEL = "✍️ Свой вариант";
+const SUBMIT_LABEL = "Готово";
+const MARKED_PREFIX = "✅ ";
 
 /** One question as the VK send path needs it. */
 export type VkQuestionPrompt = {
@@ -51,11 +54,20 @@ export type VkQuestionPrompt = {
   options: string[];
   /** A free answer is allowed ("Other…"). */
   customInput: boolean;
+  /**
+   * A multi-select question: the buttons toggle their option and "Готово"
+   * sends the marked ones. `answerKey` is the record's question id the answer
+   * is written under. The core renders no buttons for these; the options come
+   * from the record (`readVkMultiSelectPrompt`).
+   */
+  multiSelect?: { answerKey: string };
 };
 
 export type VkQuestionCallback =
   | { questionId: string; intent: "select"; optionIndex: number }
-  | { questionId: string; intent: "custom-input" };
+  | { questionId: string; intent: "custom-input" }
+  | { questionId: string; intent: "toggle"; optionIndex: number }
+  | { questionId: string; intent: "submit" };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -205,14 +217,54 @@ export function buildVkQuestionKeyboardRemoval(): string {
  * are sentences more often than words — and "Свой вариант" last. Undefined when
  * there is nothing to press.
  */
-export function buildVkQuestionKeyboard(prompt: VkQuestionPrompt): string | undefined {
+export function buildVkQuestionKeyboard(
+  prompt: VkQuestionPrompt,
+  marked: ReadonlySet<number> = new Set(),
+): string | undefined {
   if (prompt.options.length === 0) {
     return undefined;
   }
   type Button = {
     action: { type: "callback"; label: string; payload: string };
-    color: "primary" | "secondary";
+    color: "primary" | "secondary" | "positive";
   };
+  if (prompt.multiSelect) {
+    // Toggles, one per row, and "Готово" under them: a press marks or unmarks
+    // its option in place (`✅`), "Готово" sends what is marked.
+    const toggles: Button[][] = prompt.options.map((label, index) => [
+      {
+        action: {
+          type: "callback",
+          label: truncateLabel(`${marked.has(index) ? MARKED_PREFIX : ""}${label}`),
+          payload: JSON.stringify({ [VK_QUESTION_CALLBACK_KEY]: prompt.questionId, t: index }),
+        },
+        color: marked.has(index) ? "primary" : "secondary",
+      },
+    ]);
+    if (prompt.customInput) {
+      toggles.push([
+        {
+          action: {
+            type: "callback",
+            label: CUSTOM_INPUT_LABEL,
+            payload: JSON.stringify({ [VK_QUESTION_CALLBACK_KEY]: prompt.questionId, o: 1 }),
+          },
+          color: "secondary",
+        },
+      ]);
+    }
+    toggles.push([
+      {
+        action: {
+          type: "callback",
+          label: SUBMIT_LABEL,
+          payload: JSON.stringify({ [VK_QUESTION_CALLBACK_KEY]: prompt.questionId, d: 1 }),
+        },
+        color: "positive",
+      },
+    ]);
+    return JSON.stringify({ inline: true, buttons: toggles });
+  }
   const rows: Button[][] = prompt.options.map((label, index) => [
     {
       action: {
@@ -254,6 +306,15 @@ export function parseVkQuestionCallback(payload: unknown): VkQuestionCallback | 
   }
   if (record?.o === 1) {
     return { questionId, intent: "custom-input" };
+  }
+  if (record?.d === 1) {
+    return { questionId, intent: "submit" };
+  }
+  const toggled = record?.t;
+  if (typeof toggled === "number") {
+    return Number.isInteger(toggled) && toggled >= 0 && toggled < MAX_OPTION_BUTTONS
+      ? { questionId, intent: "toggle", optionIndex: toggled }
+      : null;
   }
   const optionIndex = record?.i;
   return typeof optionIndex === "number" &&
@@ -309,6 +370,10 @@ type Entry = {
   prompt?: VkQuestionPrompt;
   /** False once the core refused a typed answer for this record's shape. */
   textAnswerable: boolean;
+  /** Multi-select: the options marked so far, by index. */
+  marked: Set<number>;
+  /** Multi-select: puts a new keyboard on the prompt message. */
+  redraw?: (keyboard: string) => Promise<void>;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -318,16 +383,57 @@ export function rememberVkQuestionDelivery(
   questionId: string,
   delivery: VkQuestionDelivery,
   prompt?: VkQuestionPrompt,
+  redraw?: (keyboard: string) => Promise<void>,
 ): void {
   let entry = deliveries.get(questionId);
   if (!entry) {
     const timer = setTimeout(() => deliveries.delete(questionId), DELIVERY_RETENTION_MS);
     timer.unref?.();
-    entry = { deliveries: [], terminal: false, textAnswerable: true, timer };
+    entry = { deliveries: [], terminal: false, textAnswerable: true, marked: new Set(), timer };
     deliveries.set(questionId, entry);
   }
   entry.prompt ??= prompt;
+  entry.redraw ??= redraw;
   entry.deliveries.push(delivery);
+}
+
+/**
+ * Marks or unmarks one option of an open multi-select question and redraws its
+ * keyboard. Returns the marked labels in option order, or undefined when the
+ * question is not an open multi-select here.
+ */
+export async function toggleVkQuestionOption(
+  questionId: string,
+  optionIndex: number,
+): Promise<string[] | undefined> {
+  const entry = deliveries.get(questionId);
+  const prompt = entry?.prompt;
+  if (!entry || entry.terminal || !prompt?.multiSelect || optionIndex >= prompt.options.length) {
+    return undefined;
+  }
+  if (!entry.marked.delete(optionIndex)) {
+    entry.marked.add(optionIndex);
+  }
+  const keyboard = buildVkQuestionKeyboard(prompt, entry.marked);
+  if (keyboard && entry.redraw) {
+    await entry.redraw(keyboard);
+  }
+  return readVkQuestionMarked(questionId)?.labels;
+}
+
+/** The marked options of a multi-select question and the key they are written under. */
+export function readVkQuestionMarked(
+  questionId: string,
+): { answerKey: string; labels: string[] } | undefined {
+  const entry = deliveries.get(questionId);
+  const prompt = entry?.prompt;
+  if (!entry || !prompt?.multiSelect) {
+    return undefined;
+  }
+  return {
+    answerKey: prompt.multiSelect.answerKey,
+    labels: prompt.options.filter((_label, index) => entry.marked.has(index)),
+  };
 }
 
 /** The core refused a typed answer for this question (several questions, multi-select). */

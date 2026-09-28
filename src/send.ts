@@ -29,8 +29,10 @@ import {
   markVkQuestionTerminal,
   readVkQuestionPrompt,
   rememberVkQuestionDelivery,
+  VK_QUESTION_MAX_OPTIONS,
   type VkQuestionPrompt,
 } from "./question.js";
+import { readVkMultiSelectPrompt } from "./question-gateway.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { vkPositiveSetting } from "./settings.js";
 import { normalizeVkTargetId } from "./send-support.js";
@@ -2046,7 +2048,14 @@ async function sendVkQuestionPayload(params: {
   opts: SendVkOptions;
 }): Promise<SendVkResult | null> {
   const runtime = await loadVkQuestionRuntime();
-  const keyboard = runtime ? buildVkQuestionKeyboard(params.question) : undefined;
+  // A multi-select comes without buttons from the core: read its options from
+  // the record and offer toggles instead of a text-only prompt.
+  const question =
+    runtime && params.question.options.length === 0
+      ? ((await readVkMultiSelectPrompt(params.question.questionId, VK_QUESTION_MAX_OPTIONS)) ??
+        params.question)
+      : params.question;
+  const keyboard = runtime ? buildVkQuestionKeyboard(question) : undefined;
   const { account, peerId } = await resolveSendTarget({
     cfg: params.opts.cfg,
     accountId: params.opts.accountId,
@@ -2066,19 +2075,26 @@ async function sendVkQuestionPayload(params: {
   const lastChunk = chunks.at(-1);
   const messageId = Number(last?.messageId);
   vkDiag("question sent", {
-    questionId: params.question.questionId,
-    options: params.question.options.length,
-    customInput: params.question.customInput,
+    questionId: question.questionId,
+    options: question.options.length,
+    customInput: question.customInput,
+    multiSelect: Boolean(question.multiSelect),
     keyboard: Boolean(keyboard),
     messageId: last?.messageId ?? null,
   });
   if (!runtime || !last || !lastChunk || !Number.isFinite(messageId) || messageId <= 0) {
     return last;
   }
-  const questionId = params.question.questionId;
+  const questionId = question.questionId;
   // Remembered before registering: the core finalizes an already-finished
   // question synchronously inside `registerChannelDelivery`.
-  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId }, params.question);
+  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId }, question, async (next) => {
+    const current = resolveVkAccount({ cfg: readVkRuntimeConfig(), accountId });
+    await editMessageVk(String(peerId), messageId, lastChunk.text, current, {
+      formatData: lastChunk.formatData,
+      keyboard: next,
+    });
+  });
   runtime.registerChannelDelivery({
     questionId,
     deliveryId: `vk:${accountId}:${peerId}:${messageId}`,
