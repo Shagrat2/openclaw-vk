@@ -38,6 +38,27 @@ vi.mock("openclaw/plugin-sdk/channel-pairing", () => ({
 vi.mock("openclaw/plugin-sdk/channel-policy", () => ({
   readStoreAllowFromForDmPolicy: async ({ dmPolicy, readStore }: { dmPolicy: string; readStore: () => Promise<string[]> }) =>
     dmPolicy === "pairing" ? await readStore() : [],
+  // The core's group list: groupAllowFrom when set, no fallback to allowFrom here.
+  resolveEffectiveAllowFromLists: ({ groupAllowFrom }: { groupAllowFrom?: string[] }) => ({
+    effectiveAllowFrom: [],
+    effectiveGroupAllowFrom: groupAllowFrom?.length ? groupAllowFrom : [],
+  }),
+}));
+// The core's resolvers as they are: the channel's own policy, else the
+// inherited default, else "allowlist".
+vi.mock("openclaw/plugin-sdk/runtime-group-policy", () => ({
+  resolveDefaultGroupPolicy: (cfg: { channels?: { defaults?: { groupPolicy?: string } } }) =>
+    cfg.channels?.defaults?.groupPolicy,
+  resolveAllowlistProviderRuntimeGroupPolicy: (params: {
+    providerConfigPresent: boolean;
+    groupPolicy?: string;
+    defaultGroupPolicy?: string;
+  }) => ({
+    groupPolicy: params.providerConfigPresent
+      ? (params.groupPolicy ?? params.defaultGroupPolicy ?? "allowlist")
+      : (params.groupPolicy ?? "allowlist"),
+    providerMissingFallbackApplied: !params.providerConfigPresent && params.groupPolicy === undefined,
+  }),
 }));
 vi.mock("./runtime.js", () => ({
   getVkRuntime: () => ({ config: { current: () => state.config } }),
@@ -240,6 +261,37 @@ describe("handleVkQuestionEvent", () => {
   });
 });
 
+describe("a group question while the inherited policy changes", () => {
+  const GQ = `ask_${"4".repeat(32)}`;
+  const inGroup = (groupPolicy: string) => ({
+    channels: { defaults: { groupPolicy }, vk: { token: "t", groupAllowFrom: [String(DM)] } },
+  });
+
+  beforeEach(() => {
+    rememberVkQuestionDelivery(GQ, { accountId: "default", peerId: CHAT, messageId: 80 });
+  });
+
+  it("a press after the default turned disabled is refused, the core is not asked", async () => {
+    state.config = inGroup("disabled");
+    const { event, answer } = pressEvent({ peerId: CHAT, eventPayload: { ocq: GQ, i: 0 } });
+    expect(await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv })).toBe(true);
+    expect(snackbar(answer)).toBe("Ответить на этот вопрос может только тот, кому он задан");
+    expect(resolveOption).not.toHaveBeenCalled();
+  });
+
+  it("disabled between the press and the write: the authorizer refuses, nothing is resolved", async () => {
+    state.config = inGroup("allowlist");
+    resolveOption.mockImplementation(async ({ authorize }: { authorize: () => Promise<boolean> }) => {
+      state.config = inGroup("disabled");
+      return (await authorize()) ? { status: "answered", questionId: GQ, optionValue: "x" } : { status: "denied" };
+    });
+    const { event, answer } = pressEvent({ peerId: CHAT, eventPayload: { ocq: GQ, i: 0 } });
+    await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv });
+    expect(await resolveOption.mock.results[0].value).toEqual({ status: "denied" });
+    expect(snackbar(answer)).toBe("Ответить на этот вопрос может только тот, кому он задан");
+  });
+});
+
 describe("isVkQuestionAnswerer", () => {
   const ask = (config: Record<string, unknown>, userId: number, peerId = CHAT) =>
     isVkQuestionAnswerer({ config: config as never, accountId: "default", peerId, userId });
@@ -294,6 +346,40 @@ describe("isVkQuestionAnswerer", () => {
   it("an empty allowlist admits everyone only in an open group", async () => {
     expect(await ask({ channels: { vk: { groupPolicy: "open" } } }, 7)).toBe(true);
     expect(await ask({ channels: { vk: {} } }, 7)).toBe(false);
+  });
+
+  describe("the inbound gate's effective group policy (review of #20)", () => {
+    const withDefault = (groupPolicy: string, vk: Record<string, unknown> = {}) => ({
+      channels: { defaults: { groupPolicy }, vk },
+    });
+
+    it("an inherited open admits anyone, as the inbound gate does", async () => {
+      expect(await ask(withDefault("open"), 7)).toBe(true);
+    });
+
+    it("an inherited allowlist admits only the listed", async () => {
+      expect(await ask(withDefault("allowlist", { groupAllowFrom: ["42"] }), 42)).toBe(true);
+      expect(await ask(withDefault("allowlist", { groupAllowFrom: ["42"] }), 7)).toBe(false);
+    });
+
+    it("an inherited disabled admits nobody, listed or not", async () => {
+      expect(await ask(withDefault("disabled", { groupAllowFrom: ["42"] }), 42)).toBe(false);
+    });
+
+    it("an explicit open ignores the channel and per-chat allowlists", async () => {
+      expect(await ask({ channels: { vk: { groupPolicy: "open", groupAllowFrom: ["42"] } } }, 7)).toBe(true);
+      expect(
+        await ask(
+          { channels: { vk: { groupPolicy: "open", groups: { [String(CHAT)]: { allowFrom: ["42"] } } } } },
+          7,
+        ),
+      ).toBe(true);
+    });
+
+    it("the channel's own policy wins over the inherited default", async () => {
+      expect(await ask(withDefault("disabled", { groupPolicy: "open" }), 7)).toBe(true);
+      expect(await ask(withDefault("open", { groupPolicy: "disabled" }), 7)).toBe(false);
+    });
   });
 
   it("nobody in a disabled group", async () => {

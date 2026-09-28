@@ -16,6 +16,7 @@ const entryPoints = [
   "src/diagnostics.ts",
   "src/stall-watchdog.ts",
   "src/format.ts",
+  "src/group-access.ts",
   "src/inbound.ts",
   "src/keyboard.ts",
   "src/media.ts",

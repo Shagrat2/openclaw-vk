@@ -28,8 +28,6 @@ import {
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import {
   GROUP_POLICY_BLOCKED_LABEL,
-  resolveAllowlistProviderRuntimeGroupPolicy,
-  resolveDefaultGroupPolicy,
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/runtime-group-policy";
 import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
@@ -49,6 +47,7 @@ import {
 import { createVkStatusReactionController } from "./reactions-controller.js";
 import { readVkAskUserQuestionId, registerVkDraftQuestionHandoff } from "./question.js";
 import { answerVkQuestionByText } from "./question-events.js";
+import { resolveVkGroupAccess, resolveVkGroupSenderAdmission } from "./group-access.js";
 import { normalizeVkAllowlist, resolveVkAllowlistMatch } from "./send-support.js";
 import { getVkRuntime } from "./runtime.js";
 import {
@@ -213,18 +212,12 @@ export async function handleVkInbound(params: {
 
   const senderDisplay = String(message.senderId);
   const isGroup = message.isGroup;
-  const groupConfig = isGroup
-    ? (account.config.groups?.[String(message.peerId)] ?? account.config.groups?.["*"])
-    : undefined;
+  // Shared with question buttons: both gates must admit the same senders.
+  const groupAccess = resolveVkGroupAccess({ config, account, peerId: message.peerId });
+  const groupConfig = isGroup ? groupAccess.groupConfig : undefined;
 
   const dmPolicy = account.config.dmPolicy ?? "pairing";
-  const defaultGroupPolicy = resolveDefaultGroupPolicy(config as OpenClawConfig);
-  const { groupPolicy, providerMissingFallbackApplied } =
-    resolveAllowlistProviderRuntimeGroupPolicy({
-      providerConfigPresent: config.channels?.vk !== undefined,
-      groupPolicy: account.config.groupPolicy,
-      defaultGroupPolicy,
-    });
+  const { groupPolicy, providerMissingFallbackApplied } = groupAccess;
   warnMissingProviderGroupPolicyFallbackOnce({
     providerMissingFallbackApplied,
     providerKey: "vk",
@@ -234,7 +227,6 @@ export async function handleVkInbound(params: {
   });
 
   const configAllowFrom = normalizeVkAllowlist(account.config.allowFrom);
-  const configGroupAllowFrom = normalizeVkAllowlist(account.config.groupAllowFrom);
   const storeAllowFrom = await readStoreAllowFromForDmPolicy({
     provider: CHANNEL_ID,
     accountId: account.accountId,
@@ -243,18 +235,13 @@ export async function handleVkInbound(params: {
   });
   const storeAllowList = normalizeVkAllowlist(storeAllowFrom);
 
-  const { effectiveAllowFrom, effectiveGroupAllowFrom } = resolveEffectiveAllowFromLists({
+  const { effectiveAllowFrom } = resolveEffectiveAllowFromLists({
     allowFrom: configAllowFrom,
-    groupAllowFrom: configGroupAllowFrom,
     storeAllowFrom: storeAllowList,
     dmPolicy,
     groupAllowFromFallbackToAllowFrom: false,
   });
-  const groupAllowOverride =
-    groupConfig && Object.hasOwn(groupConfig, "allowFrom")
-      ? normalizeVkAllowlist(groupConfig.allowFrom)
-      : undefined;
-  const effectiveGroupSenderAllowFrom = groupAllowOverride ?? effectiveGroupAllowFrom;
+  const { effectiveGroupAllowFrom, effectiveGroupSenderAllowFrom } = groupAccess;
 
   // Forwards follow the core's supplemental context visibility, as in Telegram:
   // filtered in groups only — in a direct chat the sender already passed allowFrom,
@@ -303,29 +290,18 @@ export async function handleVkInbound(params: {
     return;
   }
 
-  // Group access check
+  // Group access and sender authorization
   if (isGroup) {
-    if (groupConfig?.enabled === false) {
-      runtime.log?.(`vk: drop group peerId=${message.peerId} (group disabled by config)`);
+    const admission = resolveVkGroupSenderAdmission(groupAccess, message.senderId);
+    if ("reason" in admission) {
+      runtime.log?.(
+        admission.reason === "chat-disabled"
+          ? `vk: drop group peerId=${message.peerId} (group disabled by config)`
+          : admission.reason === "policy-disabled"
+            ? `vk: drop group peerId=${message.peerId} (groupPolicy=${groupPolicy})`
+            : `vk: drop group sender ${senderDisplay} (groupPolicy=allowlist)`,
+      );
       return;
-    }
-    if (groupPolicy === "disabled") {
-      runtime.log?.(`vk: drop group peerId=${message.peerId} (groupPolicy=${groupPolicy})`);
-      return;
-    }
-  }
-
-  // Sender authorization
-  if (isGroup) {
-    if (groupPolicy === "allowlist") {
-      const senderAllowed = resolveVkAllowlistMatch({
-        allowFrom: effectiveGroupSenderAllowFrom,
-        senderId: message.senderId,
-      });
-      if (!senderAllowed.allowed) {
-        runtime.log?.(`vk: drop group sender ${senderDisplay} (groupPolicy=allowlist)`);
-        return;
-      }
     }
   } else {
     if (dmPolicy === "disabled") {
