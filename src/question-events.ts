@@ -19,6 +19,7 @@ import { readStoreAllowFromForDmPolicy } from "openclaw/plugin-sdk/channel-polic
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime";
 import { resolveVkAccount } from "./accounts.js";
+import { resolveVkGroupAccess, resolveVkGroupSenderAdmission } from "./group-access.js";
 import { redactVkId, vkDiag } from "./diagnostics.js";
 import {
   isVkGroupPeerId,
@@ -114,19 +115,14 @@ export async function isVkQuestionAnswerer(params: {
     ]);
     return resolveVkAllowlistMatch({ allowFrom, senderId: params.userId }).allowed;
   }
-  const groupConfig =
-    account.config.groups?.[String(params.peerId)] ?? account.config.groups?.["*"];
-  if (groupConfig?.enabled === false || account.config.groupPolicy === "disabled") {
-    return false;
-  }
-  const allowFrom =
-    groupConfig && Object.hasOwn(groupConfig, "allowFrom")
-      ? normalizeVkAllowlist(groupConfig.allowFrom)
-      : normalizeVkAllowlist(account.config.groupAllowFrom);
-  if (allowFrom.length === 0) {
-    return account.config.groupPolicy === "open";
-  }
-  return resolveVkAllowlistMatch({ allowFrom, senderId: params.userId }).allowed;
+  // The inbound gate's own calculation: inherited defaults, a disabled chat or
+  // policy first, the allowlist only in "allowlist" mode.
+  const access = resolveVkGroupAccess({
+    config: params.config,
+    account,
+    peerId: params.peerId,
+  });
+  return resolveVkGroupSenderAdmission(access, params.userId).allowed;
 }
 
 /**
