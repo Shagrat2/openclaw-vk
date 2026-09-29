@@ -115,6 +115,8 @@ const mockMessagesDelete = vi.hoisted(() => vi.fn().mockResolvedValue(1));
 const mockUploadPhoto = vi.hoisted(() => vi.fn().mockResolvedValue("photo123_456"));
 const mockUploadDocument = vi.hoisted(() => vi.fn().mockResolvedValue("doc123_789"));
 const mockUploadAudioMessage = vi.hoisted(() => vi.fn().mockResolvedValue("audio_message123_789"));
+// vk-io's POST to the upload server; the upload methods reach it as `this.upload`.
+const mockUploadServerPost = vi.hoisted(() => vi.fn());
 const mockGroupsGetById = vi.hoisted(() =>
   vi.fn().mockResolvedValue({ groups: [{ id: 12345678, name: "Test Group" }] }),
 );
@@ -146,6 +148,7 @@ vi.mock("vk-io", () => ({
         messagePhoto: mockUploadPhoto,
         messageDocument: mockUploadDocument,
         audioMessage: mockUploadAudioMessage,
+        upload: mockUploadServerPost,
       },
     };
   }),
@@ -644,6 +647,103 @@ describe("sendPhotoVk", () => {
     expect((meta as { source?: unknown })?.source).toBe("buffer");
   });
 
+  it("times each attempt, so a refusal is told apart from a transfer that broke", async () => {
+    // Three failed attempts that took 11 seconds between them showed the file
+    // was actually being sent and not rejected outright. Without a duration the
+    // log cannot make that distinction.
+    mockUploadPhoto.mockReset().mockImplementation(
+      () => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("boom")), 20)),
+    );
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    const [, meta] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect((meta as { elapsedMs?: number })?.elapsedMs).toBeGreaterThanOrEqual(15);
+  });
+
+  it("names the system error behind a failure without logging its text", async () => {
+    // A truncated upload arrives from vk-io looking exactly like a refusal by VK:
+    // same shape, message buried under `cause`. The errno is the one safe field
+    // that separates them.
+    const failure = Object.assign(new Error("Code №100 - photo is undefined"), {
+      code: 100,
+      cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+    });
+    mockUploadPhoto.mockReset().mockRejectedValue(failure);
+
+    await expect(
+      sendPhotoVk("123", Buffer.from("png"), undefined, { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ vkCode: 100, errno: "ECONNRESET" }),
+    );
+  });
+
+  it("finds the system error inside an AggregateError under the cause", async () => {
+    // A happy-eyeballs connect fails with an AggregateError that keeps the real
+    // codes in `errors`, one level below vk-io's own wrapper.
+    const failure = Object.assign(new Error("Code №100 - photo is undefined"), {
+      code: 100,
+      cause: new AggregateError([{ code: "ECONNREFUSED" }, { code: "ENETUNREACH" }], "connect failed"),
+    });
+    mockUploadPhoto.mockReset().mockRejectedValue(failure);
+
+    await expect(sendPhotoVk("123", Buffer.from("png"), undefined, { cfg })).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ vkCode: 100, errno: "ECONNREFUSED" }),
+    );
+  });
+
+  it("checks a photo upload's answer for the photo field, not file", async () => {
+    mockUploadServerPost.mockReset().mockResolvedValue({ server: 1, photo: "", hash: "h" });
+    mockUploadPhoto.mockReset().mockImplementation(async function (this: {
+      upload: (url: string, options: object) => Promise<unknown>;
+    }) {
+      await this.upload("https://upload.vk.example/photo", {});
+      throw Object.assign(new Error("Code №100 - photo is undefined"), { code: 100 });
+    });
+
+    await expect(sendPhotoVk("123", Buffer.from("png"), undefined, { cfg })).rejects.toThrow();
+
+    // The answer came, and the field the save call needs was empty in it.
+    expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+      "vk upload failed",
+      expect.objectContaining({
+        uploadPost: "answered",
+        uploadHasPayload: false,
+        uploadKeys: ["server", "photo", "hash"],
+      }),
+    );
+  });
+
+  it("measures an on-disk file of a failed upload even with diagnostics off", async () => {
+    // Failures are logged at every level, and the byte count is a safe field: it
+    // tells an empty render from a complete one. Buffers always carried it, files
+    // on disk did not — the size was measured only when diagnostics were on, which
+    // is never in production. The happy path still touches no disk while off.
+    const dir = await mkdtemp(join(tmpdir(), "vk-send-test-"));
+    const file = join(dir, "frame.jpg");
+    await writeFile(file, Buffer.alloc(2048, 7));
+    mockUploadPhoto.mockReset().mockRejectedValue(new Error("boom"));
+
+    try {
+      await expect(sendPhotoVk("123", file, undefined, { cfg })).rejects.toThrow();
+
+      expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+        "vk upload failed",
+        expect.objectContaining({ bytes: 2048, source: "local" }),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("sends empty message text when no caption", async () => {
     mockMessagesSend.mockResolvedValueOnce(1);
 
@@ -708,6 +808,75 @@ describe("sendDocumentVk", () => {
       }),
     );
     expect(result).toEqual({ messageId: "77", chatId: "456" });
+  });
+
+  // vk-io's save call for a document, after the POST to the upload server.
+  const postThenFileUndefined = (answer: unknown) =>
+    async function (this: { upload: (url: string, options: object) => Promise<unknown> }) {
+      mockUploadServerPost.mockResolvedValueOnce(answer);
+      await this.upload("https://upload.vk.example/doc", {});
+      throw Object.assign(new Error("Code №100 - file is undefined"), { code: 100 });
+    };
+
+  it("shows a long value of the upload server's answer by its length, even at full", async () => {
+    // A successful answer carries the one-time `file` blob for docs.save; when the
+    // save call fails, the whole answer is in the trace. The blob must not reach
+    // the log at any level.
+    const blob = "x".repeat(300);
+    process.env.VK_DIAG_LEVEL = "full";
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset();
+    mockUploadDocument.mockReset().mockImplementation(postThenFileUndefined({ file: blob }));
+    try {
+      await expect(sendDocumentVk("456", Buffer.from("pdf"), "a.pdf", undefined, { cfg })).rejects.toThrow();
+    } finally {
+      delete process.env.VK_DIAG_LEVEL;
+    }
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    const answer = String((fields as { uploadAnswer?: unknown }).uploadAnswer);
+    expect(fields).toMatchObject({ uploadPost: "answered", uploadHasPayload: true, uploadKeys: ["file"] });
+    expect(answer).toContain("<300 chars>");
+    expect(answer).not.toContain("x".repeat(65));
+  });
+
+  it("names an answer that is not an object by its type, and keeps its text for full", async () => {
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset();
+    mockUploadDocument.mockReset().mockImplementation(postThenFileUndefined("upstream refused /srv/doc"));
+
+    await expect(sendDocumentVk("456", Buffer.from("pdf"), "a.pdf", undefined, { cfg })).rejects.toThrow();
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(fields).toMatchObject({
+      uploadPost: "answered",
+      uploadAnswerType: "string",
+      uploadAnswer: "<text>",
+    });
+    expect(JSON.stringify(fields)).not.toContain("/srv/doc");
+  });
+
+  it("does not describe a later attempt with an earlier attempt's answer", async () => {
+    // The first attempt reached the upload server; the second failed before its
+    // POST. Its line must say so, not repeat the first answer.
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset();
+    mockUploadDocument
+      .mockReset()
+      .mockImplementationOnce(postThenFileUndefined({ error: "ERR_UPLOAD_FIRST" }))
+      .mockRejectedValue(Object.assign(new Error("Code №100 - file is undefined"), { code: 100 }));
+
+    await expect(sendDocumentVk("456", Buffer.from("pdf"), "a.pdf", undefined, { cfg })).rejects.toThrow();
+
+    const failures = mockUploadLogger.error.mock.calls
+      .filter(([event]) => event === "vk upload failed")
+      .map(([, fields]) => fields as Record<string, unknown>);
+    expect(failures.length).toBeGreaterThanOrEqual(2);
+    expect(failures[0]).toMatchObject({ attempt: 1, uploadPost: "answered", uploadError: "ERR_UPLOAD_FIRST" });
+    for (const later of failures.slice(1)) {
+      expect(later).toMatchObject({ uploadPost: "not-started" });
+      expect(later).not.toHaveProperty("uploadError");
+    }
   });
 
   it("sends empty message text when no caption", async () => {
@@ -958,6 +1127,84 @@ describe("sendAudioMessageVk", () => {
       expect.objectContaining({ peer_id: 456, attachment: "audio_message123_789" }),
     );
     expect(result).toEqual({ messageId: "88", chatId: "456" });
+  });
+
+  it("logs what the upload server answered when a voice upload fails", async () => {
+    // "file is undefined" is thrown by the save call; the answer that lacked the
+    // field is what tells a refusal by VK from a cut transfer, and vk-io drops it.
+    const fileUndefined = () =>
+      Object.assign(new Error("One of the parameters specified was missing or invalid: file is undefined"), {
+        code: 100,
+      });
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset().mockResolvedValue({
+      error: "ERR_UPLOAD_TEST",
+      error_descr: "upload refused for /secret/path",
+    });
+    mockUploadAudioMessage.mockReset().mockImplementation(async function (this: {
+      upload: (url: string, options: object) => Promise<unknown>;
+    }) {
+      await this.upload("https://upload.vk.example/audio", {});
+      throw fileUndefined();
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadServerPost).toHaveBeenCalledTimes(3);
+    const failures = mockUploadLogger.error.mock.calls.filter(([event]) => event === "vk upload failed");
+    expect(failures).toHaveLength(3);
+    for (const [, fields] of failures) {
+      // Below `full` the keys and a code-shaped error stay; the answer's text,
+      // with the path in it, does not.
+      expect(fields).toMatchObject({
+        uploadPost: "answered",
+        uploadHasPayload: false,
+        uploadKeys: ["error", "error_descr"],
+        uploadError: "ERR_UPLOAD_TEST",
+        uploadAnswer: "<text>",
+      });
+    }
+  });
+
+  it("says the upload server was never reached when the address request fails", async () => {
+    const denied = Object.assign(new Error("Access denied"), { code: 15 });
+    mockGetMessagesUploadServer.mockReset().mockRejectedValue(denied);
+    mockUploadAudioMessage.mockReset();
+    mockUploadServerPost.mockReset();
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow();
+
+    expect(mockUploadLogger.error).toHaveBeenLastCalledWith(
+      "vk upload failed",
+      expect.objectContaining({ uploadPost: "not-started" }),
+    );
+  });
+
+  it("says the POST failed when the upload server refuses it without a JSON answer", async () => {
+    // vk-io throws `new Error(response.statusText)` on a non-2xx answer (the
+    // upload server's "Not Allowed" limit, a gateway's "Gateway Time-out"). The
+    // server did answer, just not with JSON: that is neither "never reached"
+    // nor an answer with keys.
+    mockUploadLogger.error.mockClear();
+    mockGetMessagesUploadServer.mockReset().mockResolvedValue({ upload_url: "https://upload.vk.example/audio" });
+    mockUploadServerPost.mockReset().mockRejectedValue(new Error("Not Allowed"));
+    mockUploadAudioMessage.mockReset().mockImplementation(async function (this: {
+      upload: (url: string, options: object) => Promise<unknown>;
+    }) {
+      return await this.upload("https://upload.vk.example/audio", {});
+    });
+
+    await expect(
+      sendAudioMessageVk("456", "/tmp/voice.mp3", "voice.mp3", "caption", { cfg }),
+    ).rejects.toThrow("Not Allowed");
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(fields).toMatchObject({ uploadPost: "failed", errorName: "Error" });
+    expect(fields).not.toHaveProperty("uploadKeys");
   });
 
   it("does not retry audio upload on a genuine (non-file) code=100", async () => {

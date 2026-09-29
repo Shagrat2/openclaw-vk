@@ -118,6 +118,14 @@ const TOKEN_FIELDS = new Set([
   "status",
   "errorName",
   "errno",
+  // The upload server's answer (send.ts): how far the POST got
+  // (`not-started` / `failed` / `answered`), its keys (field names), its error a
+  // code such as `ERR_UPLOAD_FILE`, its type `object` / `string`. The answer's
+  // text itself (`uploadAnswer`) is not here and stays `full`-only.
+  "uploadPost",
+  "uploadKeys",
+  "uploadError",
+  "uploadAnswerType",
 ]);
 const TOKEN_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MIME_RE = /^[a-z]+\/[a-z0-9.+-]{1,63}$/i;

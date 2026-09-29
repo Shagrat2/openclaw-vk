@@ -150,6 +150,12 @@ const mockGetVkRuntime = vi.hoisted(() =>
 );
 vi.mock("./runtime.js", () => ({ getVkRuntime: mockGetVkRuntime }));
 
+const mockVkDiag = vi.hoisted(() => vi.fn());
+vi.mock("./diagnostics.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./diagnostics.js")>()),
+  vkDiag: mockVkDiag,
+}));
+
 const mockResolveVkAccount = vi.hoisted(() =>
   vi.fn().mockReturnValue({
     accountId: "default",
@@ -908,6 +914,24 @@ describe("outbound", () => {
     expect(result.channel).toBe("vk");
   });
 
+  it("logs one line per core-routed send, which the inbound deliver log never sees", async () => {
+    mockVkDiag.mockClear();
+
+    await vkPlugin.outbound!.sendText({ cfg: {}, to: "123", text: "hello", accountId: "default" } as never);
+    await vkPlugin.outbound!.sendFormattedMedia({
+      cfg: {},
+      to: "123",
+      text: "look",
+      mediaUrl: "https://example.com/a.jpg",
+      accountId: "default",
+    } as never);
+
+    expect(mockVkDiag.mock.calls).toEqual([
+      ["outbound sent", { stage: "sendText", to: "123", textLen: 5, media: false, messageId: "1" }],
+      ["outbound sent", { stage: "sendFormattedMedia", to: "123", textLen: 4, media: true, messageId: "fm-1" }],
+    ]);
+  });
+
   it("sendText delegates plain text delivery directly to VK", async () => {
     const result = await vkPlugin.outbound!.sendText({
       cfg: {},
@@ -954,6 +978,7 @@ describe("outbound", () => {
 
   it("sendMedia without a mediaUrl sends the caption as a plain message", async () => {
     // mediaUrl is optional in the core contract; the uploader would fail on it.
+    mockVkDiag.mockClear();
     const result = await vkPlugin.outbound!.sendMedia({
       cfg: {},
       to: "123",
@@ -969,6 +994,10 @@ describe("outbound", () => {
       replyTo: "88",
     });
     expect(result).toMatchObject({ channel: "vk" });
+    // A core-routed send, so it leaves its line like any other.
+    expect(mockVkDiag.mock.calls).toEqual([
+      ["outbound sent", { stage: "sendMedia", to: "123", textLen: 12, media: false, messageId: "1" }],
+    ]);
   });
 
   it("hands a running account's stop signal to outbound sends, and only while it runs", async () => {

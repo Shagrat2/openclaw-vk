@@ -271,6 +271,34 @@ describe("VK diagnostics levels", () => {
     expect(lastFields(mockLogger.info)).toEqual({ kind: "<text>", mime: "<text>" });
   });
 
+  it("keeps the upload server's answer to its keys, error code and flags below full", () => {
+    // The fields send.ts logs for a failed upload attempt: enough to tell a
+    // refusal by the upload server from a transfer that broke, never the answer.
+    vkDiagFailure("vk upload failed", new Error("file is undefined"), {
+      elapsedMs: 2100,
+      errno: "ECONNRESET",
+      uploadPost: "answered",
+      uploadKeys: ["error", "error_descr", "/srv/secret key"],
+      uploadHasPayload: false,
+      uploadError: "ERR_UPLOAD_FILE",
+      uploadAnswerType: "object",
+      uploadAnswer: '{"error":"ERR_UPLOAD_FILE","error_descr":"refused for /srv/secret"}',
+    });
+    expect(lastFields(mockLogger.error)).toMatchObject({
+      elapsedMs: 2100,
+      errno: "ECONNRESET",
+      uploadPost: "answered",
+      uploadKeys: ["error", "error_descr", "<text>"],
+      uploadHasPayload: false,
+      uploadError: "ERR_UPLOAD_FILE",
+      uploadAnswerType: "object",
+      uploadAnswer: "<text>",
+    });
+    // An error that is a sentence is text like any other.
+    vkDiagFailure("vk upload failed", new Error("file is undefined"), { uploadError: "unknown error" });
+    expect(lastFields(mockLogger.error).uploadError).toBe("<text>");
+  });
+
   it("hashes identifiers so two failures stay distinguishable without naming anyone", () => {
     process.env.VK_DIAG_LEVEL = "redacted";
     vkDiag("send text", { to: "111" });

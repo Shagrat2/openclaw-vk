@@ -100,6 +100,30 @@ describe.skipIf(!sdk || !diag)("VK diagnostics through the real SDK redactor", (
     expect(reason).toMatch(/ after <data URI cut, \d+ chars>$/);
   });
 
+  it("keeps a failed upload's answer to its keys, code and flags at off", () => {
+    // Failures are logged at every level; the upload server's answer text may
+    // carry a path or a file token and is kept for `full` only.
+    diag!.vkDiagFailure("vk upload failed", Object.assign(new Error("file is undefined"), { code: 100 }), {
+      elapsedMs: 2100,
+      uploadPost: "answered",
+      uploadKeys: ["error", "error_descr"],
+      uploadHasPayload: false,
+      uploadError: "ERR_UPLOAD_FILE",
+      uploadAnswer: '{"error":"ERR_UPLOAD_FILE","error_descr":"refused for /данные/клиент"}',
+    });
+    const fields = lastFields(mockLogger.error);
+    expect(fields).toMatchObject({
+      vkCode: 100,
+      elapsedMs: 2100,
+      uploadPost: "answered",
+      uploadKeys: ["error", "error_descr"],
+      uploadHasPayload: false,
+      uploadError: "ERR_UPLOAD_FILE",
+      uploadAnswer: "<text>",
+    });
+    expect(JSON.stringify(fields)).not.toContain("данные");
+  });
+
   it("keeps a data URI with a percent-encoded parameter out of the log at full", () => {
     // The review's input: the old pattern did not match this header, and the
     // real redactor let the whole URI through.
