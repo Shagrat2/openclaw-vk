@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strictNullChecks": false
+  },
+  "include": [
+    "src/**/*.ts",
+    "index.ts",
+    "api.ts",
+    "setup-entry.ts",
+    "secret-contract-api.ts"
+  ],
+  "exclude": []
+}
