@@ -36,3 +36,33 @@ export function readVkErrorMessage(error: unknown): string {
     .filter(Boolean)
     .join(" ");
 }
+
+/**
+ * Operating-system error code from the failure or anything it wraps: `ECONNRESET`,
+ * `EPIPE`, `ETIMEDOUT`. vk-io buries these under `cause`, sometimes two levels deep,
+ * so a truncated upload arrives looking exactly like a refusal from VK.
+ *
+ * Only an uppercase `errno`-shaped token is returned. It is a safe field by the
+ * channel's logging rules — a class of failure, not its text — while `message`
+ * carries paths and request parameters and must not be logged below `full`.
+ */
+export function readVkErrorSystemCode(error: unknown, depth = 0): string | undefined {
+  if (!error || typeof error !== "object" || depth > 4) {
+    return undefined;
+  }
+  const record = error as Record<string, unknown>;
+  const code = record.code;
+  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)) {
+    return code;
+  }
+  // `AggregateError` from a happy-eyeballs connect keeps the real codes in `errors`.
+  if (Array.isArray(record.errors)) {
+    for (const nested of record.errors) {
+      const found = readVkErrorSystemCode(nested, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  return readVkErrorSystemCode(record.cause, depth + 1);
+}
