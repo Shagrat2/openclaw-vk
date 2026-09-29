@@ -952,6 +952,25 @@ describe("outbound", () => {
     expect(result).toEqual({ channel: "vk", messageId: "fm-1", chatId: "0" });
   });
 
+  it("sendMedia without a mediaUrl sends the caption as a plain message", async () => {
+    // mediaUrl is optional in the core contract; the uploader would fail on it.
+    const result = await vkPlugin.outbound!.sendMedia({
+      cfg: {},
+      to: "123",
+      text: "caption only",
+      accountId: "default",
+      replyToId: "88",
+    } as never);
+
+    expect(mockSendFormattedMediaVk).not.toHaveBeenCalled();
+    expect(mockSendMessageVk).toHaveBeenCalledWith("123", "caption only", {
+      cfg: {},
+      accountId: "default",
+      replyTo: "88",
+    });
+    expect(result).toMatchObject({ channel: "vk" });
+  });
+
   it("hands a running account's stop signal to outbound sends, and only while it runs", async () => {
     // The core's outbound context carries no cancellation, so a gateway stop
     // used to leave a download or an ffmpeg run to finish and upload after it.

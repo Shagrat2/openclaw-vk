@@ -2324,6 +2324,39 @@ describe("status reaction lifecycle", () => {
     expect(controller.setDone).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["a group without requireMention, no mention", false, "hi everyone", false, false],
+    ["a group with requireMention, mentioned", true, "@bot hi", false, false],
+    ["a group with requireMention, a command without a mention", true, "/status", true, true],
+  ])("bypasses the mention for the ack gate as Telegram does: %s", async (_case, requireMention, text, command, bypass) => {
+    const runtime = installRuntime({
+      hasControlCommand: command,
+      buildMentionRegexes: vi.fn().mockReturnValue([/@bot/i]),
+      matchesMentionPatterns: vi.fn().mockImplementation((body: string) => body.includes("@bot")),
+    });
+
+    await handleVkInbound({
+      message: makeMessage({
+        peerId: GROUP_PEER_ID,
+        senderId: SENDER_ID,
+        isGroup: true,
+        text,
+        conversationMessageId: 42,
+      }),
+      account: makeAccount({
+        config: { dmPolicy: "open", groupPolicy: "open", groups: { "*": { requireMention } } },
+      }),
+      config: statusReactionConfig({ ackReactionScope: "group-mentions" }),
+      runtime: createVkRuntimeEnv(),
+    });
+
+    // The core gate reads `shouldBypassMention`; a `requireMention` key is ignored.
+    // What the gate then decides is pinned in `inbound.ack.sdk.test.ts`.
+    const gate = vi.mocked(runtime.channel.reactions.shouldAckReaction).mock.calls[0]?.[0];
+    expect(gate).toMatchObject({ scope: "group-mentions", isGroup: true, shouldBypassMention: bypass });
+    expect(gate).not.toHaveProperty("requireMention");
+  });
+
   it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
     const controller = await installStatusController();
     const runtime = installRuntime();
@@ -2363,7 +2396,7 @@ describe("status reaction lifecycle", () => {
       isDirect: true,
       isGroup: false,
       isMentionableGroup: false,
-      requireMention: false,
+      shouldBypassMention: false,
       canDetectMention: true,
       effectiveWasMentioned: false,
     });
