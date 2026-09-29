@@ -22,6 +22,7 @@ import { buildVkKeyboard, buildVkKeyboardRemoval, resolveVkButtonsFromPayload } 
 import { loadVkOutboundMedia } from "./media.js";
 import {
   buildVkQuestionKeyboard,
+  buildVkQuestionKeyboardRemoval,
   formatVkQuestionStatusLine,
   handOffVkDraftsBeforeQuestion,
   loadVkQuestionRuntime,
@@ -1723,7 +1724,7 @@ export async function editMessageVk(
   messageId: number,
   text: string,
   account: ResolvedVkAccount,
-  opts: { formatData?: VkPreparedFormattedMessage["formatData"] } = {},
+  opts: { formatData?: VkPreparedFormattedMessage["formatData"]; keyboard?: string } = {},
 ): Promise<boolean> {
   if (!account.token) {
     return false;
@@ -1744,6 +1745,9 @@ export async function editMessageVk(
   // param but not typed by vk-io, so build the params loosely and cast on the call.
   if (opts.formatData && opts.formatData.items.length > 0) {
     editParams.format_data = JSON.stringify(opts.formatData);
+  }
+  if (opts.keyboard) {
+    editParams.keyboard = opts.keyboard;
   }
   await withVkRetry(async () => {
     await vk.api.messages.edit(
@@ -2029,8 +2033,8 @@ export function appendVkQuestionStatus(
  * The keyboard goes on the last message of the prompt, and that message is
  * handed to the core's question runtime: when the question is answered,
  * expires or is cancelled, the core calls `finalize` with a status line, and
- * the message is edited to carry it. An edit without a keyboard also takes the
- * inline buttons away, so a finished question cannot be pressed again.
+ * the message is edited to carry it. The edit sends an empty inline keyboard,
+ * so the buttons go away and a finished question cannot be pressed again.
  *
  * Without the runtime (a core older than 2026.9.6) the prompt goes out as plain
  * text, exactly as before.
@@ -2084,6 +2088,8 @@ async function sendVkQuestionPayload(params: {
       const finished = appendVkQuestionStatus(lastChunk, formatVkQuestionStatusLine(statusLine));
       await editMessageVk(String(peerId), messageId, finished.text, current, {
         formatData: finished.formatData,
+        // Only a prompt that had buttons: a text-only one is edited as before.
+        keyboard: keyboard ? buildVkQuestionKeyboardRemoval() : undefined,
       });
       vkDiag("question finalized", { questionId, messageId, status: statusLine });
     },

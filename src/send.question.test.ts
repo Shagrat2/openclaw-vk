@@ -166,7 +166,7 @@ describe("sendPayloadVk — a question from the core", () => {
     }
   });
 
-  it("finalize edits the message: question text, outcome line, no keyboard", async () => {
+  it("finalize edits the message: question text, outcome line, an empty keyboard", async () => {
     const result = await sendPayloadVk("7654321", questionPayload(), { cfg: cfg as never });
     await questionRuntime.registrations[0].finalize("Answered: Увеличить ×2");
 
@@ -176,8 +176,8 @@ describe("sendPayloadVk — a question from the core", () => {
     expect(edit.message_id).toBe(Number(result?.messageId));
     expect(edit.message.startsWith(vkApi.send.mock.calls[0][0].message)).toBe(true);
     expect(edit.message.endsWith("\n\n✅ Ответ: Увеличить ×2")).toBe(true);
-    // An edit without `keyboard` is what takes VK's inline buttons away.
-    expect(edit).not.toHaveProperty("keyboard");
+    // The buttons are taken away explicitly: an empty inline keyboard.
+    expect(JSON.parse(edit.keyboard)).toEqual({ inline: true, buttons: [] });
     // The question is closed for presses from now on.
     expect(findOpenVkQuestionDelivery({ questionId: QID, accountId: "default", peerId: 7654321 })).toBeUndefined();
   });
@@ -187,7 +187,14 @@ describe("sendPayloadVk — a question from the core", () => {
     await questionRuntime.registrations[0].finalize("Expired");
     const edit = vkApi.edit.mock.calls[0][0];
     expect(edit.message.endsWith("\n\n⌛ Время на ответ вышло")).toBe(true);
-    expect(edit).not.toHaveProperty("keyboard");
+    expect(JSON.parse(edit.keyboard)).toEqual({ inline: true, buttons: [] });
+  });
+
+  it("a cancelled question loses its buttons the same way", async () => {
+    await sendPayloadVk("7654321", questionPayload(), { cfg: cfg as never });
+    await questionRuntime.registrations[0].finalize("Cancelled");
+    const edit = vkApi.edit.mock.calls[0][0];
+    expect(JSON.parse(edit.keyboard)).toEqual({ inline: true, buttons: [] });
   });
 
   it("keeps the rich-text runs of the question when it adds the outcome", async () => {
@@ -219,6 +226,9 @@ describe("sendPayloadVk — a question from the core", () => {
     );
     expect(vkApi.send.mock.calls[0][0].keyboard).toBeUndefined();
     expect(questionRuntime.registrations).toHaveLength(1);
+    // No buttons to take away: finalized with a plain edit, as before.
+    await questionRuntime.registrations[0].finalize("Answered");
+    expect(vkApi.edit.mock.calls[0][0]).not.toHaveProperty("keyboard");
   });
 
   it("on a core without the question runtime the prompt is plain text, as before", async () => {

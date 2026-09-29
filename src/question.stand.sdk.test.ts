@@ -55,8 +55,11 @@ vi.mock("vk-io", () => ({
               throw new Error("VK API error 100: message not found");
             }
             message.text = params.message;
-            // messages.edit replaces the message: no keyboard sent, none kept.
-            message.keyboard = params.keyboard;
+            // messages.edit replaces the message: no keyboard sent or an empty one
+            // leaves no buttons (both checked live in VK on 29.09.2026).
+            message.keyboard = params.keyboard && JSON.parse(params.keyboard).buttons?.length
+              ? params.keyboard
+              : undefined;
             return 1;
           }),
         },
