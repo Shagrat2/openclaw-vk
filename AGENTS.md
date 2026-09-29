@@ -13,6 +13,7 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 - `index.ts`: channel plugin entry (`defineChannelPluginEntry`)
 - `setup-entry.ts`: setup wizard entry (`defineSetupPluginEntry`)
 - `doctor-contract-api.ts`: OpenClaw Doctor contract (`stateMigrations`, mirrored by `doctorContract` in the manifest)
+- `secret-contract-api.ts`: secret contract the core loads from external channel plugins (the `token` SecretRef targets and their collector, from `src/secret-contract.ts`)
 - `openclaw.plugin.json`: plugin manifest (`id`, channels, `doctorContract`, config schema)
 - `src/config-schema.ts`: account/channel config JSON schema builder
 - `src/channel.ts`: main channel behavior (routing, security, status, gateway start/stop)
@@ -20,6 +21,7 @@ This directory contains the OpenClaw VK channel plugin (`id: vk`) implemented as
 - `src/setup-core.ts`: setup-side core operations (probe, account persistence)
 - `src/setup-surface.ts`: setup UI/runtime bridge used by setup entry
 - `src/accounts.ts`: account resolution and normalization helpers
+- `src/secret-contract.ts`: SecretRef targets for `token` and the assignment collector that follows the account model (root token, `VK_TOKEN`, `tokenFile` first)
 - `src/format.ts`: outbound Markdown-to-VK adapter; prepares `{ text, formatData }` chunks via `markdown-to-vk`
 - `src/sanitize.ts`: plain-text cleanup for VK outbound text before markdown-aware rendering
 - `src/send-support.ts`: target normalization, allowlist edits, and directory helpers shared by VK send surfaces
