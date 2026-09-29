@@ -3,7 +3,7 @@ import { extname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const sourceRoots = ["api.ts", "doctor-contract-api.ts", "index.ts", "setup-entry.ts", "src"];
+const sourceRoots = ["api.ts", "doctor-contract-api.ts", "index.ts", "secret-contract-api.ts", "setup-entry.ts", "src"];
 const sourceExtensions = new Set([".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
 
 try {
