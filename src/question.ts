@@ -192,6 +192,15 @@ function truncateLabel(text: string): string {
 }
 
 /**
+ * The keyboard a finished question is edited with: an empty inline one, so the
+ * buttons go away explicitly. VK also drops them on an edit without `keyboard`
+ * (checked live on 29.09.2026), but `messages.edit` does not promise that.
+ */
+export function buildVkQuestionKeyboardRemoval(): string {
+  return JSON.stringify({ inline: true, buttons: [] });
+}
+
+/**
  * VK inline keyboard: one callback button per option, one per row — the labels
  * are sentences more often than words — and "Свой вариант" last. Undefined when
  * there is nothing to press.
