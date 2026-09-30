@@ -108,13 +108,20 @@ const VkStreamingSchema = z
  */
 const SECRET_PROVIDER_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const ENV_SECRET_ID_RE = /^[A-Z][A-Z0-9_]{0,127}$/;
+// The host's file and exec id grammars (docs.openclaw.ai/gateway/secrets/secretref-contract).
+// An id outside them passes a looser schema but throws when the gateway resolves
+// secrets, which fails activation instead of isolating the channel. A file id is
+// "value" or an absolute JSON pointer, `~` escaped as `~0`/`~1`; an exec id has
+// no "." or ".." segment. The manifest repeats both patterns.
+const FILE_SECRET_ID_RE = /^(?:value|(?:\/(?:[^~/]|~[01])*)+)$/;
+const EXEC_SECRET_ID_RE = /^(?!(?:[^/]*\/)*\.{1,2}(?:\/|$))[A-Za-z0-9][A-Za-z0-9._:/#-]{0,255}$/;
 const VkSecretInputSchema = z.union([
   z.string(),
   z.discriminatedUnion("source", [
     z.object({ source: z.literal("env"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string().regex(ENV_SECRET_ID_RE) }).strict(),
     z.object({ source: z.literal("store"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string().regex(ENV_SECRET_ID_RE) }).strict(),
-    z.object({ source: z.literal("file"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string() }).strict(),
-    z.object({ source: z.literal("exec"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string() }).strict(),
+    z.object({ source: z.literal("file"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string().regex(FILE_SECRET_ID_RE) }).strict(),
+    z.object({ source: z.literal("exec"), provider: z.string().regex(SECRET_PROVIDER_RE), id: z.string().regex(EXEC_SECRET_ID_RE) }).strict(),
   ]),
 ]);
 

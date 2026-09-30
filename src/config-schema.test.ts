@@ -307,6 +307,40 @@ describe("token as a SecretRef", () => {
     expect(ok(42)).toBe(false);
   });
 
+  // The review's input: these passed the schema and then threw while the
+  // gateway resolved secrets, failing activation instead of isolating VK.
+  const BAD_IDS: Array<[string, string]> = [
+    ["file", "relative"],
+    ["file", "/bad~escape"],
+    ["file", ""],
+    ["exec", "../token"],
+    ["exec", "vault/./key"],
+    ["exec", "vault/.."],
+    ["exec", ""],
+  ];
+  const GOOD_IDS: Array<[string, string]> = [
+    ["file", "value"],
+    ["file", "/vk/token"],
+    ["file", "/a~0b/~1c"],
+    ["exec", "vault/openai/api-key"],
+    ["exec", "aws/secret#json_key"],
+    ["exec", "a..b/c.d"],
+  ];
+
+  it("rejects file and exec ids outside the host's grammar, at channel and account level", () => {
+    for (const [source, id] of BAD_IDS) {
+      const token = { source, provider: "p", id };
+      expect(ok(token), `${source} ${JSON.stringify(id)}`).toBe(false);
+      expect(VkConfigSchema.safeParse({ accounts: { work: { token } } }).success, `${source} ${id}`).toBe(false);
+    }
+  });
+
+  it("accepts file and exec ids the host resolves", () => {
+    for (const [source, id] of GOOD_IDS) {
+      expect(ok({ source, provider: "p", id }), `${source} ${id}`).toBe(true);
+    }
+  });
+
   it("accepts a reference in a named account", () => {
     const result = VkConfigSchema.safeParse({
       accounts: { work: { token: { source: "exec", provider: "openclaw-keychain", id: "vk-work" } } },
