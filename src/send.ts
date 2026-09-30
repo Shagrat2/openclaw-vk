@@ -29,6 +29,7 @@ import {
   markVkQuestionTerminal,
   readVkQuestionPrompt,
   rememberVkQuestionDelivery,
+  runVkQuestionEdit,
   VK_QUESTION_MAX_OPTIONS,
   type VkQuestionPrompt,
   withoutVkQuestionReplyGuidance,
@@ -2106,12 +2107,15 @@ async function sendVkQuestionPayload(params: {
     deliveryId: `vk:${accountId}:${peerId}:${messageId}`,
     finalize: async (statusLine) => {
       markVkQuestionTerminal(questionId);
-      const current = resolveVkAccount({ cfg: readVkRuntimeConfig(), accountId });
-      const finished = appendVkQuestionStatus(lastChunk, formatVkQuestionStatusLine(statusLine));
-      await editMessageVk(String(peerId), messageId, finished.text, current, {
-        formatData: finished.formatData,
-        // Only a prompt that had buttons: a text-only one is edited as before.
-        keyboard: keyboard ? buildVkQuestionKeyboardRemoval() : undefined,
+      // After a toggle's redraw already sent, so the outcome is the last edit.
+      await runVkQuestionEdit(questionId, async () => {
+        const current = resolveVkAccount({ cfg: readVkRuntimeConfig(), accountId });
+        const finished = appendVkQuestionStatus(lastChunk, formatVkQuestionStatusLine(statusLine));
+        await editMessageVk(String(peerId), messageId, finished.text, current, {
+          formatData: finished.formatData,
+          // Only a prompt that had buttons: a text-only one is edited as before.
+          keyboard: keyboard ? buildVkQuestionKeyboardRemoval() : undefined,
+        });
       });
       vkDiag("question finalized", { questionId, messageId, status: statusLine });
     },

@@ -295,6 +295,164 @@ describe("sendPayloadVk — a question from the core", () => {
     expect(await toggleVkQuestionOption(QID, 1)).toEqual(["Первый"]);
   });
 
+  it("a multi-select in a group chat gets toggles and «Готово», and no «Свой вариант»", async () => {
+    gatewayCall.mockResolvedValue({
+      question: {
+        id: QID,
+        status: "pending",
+        questions: [
+          {
+            questionId: "q",
+            header: "Фрукты",
+            question: "Какие?",
+            multiSelect: true,
+            isOther: true,
+            options: [{ label: "Яблоко" }, { label: "Слива" }],
+          },
+        ],
+      },
+    });
+    await sendPayloadVk("vk:2000000005", { text: "Какие?", channelData: { askUser: { questionId: QID } } }, {
+      cfg: cfg as never,
+    });
+    expect(sentKeyboard(0).buttons.map((row: Array<{ action: { label: string } }>) => row[0].action.label)).toEqual([
+      "Яблоко",
+      "Слива",
+      "Готово",
+    ]);
+  });
+
+  describe("toggles and the outcome racing on one message", () => {
+    // The review's input: vk-io runs Long Poll handlers without awaiting the
+    // previous one, so edits overlap, and VK applies them in the order they land.
+    const labels = (keyboard: string | undefined) =>
+      keyboard
+        ? (JSON.parse(keyboard).buttons as Array<Array<{ action: { label: string } }>>).map((row) => row[0].action.label)
+        : [];
+
+    async function sendMultiSelect() {
+      gatewayCall.mockResolvedValue({
+        question: {
+          id: QID,
+          status: "pending",
+          questions: [
+            {
+              questionId: "m",
+              header: "Тест",
+              question: "Какие?",
+              multiSelect: true,
+              options: [{ label: "A" }, { label: "B" }, { label: "C" }],
+            },
+          ],
+        },
+      });
+      await sendPayloadVk("7654321", { text: "Какие?", channelData: { askUser: { questionId: QID } } }, {
+        cfg: cfg as never,
+      });
+    }
+
+    /** VK edits that finish only when the test says so, in any order. */
+    function deferEdits() {
+      const pending: Array<() => void> = [];
+      vkApi.edit.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            pending.push(() => resolve(1));
+          }),
+      );
+      return pending;
+    }
+
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    /** VK edits the test settles one by one: ok, or refused. */
+    function settleEdits() {
+      const pending: Array<{ ok: () => void; fail: (error: Error) => void }> = [];
+      vkApi.edit.mockImplementation(
+        () =>
+          new Promise((resolve, reject) => {
+            pending.push({ ok: () => resolve(1), fail: reject });
+          }),
+      );
+      return pending;
+    }
+
+    it("a refused redraw keeps the marks: the next edit in the queue draws them, and the queue goes on", async () => {
+      await sendMultiSelect();
+      const pending = settleEdits();
+      const x = toggleVkQuestionOption(QID, 0);
+      await flush();
+      const a = toggleVkQuestionOption(QID, 1);
+      const b = toggleVkQuestionOption(QID, 2);
+      await flush();
+      pending.shift()!.ok();
+      await flush();
+      // A's edit folds A and B in, and VK refuses it.
+      expect(labels(vkApi.edit.mock.calls[1][0].keyboard)).toEqual(["✅ A", "✅ B", "✅ C", "Готово"]);
+      pending.shift()!.fail(new Error("VK API error 9: flood control"));
+      await expect(a).rejects.toThrow("flood control");
+      await flush();
+      // B's edit is not skipped: it draws every mark again.
+      expect(vkApi.edit).toHaveBeenCalledTimes(3);
+      expect(labels(vkApi.edit.mock.calls[2][0].keyboard)).toEqual(["✅ A", "✅ B", "✅ C", "Готово"]);
+      pending.shift()!.ok();
+      await expect(Promise.all([x, b])).resolves.toEqual([["A"], ["A", "B", "C"]]);
+
+      // The queue is not stuck behind the refusal: the outcome still goes out.
+      const finalized = questionRuntime.registrations[0].finalize("Answered: A, B, C");
+      await flush();
+      pending.shift()!.ok();
+      await finalized;
+      expect(vkApi.edit.mock.calls[3][0].message).toContain("✅ Ответ: A, B, C");
+    });
+
+    it("a later toggle waits for the edit on the wire and draws the marks as they are then", async () => {
+      await sendMultiSelect();
+      const pending = deferEdits();
+      const first = toggleVkQuestionOption(QID, 0);
+      await flush();
+      const second = toggleVkQuestionOption(QID, 1);
+      const third = toggleVkQuestionOption(QID, 2);
+      await flush();
+      // One edit on the wire; the other two wait behind it.
+      expect(vkApi.edit).toHaveBeenCalledTimes(1);
+      expect(labels(vkApi.edit.mock.calls[0][0].keyboard)).toEqual(["✅ A", "B", "C", "Готово"]);
+      pending.shift()!();
+      await flush();
+      // The two queued toggles fold into one edit with every mark.
+      expect(vkApi.edit).toHaveBeenCalledTimes(2);
+      expect(labels(vkApi.edit.mock.calls[1][0].keyboard)).toEqual(["✅ A", "✅ B", "✅ C", "Готово"]);
+      pending.shift()!();
+      await expect(Promise.all([first, second, third])).resolves.toEqual([["A"], ["A", "B"], ["A", "B", "C"]]);
+      expect(vkApi.edit).toHaveBeenCalledTimes(2);
+    });
+
+    it("the outcome is the last edit: it waits for a redraw on the wire, and later toggles draw nothing", async () => {
+      await sendMultiSelect();
+      const pending = deferEdits();
+      const onWire = toggleVkQuestionOption(QID, 0);
+      await flush();
+      const queued = toggleVkQuestionOption(QID, 1);
+      await flush();
+      const finalized = questionRuntime.registrations[0].finalize("Answered: A, B");
+      const late = toggleVkQuestionOption(QID, 2);
+      await flush();
+      expect(vkApi.edit).toHaveBeenCalledTimes(1);
+
+      pending.shift()!();
+      await flush();
+      // The queued toggle is dropped: the question is finished.
+      expect(vkApi.edit).toHaveBeenCalledTimes(2);
+      const outcome = vkApi.edit.mock.calls[1][0];
+      expect(outcome.message).toContain("✅ Ответ: A, B");
+      expect(labels(outcome.keyboard)).toEqual([]);
+      pending.shift()!();
+      await Promise.all([onWire, queued, finalized]);
+      expect(await late).toBeUndefined();
+      expect(vkApi.edit).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("a multi-select that allows an own answer gets «Свой вариант» above «Готово»", async () => {
     gatewayCall.mockResolvedValue({
       question: {

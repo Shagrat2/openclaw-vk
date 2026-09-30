@@ -606,6 +606,20 @@ describe("answerVkQuestionByText", () => {
       expect(call).not.toHaveBeenCalled();
     });
 
+    it("a toggle whose redraw VK refused says the mark is kept, and «Готово» submits it", async () => {
+      redraw.mockRejectedValueOnce(new Error("VK API error 9: flood control"));
+      const first = press({ t: 1 });
+      await handleVkQuestionEvent({ event: first.event, accountId: "default", runtime: runtimeEnv });
+      expect(snackbar(first.answer)).toBe("Отметка учтена, но кнопки не обновились");
+      const done = press({ d: 1 });
+      await handleVkQuestionEvent({ event: done.event, accountId: "default", runtime: runtimeEnv });
+      expect(call).toHaveBeenCalledWith("question.resolve", {
+        id: MQ,
+        answers: { answers: { test_multi: ["Второй"] } },
+        resolvedBy: String(DM),
+      });
+    });
+
     it("«Готово» writes the marked options under the record's question id", async () => {
       for (const t of [0, 2]) {
         await handleVkQuestionEvent({ event: press({ t }).event, accountId: "default", runtime: runtimeEnv });

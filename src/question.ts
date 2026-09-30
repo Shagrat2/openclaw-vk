@@ -400,6 +400,14 @@ type Entry = {
   marked: Set<number>;
   /** Multi-select: puts a new keyboard on the prompt message. */
   redraw?: (keyboard: string) => Promise<void>;
+  /** A toggle changed the marks and the keyboard has not been redrawn since. */
+  redrawPending: boolean;
+  /**
+   * The last edit of this question's messages, finished or not. vk-io runs
+   * Long Poll handlers without awaiting the previous one, so two toggles edit
+   * at once; edits wait here for each other, in order.
+   */
+  edits: Promise<void>;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -415,7 +423,15 @@ export function rememberVkQuestionDelivery(
   if (!entry) {
     const timer = setTimeout(() => deliveries.delete(questionId), DELIVERY_RETENTION_MS);
     timer.unref?.();
-    entry = { deliveries: [], terminal: false, textAnswerable: true, marked: new Set(), timer };
+    entry = {
+      deliveries: [],
+      terminal: false,
+      textAnswerable: true,
+      marked: new Set(),
+      redrawPending: false,
+      edits: Promise.resolve(),
+      timer,
+    };
     deliveries.set(questionId, entry);
   }
   entry.prompt ??= prompt;
@@ -440,11 +456,50 @@ export async function toggleVkQuestionOption(
   if (!entry.marked.delete(optionIndex)) {
     entry.marked.add(optionIndex);
   }
-  const keyboard = buildVkQuestionKeyboard(prompt, entry.marked);
-  if (keyboard && entry.redraw) {
-    await entry.redraw(keyboard);
+  const labels = readVkQuestionMarked(questionId)?.labels;
+  const redraw = entry.redraw;
+  if (redraw) {
+    entry.redrawPending = true;
+    await runVkQuestionEdit(questionId, async () => {
+      // The keyboard is built when the edit runs, from the marks as they are
+      // then: toggles queued meanwhile fold into one edit, and an edit that
+      // finishes late cannot put back an older set. A finished question is
+      // not redrawn at all.
+      if (!entry.redrawPending || entry.terminal) {
+        return;
+      }
+      entry.redrawPending = false;
+      const keyboard = buildVkQuestionKeyboard(prompt, entry.marked);
+      if (keyboard) {
+        try {
+          await redraw(keyboard);
+        } catch (error) {
+          // The marks stay; the next edit in the queue, or the next toggle,
+          // draws them. Without this a toggle folded into the failed edit
+          // would never reach the keyboard, while «Готово» submits it.
+          entry.redrawPending = true;
+          throw error;
+        }
+      }
+    });
   }
-  return readVkQuestionMarked(questionId)?.labels;
+  return labels;
+}
+
+/**
+ * Runs `edit` on this question's messages after every earlier one has finished,
+ * failed or not. Finalization goes through here too, after marking the question
+ * terminal: it waits for a redraw already on the wire and no later redraw runs.
+ */
+export async function runVkQuestionEdit(questionId: string, edit: () => Promise<void>): Promise<void> {
+  const entry = deliveries.get(questionId);
+  if (!entry) {
+    await edit();
+    return;
+  }
+  const run = entry.edits.then(edit);
+  entry.edits = run.catch(() => undefined);
+  await run;
 }
 
 /** The marked options of a multi-select question and the key they are written under. */

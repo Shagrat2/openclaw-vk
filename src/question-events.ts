@@ -68,6 +68,7 @@ const TEXT = {
   marked: (labels: string[]) =>
     labels.length > 0 ? `Отмечено: ${labels.join(", ")}` : "Ничего не отмечено",
   markNone: "Отметьте хотя бы один вариант, затем «Готово»",
+  markedNotRedrawn: "Отметка учтена, но кнопки не обновились",
   severalHint:
     "Не поняла ответ. Напишите номера вариантов через запятую, например «1, 3»; если вопросов несколько — по строке на каждый. «Стоп» прервёт работу.",
 } as const;
@@ -275,7 +276,15 @@ async function handleVkMultiSelectPress(params: {
   const { questionId } = callback;
   try {
     if (callback.intent === "toggle") {
-      const labels = await toggleVkQuestionOption(questionId, callback.optionIndex);
+      let labels: string[] | undefined;
+      try {
+        labels = await toggleVkQuestionOption(questionId, callback.optionIndex);
+      } catch (error) {
+        // Only the redraw failed: the mark is kept and «Готово» submits it.
+        vkDiagFailure("question redraw failed", error, { questionId });
+        await reply(TEXT.markedNotRedrawn);
+        return true;
+      }
       await reply(labels ? TEXT.marked(labels) : TEXT.closed);
       return true;
     }
