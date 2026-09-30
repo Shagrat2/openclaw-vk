@@ -18,6 +18,7 @@ import {
   rememberVkQuestionDelivery,
   resetVkQuestionRuntimeForTest,
   VK_QUESTION_CHANNEL_DATA_KEY,
+  withoutVkQuestionReplyGuidance,
 } from "./question.js";
 
 vi.mock("./diagnostics.js", () => ({ vkDiag: vi.fn() }));
@@ -411,5 +412,23 @@ describe("findOpenVkQuestionForChat", () => {
   it("a delivery remembered without a prompt answers only by buttons", () => {
     rememberVkQuestionDelivery(QID, { accountId: "default", peerId: 7, messageId: 1 });
     expect(findOpenVkQuestionForChat({ accountId: "default", peerId: 7 })).toBeUndefined();
+  });
+});
+
+describe("withoutVkQuestionReplyGuidance", () => {
+  it("cuts each of the core's closing lines, and only a whole last paragraph", () => {
+    for (const line of [
+      "Reply by number or question id. Use a declared option where choices are fixed.",
+      "Reply with your answer.",
+      "Reply with comma-separated option numbers or text, or your own answer.",
+      "Reply with the number, the option text, or your own answer.",
+      "Reply with the number or option text.",
+    ]) {
+      expect(withoutVkQuestionReplyGuidance(`Вопрос?\n1. Да\n\n${line}`)).toBe("Вопрос?\n1. Да");
+    }
+    expect(withoutVkQuestionReplyGuidance("Вопрос?\n\nReply with your answer. Или нет")).toBe(
+      "Вопрос?\n\nReply with your answer. Или нет",
+    );
+    expect(withoutVkQuestionReplyGuidance("Reply with your answer.")).toBe("Reply with your answer.");
   });
 });

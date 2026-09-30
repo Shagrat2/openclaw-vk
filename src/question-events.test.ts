@@ -292,6 +292,31 @@ describe("a group question while the inherited policy changes", () => {
   });
 });
 
+describe("a group question's buttons", () => {
+  const GQ = `ask_${"5".repeat(32)}`;
+
+  beforeEach(() => {
+    state.config = { channels: { vk: { token: "t", groupPolicy: "open" } } };
+    rememberVkQuestionDelivery(GQ, { accountId: "default", peerId: CHAT, messageId: 81 });
+  });
+
+  it("'Свой вариант' from an older keyboard asks for no typed answer and leaves the core alone", async () => {
+    const { event, answer } = pressEvent({ peerId: CHAT, eventPayload: { ocq: GQ, o: 1 } });
+    await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv });
+    expect(snackbar(answer)).toBe("В беседе ответ принимается только кнопками");
+    expect(resolveOption).not.toHaveBeenCalled();
+    expect(sendMessageVk).not.toHaveBeenCalled();
+    expect(findOpenVkQuestionDelivery({ questionId: GQ, accountId: "default", peerId: CHAT })).toBeDefined();
+  });
+
+  it("a failing core does not recommend a typed answer in a group", async () => {
+    resolveOption.mockRejectedValue(new Error("gateway unavailable"));
+    const { event, answer } = pressEvent({ peerId: CHAT, eventPayload: { ocq: GQ, i: 0 } });
+    await handleVkQuestionEvent({ event, accountId: "default", runtime: runtimeEnv });
+    expect(snackbar(answer)).toBe("Не получилось передать ответ. Нажмите кнопку ещё раз");
+  });
+});
+
 describe("isVkQuestionAnswerer", () => {
   const ask = (config: Record<string, unknown>, userId: number, peerId = CHAT) =>
     isVkQuestionAnswerer({ config: config as never, accountId: "default", peerId, userId });

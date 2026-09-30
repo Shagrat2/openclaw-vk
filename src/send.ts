@@ -30,10 +30,11 @@ import {
   readVkQuestionPrompt,
   rememberVkQuestionDelivery,
   type VkQuestionPrompt,
+  withoutVkQuestionReplyGuidance,
 } from "./question.js";
 import { getVkRuntime, readVkRuntimeConfig } from "./runtime.js";
 import { vkPositiveSetting } from "./settings.js";
-import { normalizeVkTargetId } from "./send-support.js";
+import { isVkGroupPeerId, normalizeVkTargetId } from "./send-support.js";
 import type { CoreConfig, ResolvedVkAccount, VkReplyButtons } from "./types.js";
 import { readVkErrorCode, readVkErrorMessage } from "./vk-errors.js";
 export {
@@ -2046,17 +2047,22 @@ async function sendVkQuestionPayload(params: {
   opts: SendVkOptions;
 }): Promise<SendVkResult | null> {
   const runtime = await loadVkQuestionRuntime();
-  const keyboard = runtime ? buildVkQuestionKeyboard(params.question) : undefined;
   const { account, peerId } = await resolveSendTarget({
     cfg: params.opts.cfg,
     accountId: params.opts.accountId,
     to: params.to,
   });
   const accountId = account.accountId;
+  // A group chat answers by buttons only: a typed message there is never taken
+  // as an answer (see `inbound.ts`), so "Свой вариант" would lead nowhere.
+  const inGroup = isVkGroupPeerId(peerId);
+  const question = inGroup ? { ...params.question, customInput: false } : params.question;
+  const keyboard = runtime ? buildVkQuestionKeyboard(question) : undefined;
   // The turn waiting on this question moves its step draft out of the way
   // first, so the question is the last message and what follows lands below.
   await handOffVkDraftsBeforeQuestion({ accountId, peerId });
-  const chunks = prepareVkMessageChunks(params.text);
+  // Cut before chunking, so `finalize` edits the same text that went out.
+  const chunks = prepareVkMessageChunks(inGroup ? withoutVkQuestionReplyGuidance(params.text) : params.text);
   const results = await sendMessageChunksVk({
     to: params.to,
     chunks,
@@ -2066,9 +2072,9 @@ async function sendVkQuestionPayload(params: {
   const lastChunk = chunks.at(-1);
   const messageId = Number(last?.messageId);
   vkDiag("question sent", {
-    questionId: params.question.questionId,
-    options: params.question.options.length,
-    customInput: params.question.customInput,
+    questionId: question.questionId,
+    options: question.options.length,
+    customInput: question.customInput,
     keyboard: Boolean(keyboard),
     messageId: last?.messageId ?? null,
   });
@@ -2078,7 +2084,7 @@ async function sendVkQuestionPayload(params: {
   const questionId = params.question.questionId;
   // Remembered before registering: the core finalizes an already-finished
   // question synchronously inside `registerChannelDelivery`.
-  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId }, params.question);
+  rememberVkQuestionDelivery(questionId, { accountId, peerId, messageId }, question);
   runtime.registerChannelDelivery({
     questionId,
     deliveryId: `vk:${accountId}:${peerId}:${messageId}`,

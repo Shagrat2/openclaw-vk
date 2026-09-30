@@ -146,6 +146,32 @@ describe("sendPayloadVk — a question from the core", () => {
     });
   });
 
+  it("offers no 'Свой вариант' in a group chat, where a typed answer is never taken", async () => {
+    await sendPayloadVk("vk:2000000005", questionPayload(), { cfg: cfg as never });
+
+    const keyboard = sentKeyboard(0);
+    expect(keyboard.buttons.map((row: Array<{ action: { label: string } }>) => row[0].action.label)).toEqual([
+      "Сохранить",
+      "Увеличить ×2",
+    ]);
+    // Nor the core's closing line asking for a typed reply; the options stay.
+    const message = vkApi.send.mock.calls[0][0].message;
+    expect(message).toContain("2. Увеличить ×2 - до 2048");
+    expect(message).not.toContain("Reply with");
+    await questionRuntime.registrations[0].finalize("Answered: Сохранить");
+    expect(vkApi.edit.mock.calls[0][0].message).not.toContain("Reply with");
+  });
+
+  it("keeps the core's closing line in a direct chat, and an unknown last paragraph in a group", async () => {
+    await sendPayloadVk("vk:7654321", questionPayload(), { cfg: cfg as never });
+    expect(vkApi.send.mock.calls[0][0].message).toContain("Reply with the number, the option text, or your own answer.");
+
+    await sendPayloadVk("vk:2000000005", questionPayload("Какой размер?\n\nОтветьте, когда будете готовы."), {
+      cfg: cfg as never,
+    });
+    expect(vkApi.send.mock.calls[1][0].message).toContain("Ответьте, когда будете готовы.");
+  });
+
   it("moves this chat's step draft out of the way before the question goes out", async () => {
     const order: string[] = [];
     vkApi.send.mockImplementation(async () => {

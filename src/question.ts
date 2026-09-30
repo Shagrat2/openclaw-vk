@@ -192,6 +192,32 @@ function truncateLabel(text: string): string {
 }
 
 /**
+ * The core's closing line under a question prompt (`questionReplyGuidance` in
+ * the core), one per question shape. Every one of them asks for a typed reply.
+ */
+const CORE_REPLY_GUIDANCE = new Set([
+  "Reply by number or question id. Use a declared option where choices are fixed.",
+  "Reply with your answer.",
+  "Reply with comma-separated option numbers or text, or your own answer.",
+  "Reply with the number, the option text, or your own answer.",
+  "Reply with the number or option text.",
+]);
+
+/**
+ * The prompt for a group chat, where a typed message is never taken as an
+ * answer (see `inbound.ts`): without the core's closing line, which asks for
+ * one. Only a paragraph that is exactly one of those lines goes; any other
+ * text — a newer core's wording included — stays as it came.
+ */
+export function withoutVkQuestionReplyGuidance(text: string): string {
+  const cut = text.lastIndexOf("\n\n");
+  if (cut === -1 || !CORE_REPLY_GUIDANCE.has(text.slice(cut + 2).trim())) {
+    return text;
+  }
+  return text.slice(0, cut).trimEnd();
+}
+
+/**
  * The keyboard a finished question is edited with: an empty inline one, so the
  * buttons go away explicitly. VK also drops them on an edit without `keyboard`
  * (checked live on 29.09.2026), but `messages.edit` does not promise that.

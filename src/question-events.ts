@@ -54,6 +54,10 @@ const TEXT = {
   customInputSnackbar: "Напишите свой вариант ответа сообщением",
   customInputMessage: "✍️ Напишите свой вариант ответа одним сообщением.",
   failed: "Не получилось передать ответ. Ответьте текстом: номер варианта или свой ответ",
+  // A group chat takes no typed answers (see `inbound.ts`), so nothing here
+  // points to one.
+  failedInGroup: "Не получилось передать ответ. Нажмите кнопку ещё раз",
+  buttonsOnlyInGroup: "В беседе ответ принимается только кнопками",
 } as const;
 
 /** VK snackbar text limit. */
@@ -175,9 +179,17 @@ export async function handleVkQuestionEvent(params: {
     await reply(TEXT.notYours);
     return true;
   }
+  const inGroup = isVkGroupPeerId(event.peerId);
+  if (inGroup && callback.intent === "custom-input") {
+    // Not offered in a group chat; a button left from an older keyboard must
+    // not ask for a typed answer that would never be taken.
+    await reply(TEXT.buttonsOnlyInGroup);
+    return true;
+  }
+  const failedText = inGroup ? TEXT.failedInGroup : TEXT.failed;
   const questionRuntime = await loadVkQuestionRuntime();
   if (!questionRuntime) {
-    await reply(TEXT.failed);
+    await reply(failedText);
     return true;
   }
 
@@ -220,7 +232,7 @@ export async function handleVkQuestionEvent(params: {
     }
   } catch (error) {
     runtime.error?.(`vk: question ${questionId} answer failed: ${String(error)}`);
-    await reply(TEXT.failed);
+    await reply(failedText);
     return true;
   }
 }
