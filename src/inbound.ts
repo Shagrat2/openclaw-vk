@@ -626,7 +626,11 @@ export async function handleVkInbound(params: {
       isDirect: !isGroup,
       isGroup,
       isMentionableGroup: isGroup,
-      requireMention: Boolean(requireMention),
+      // As Telegram and Discord pass it: a group that requires a mention still
+      // acks a control command that got in without one (an unauthorized one was
+      // dropped above). `group-mentions` stays "messages that mention the bot",
+      // also in groups that do not require a mention.
+      shouldBypassMention: isGroup && requireMention && !wasMentioned && hasControlCommand,
       canDetectMention: true,
       effectiveWasMentioned: isGroup ? wasMentioned : false,
     });
