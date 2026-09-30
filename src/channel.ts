@@ -396,6 +396,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
           accountId: accountId ?? undefined,
           replyTo: replyToId ?? undefined,
         });
+        logVkOutbound("sendMedia", to, { textLen: text?.length ?? 0, media: false, messageId: textOnly.messageId });
         return { channel: "vk", ...textOnly };
       }
       const result = await sendFormattedMediaVk(to, text, mediaUrl, {

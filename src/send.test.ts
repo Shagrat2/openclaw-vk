@@ -722,6 +722,33 @@ describe("sendPhotoVk", () => {
     );
   });
 
+  it("drops a photo answer's `photo` and 32-character `hash` by name, even at full", async () => {
+    // The review's input: `hash` is 32 characters, under the length cutoff, and
+    // photos.save takes it together with `photo` and `server`.
+    const hash = "0123456789abcdef0123456789abcdef";
+    mockUploadServerPost.mockReset().mockResolvedValue({ server: 1, photo: '[{"p":"SYNTH"}]', hash });
+    mockUploadPhoto.mockReset().mockImplementation(async function (this: {
+      upload: (url: string, options: object) => Promise<unknown>;
+    }) {
+      await this.upload("https://upload.vk.example/photo", {});
+      throw Object.assign(new Error("Code №100 - photo is undefined"), { code: 100 });
+    });
+    process.env.VK_DIAG_LEVEL = "full";
+    try {
+      await expect(sendPhotoVk("123", Buffer.from("png"), undefined, { cfg })).rejects.toThrow();
+    } finally {
+      delete process.env.VK_DIAG_LEVEL;
+    }
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(fields).toMatchObject({
+      uploadHasPayload: true,
+      uploadAnswer: '{"server":1,"photo":"<redacted, 15 chars>","hash":"<redacted, 32 chars>"}',
+    });
+    expect(JSON.stringify(fields)).not.toContain(hash);
+    expect(JSON.stringify(fields)).not.toContain("SYNTH");
+  });
+
   it("measures an on-disk file of a failed upload even with diagnostics off", async () => {
     // Failures are logged at every level, and the byte count is a safe field: it
     // tells an empty render from a complete one. Buffers always carried it, files
@@ -818,7 +845,7 @@ describe("sendDocumentVk", () => {
       throw Object.assign(new Error("Code №100 - file is undefined"), { code: 100 });
     };
 
-  it("shows a long value of the upload server's answer by its length, even at full", async () => {
+  it("drops a long `file` from the upload server's answer by name, even at full", async () => {
     // A successful answer carries the one-time `file` blob for docs.save; when the
     // save call fails, the whole answer is in the trace. The blob must not reach
     // the log at any level.
@@ -836,11 +863,52 @@ describe("sendDocumentVk", () => {
     const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
     const answer = String((fields as { uploadAnswer?: unknown }).uploadAnswer);
     expect(fields).toMatchObject({ uploadPost: "answered", uploadHasPayload: true, uploadKeys: ["file"] });
-    expect(answer).toContain("<300 chars>");
+    expect(answer).toContain("<redacted, 300 chars>");
     expect(answer).not.toContain("x".repeat(65));
   });
 
-  it("names an answer that is not an object by its type, and keeps its text for full", async () => {
+  it("shows another long value of the upload server's answer by its length at full", async () => {
+    process.env.VK_DIAG_LEVEL = "full";
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset();
+    mockUploadDocument
+      .mockReset()
+      .mockImplementation(postThenFileUndefined({ error: "ERR_UPLOAD_FILE", note: "y".repeat(300), short: "ok" }));
+    try {
+      await expect(sendDocumentVk("456", Buffer.from("pdf"), "a.pdf", undefined, { cfg })).rejects.toThrow();
+    } finally {
+      delete process.env.VK_DIAG_LEVEL;
+    }
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(fields).toMatchObject({
+      uploadAnswer: '{"error":"ERR_UPLOAD_FILE","note":"<300 chars>","short":"ok"}',
+    });
+  });
+
+  it("drops a short `file` from the upload server's answer by name, even at full", async () => {
+    // The review's input: a length cutoff let a short credential through.
+    process.env.VK_DIAG_LEVEL = "full";
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset();
+    mockUploadDocument
+      .mockReset()
+      .mockImplementation(postThenFileUndefined({ file: "SYNTHETIC_FILE", note: "kept" }));
+    try {
+      await expect(sendDocumentVk("456", Buffer.from("pdf"), "a.pdf", undefined, { cfg })).rejects.toThrow();
+    } finally {
+      delete process.env.VK_DIAG_LEVEL;
+    }
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(fields).toMatchObject({
+      uploadHasPayload: true,
+      uploadAnswer: '{"file":"<redacted, 14 chars>","note":"kept"}',
+    });
+    expect(JSON.stringify(fields)).not.toContain("SYNTHETIC_FILE");
+  });
+
+  it("names an answer that is not an object by its type, and hides its text below full", async () => {
     mockUploadLogger.error.mockClear();
     mockUploadServerPost.mockReset();
     mockUploadDocument.mockReset().mockImplementation(postThenFileUndefined("upstream refused /srv/doc"));
@@ -854,6 +922,24 @@ describe("sendDocumentVk", () => {
       uploadAnswer: "<text>",
     });
     expect(JSON.stringify(fields)).not.toContain("/srv/doc");
+  });
+
+  it("logs an answer that is a string by its length only, even at full", async () => {
+    // vk-io hands a non-object answer to the save call as it is: the string is
+    // the credential, with no field name to drop it by.
+    process.env.VK_DIAG_LEVEL = "full";
+    mockUploadLogger.error.mockClear();
+    mockUploadServerPost.mockReset();
+    mockUploadDocument.mockReset().mockImplementation(postThenFileUndefined("SYNTHETIC_UPLOAD_STRING"));
+    try {
+      await expect(sendDocumentVk("456", Buffer.from("pdf"), "a.pdf", undefined, { cfg })).rejects.toThrow();
+    } finally {
+      delete process.env.VK_DIAG_LEVEL;
+    }
+
+    const [, fields] = mockUploadLogger.error.mock.calls.at(-1) ?? [];
+    expect(fields).toMatchObject({ uploadAnswerType: "string", uploadAnswer: "<23 chars>" });
+    expect(JSON.stringify(fields)).not.toContain("SYNTHETIC");
   });
 
   it("does not describe a later attempt with an earlier attempt's answer", async () => {

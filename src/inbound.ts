@@ -32,7 +32,7 @@ import {
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/runtime-group-policy";
 import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
-import { redactVkId, vkDiag } from "./diagnostics.js";
+import { redactVkErrorText, redactVkId, vkDiag } from "./diagnostics.js";
 import { renderVkMarkdownChunks } from "./format.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
@@ -558,7 +558,7 @@ export async function handleVkInbound(params: {
     // including when only a long answer's tail failed after the edited draft
     // was sent. Its error callback must also decide the final reaction.
     dispatchError = true;
-    runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
+    runtime.error?.(`vk ${info.kind} reply failed: ${redactVkErrorText(err)}`);
   };
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
@@ -1013,7 +1013,7 @@ export async function handleVkInbound(params: {
                       }
                     }
                   } catch (err) {
-                    runtime.error?.(`vk: step-progress answer tail failed: ${String(err)}`);
+                    runtime.error?.(`vk: step-progress answer tail failed: ${redactVkErrorText(err)}`);
                     throw err;
                   }
                   return;

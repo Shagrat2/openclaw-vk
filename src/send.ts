@@ -366,8 +366,24 @@ function traceVkUploadServer(upload: VkUploader, trace: VkUploadServerTrace): Vk
   }) as VkUploader;
 }
 
-/** Longer values in the upload server's answer are logged by length: a file token is one of them. */
+/** Longer values in the upload server's answer are logged by length. */
 const UPLOAD_ANSWER_VALUE_SHOWN = 64;
+
+/**
+ * Fields of the upload server's answer that the save call takes as credentials.
+ * Their values are dropped by name, whatever their length: `hash` is 32
+ * characters and a `file` can be short, so a length cutoff lets both through.
+ */
+const UPLOAD_ANSWER_SECRET_FIELDS = new Set(["file", "photo", "hash"]);
+
+function redactVkUploadAnswerValue(key: string, value: unknown): unknown {
+  if (UPLOAD_ANSWER_SECRET_FIELDS.has(key)) {
+    return typeof value === "string" ? `<redacted, ${value.length} chars>` : "<redacted>";
+  }
+  return typeof value === "string" && value.length > UPLOAD_ANSWER_VALUE_SHOWN
+    ? `<${value.length} chars>`
+    : value;
+}
 
 /**
  * The upload server's answer as log fields. `payloadField` is what the save call
@@ -387,7 +403,9 @@ function describeVkUploadServerAnswer(
     return {
       uploadPost: "answered",
       uploadAnswerType: Array.isArray(response) ? "array" : typeof response,
-      uploadAnswer: typeof response === "string" ? response : undefined,
+      // vk-io hands a non-object answer to the save call as it is: a string
+      // here is the credential itself, with no field name to drop it by.
+      uploadAnswer: typeof response === "string" ? `<${response.length} chars>` : undefined,
     };
   }
   const record = response as Record<string, unknown>;
@@ -397,11 +415,7 @@ function describeVkUploadServerAnswer(
     uploadKeys: Object.keys(record).slice(0, 16),
     uploadHasPayload: payload !== undefined && payload !== null && payload !== "",
     uploadError: typeof record.error === "string" ? record.error : undefined,
-    uploadAnswer: JSON.stringify(record, (_key, value: unknown) =>
-      typeof value === "string" && value.length > UPLOAD_ANSWER_VALUE_SHOWN
-        ? `<${value.length} chars>`
-        : value,
-    ),
+    uploadAnswer: JSON.stringify(record, redactVkUploadAnswerValue),
   };
 }
 

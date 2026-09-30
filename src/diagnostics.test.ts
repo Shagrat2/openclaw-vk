@@ -642,7 +642,7 @@ describe("VK diagnostics levels", () => {
       mediaUrl: "/srv/media/a.jpg",
       token: "vk1.a.<redacted>",
       url: "https://api.vk.com/method/photos.save?access_token=<redacted>&v=5.199",
-      signed: "https://cdn.example.org/a.jpg?expires=1750000000&sig=abc",
+      signed: "https://cdn.example.org/a.jpg?expires=1750000000&sig=<redacted>",
     });
   });
 

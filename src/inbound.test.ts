@@ -2409,6 +2409,34 @@ describe("status reaction lifecycle", () => {
     expect(statusSink).toHaveBeenCalledWith({ lastOutboundAt: expect.any(Number) });
   });
 
+  it("keeps a failed upload's one-time keys out of the reply-failed line, which is written at every level", async () => {
+    const runtime = installRuntime();
+    const runtimeEnv = createVkRuntimeEnv();
+    const errorSpy = vi.spyOn(runtimeEnv, "error").mockImplementation(() => {});
+    vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher).mockImplementation(
+      async ({ dispatcherOptions }: any) => {
+        dispatcherOptions.onError(
+          Object.assign(
+            new Error("request to https://pu.vk.com/c1/upload.php?hash=SYNTHETIC_HASH&rhash=SYNTHETIC_RHASH failed"),
+            { name: "FetchError" },
+          ),
+          { kind: "final" },
+        );
+      },
+    );
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: baseCfg(),
+      runtime: runtimeEnv,
+    });
+
+    const line = errorSpy.mock.calls.map(([text]) => String(text)).find((text) => text.includes("reply failed"));
+    expect(line).toContain("vk final reply failed: FetchError: request to https://pu.vk.com/c1/upload.php?hash=<redacted>");
+    expect(line).not.toContain("SYNTHETIC");
+  });
+
   it("reports dispatch and reaction cleanup failures while preserving the dispatch error", async () => {
     vi.useFakeTimers();
     try {

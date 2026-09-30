@@ -887,10 +887,13 @@ describe("outbound", () => {
       mediaUrl: "https://example.com/a.jpg",
       accountId: "default",
     } as never);
+    // `sendMedia` without a `mediaUrl` goes out as text, and is logged as sent too.
+    await vkPlugin.outbound!.sendMedia!({ cfg: {}, to: "123", text: "caption", accountId: "default" } as never);
 
     expect(mockVkDiag.mock.calls).toEqual([
       ["outbound sent", { stage: "sendText", to: "123", textLen: 5, media: false, messageId: "1" }],
       ["outbound sent", { stage: "sendFormattedMedia", to: "123", textLen: 4, media: true, messageId: "fm-1" }],
+      ["outbound sent", { stage: "sendMedia", to: "123", textLen: 7, media: false, messageId: "1" }],
     ]);
   });
 
