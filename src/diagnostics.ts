@@ -552,14 +552,25 @@ function withoutQuery(url: string): string {
   return cut === -1 ? url : `${url.slice(0, cut)}?…`;
 }
 
-/** Every address in a text, the same way: an error may name a redirect target too. */
-const URL_QUERY_RE = /\b(https?:\/\/[^\s?#'"<>]+)[?#][^\s'"<>]*/gi;
+/**
+ * Every address in a text, the same way: an error may name a redirect target too.
+ * JSON-escaped slashes (`https:\/\/`) count as well.
+ */
+const URL_QUERY_RE = /\b(https?:(?:\\?\/){2}[^\s?#'"<>]+)[?#][^\s'"<>]*/gi;
+
+/**
+ * The response body the core's media fetcher appends to an HTTP error. It is the
+ * remote server's text: an address in it may be escaped or encoded in any way,
+ * so it is logged by length only.
+ */
+const RESPONSE_BODY_RE = /; body: ([\s\S]*)$/;
 
 /**
  * A download failure for a regular log line, like `redactVkId` for an id. The
  * address is only its kind below `full`, and at `full` it loses its query; the
  * error is its class and codes below `full`, and at `full` its text with the
- * address in it cut the same way (the core's fetch errors repeat the address).
+ * address in it cut the same way (the core's fetch errors repeat the address)
+ * and the server's response body reduced to its length.
  */
 export function describeVkDownloadFailure(url: string, error: unknown): string {
   const summary = summarizeError(error);
@@ -573,7 +584,9 @@ export function describeVkDownloadFailure(url: string, error: unknown): string {
       .join(" ");
     return `${describeVkSourceKind(url)}: ${codes}`;
   }
-  const text = errorText(error).replace(URL_QUERY_RE, "$1?…");
+  const text = errorText(error)
+    .replace(RESPONSE_BODY_RE, (_match, body: string) => `; body: <${body.length} chars>`)
+    .replace(URL_QUERY_RE, "$1?…");
   return `${withoutQuery(url)}: ${summary.errorName}: ${fullText(text)}`;
 }
 

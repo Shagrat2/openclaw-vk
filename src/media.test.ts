@@ -693,6 +693,30 @@ describe("resolveVkInboundResolvedMedia", () => {
         expect(line).not.toContain(secret);
       }
     });
+
+    it("keeps the server's response body out at full, escaped addresses in it included", async () => {
+      // The review's input: the core appends the body to an HTTP error, and a
+      // JSON body escapes the slashes, which the address pattern did not match.
+      const body = '{"url":"https:\\/\\/vk.com\\/doc123_456?hash=SYNTHETIC_KEY&dl=SYNTHETIC_DL"}';
+      process.env.VK_DIAG_LEVEL = "full";
+      const logError = vi.fn();
+      await resolveVkInboundResolvedMedia({
+        attachments: [{ type: "doc", kind: "document", url: DOC_URL, mimeType: "application/pdf" }],
+        mediaRuntime: {
+          fetchRemoteMedia: vi.fn().mockRejectedValue(
+            Object.assign(new Error(`Failed to fetch media from ${DOC_URL}: HTTP 403; body: ${body}`), {
+              name: "MediaFetchError",
+              code: "http_error",
+            }),
+          ),
+          saveMediaBuffer: vi.fn(),
+        },
+        logError,
+      });
+      const line = String(logError.mock.calls[0]?.[0]);
+      expect(line).toContain(`HTTP 403; body: <${body.length} chars>`);
+      expect(line).not.toContain("SYNTHETIC");
+    });
   });
 });
 
