@@ -31,9 +31,6 @@ const secretInput = await (async () => {
     return null;
   }
 })();
-// The zod schema imports the SDK statically, so it is loaded only once the SDK
-// is known to be there — otherwise its own import fails the whole file.
-const configSchema = secretInput ? await import("./config-schema.js") : null;
 
 const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
 
@@ -153,8 +150,10 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
 
   it("takes exactly the file and exec ids the host takes, at either level", () => {
     // The review's input: any string passed, and the gateway then threw while
-    // resolving secrets. The host's schema decides; the manifest and the zod
-    // schema must agree with it on every case.
+    // resolving secrets. The host's schema decides; the manifest must agree with
+    // it on every case. The zod schema is pinned by the same cases in
+    // `config-schema.test.ts`: comparing it here would mix the plugin's zod with
+    // the host's, which CI installs separately.
     expect(secretInput).not.toBeNull();
     const hostSchema = secretInput!.buildSecretInputSchema();
     const ids = [
@@ -169,7 +168,6 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
         const label = `${source} ${JSON.stringify(id)}`;
         expect(validate({ token }), label).toBe(expected);
         expect(validate({ accounts: { work: { token } } }), label).toBe(expected);
-        expect(configSchema!.VkConfigSchema.safeParse({ token }).success, label).toBe(expected);
       }
     }
   });

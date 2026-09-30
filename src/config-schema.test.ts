@@ -341,6 +341,28 @@ describe("token as a SecretRef", () => {
     }
   });
 
+  it("gives the host's verdict on every id the manifest test runs through the host", () => {
+    // The verdicts of the host's `buildSecretInputSchema` (2026.9.7) on the ids
+    // in `manifest.sdk.test.ts`, which pins the manifest to the host directly.
+    const ids = [
+      "relative", "/bad~escape", "", "value", "/vk/token", "/a~0b/~1c", "/", "//",
+      "../token", "vault/./key", "vault/..", "./x", "vault/openai/api-key", "aws/secret#json_key",
+      "a..b/c.d", "-lead", "a b", `a${"b".repeat(255)}`, `a${"b".repeat(256)}`,
+    ];
+    const accepted: Record<string, string[]> = {
+      file: ["value", "/vk/token", "/a~0b/~1c", "/", "//"],
+      exec: ["relative", "value", "vault/openai/api-key", "aws/secret#json_key", "a..b/c.d", `a${"b".repeat(255)}`],
+    };
+    for (const source of ["file", "exec"]) {
+      for (const id of ids) {
+        const token = { source, provider: "p", id };
+        const expected = accepted[source]!.includes(id);
+        expect(ok(token), `${source} ${JSON.stringify(id)}`).toBe(expected);
+        expect(VkConfigSchema.safeParse({ accounts: { work: { token } } }).success, `${source} ${id}`).toBe(expected);
+      }
+    }
+  });
+
   it("accepts a reference in a named account", () => {
     const result = VkConfigSchema.safeParse({
       accounts: { work: { token: { source: "exec", provider: "openclaw-keychain", id: "vk-work" } } },
