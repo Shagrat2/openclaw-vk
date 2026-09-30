@@ -90,8 +90,34 @@ type Terminal =
   | { status: "cancelled" };
 
 type ChannelRuntime = {
-  handleRequested: (record: unknown) => void;
+  handleRequested: (record: unknown, scheduler: QuestionScheduler) => void;
   handleResolved: (event: unknown) => void;
+};
+
+/**
+ * The scheduler the gateway hands the channel runtime with each request. From
+ * 2026.9.7 `handleResolved` schedules the entry's cleanup through it and throws
+ * without one; earlier cores ignore the argument.
+ */
+type QuestionScheduler = {
+  schedule: (job: { id: string; delayMs: number; run: () => void }) => { cancel: () => void };
+};
+const scheduledCleanups = new Set<ReturnType<typeof setTimeout>>();
+const questionScheduler: QuestionScheduler = {
+  schedule: ({ delayMs, run }) => {
+    const timer = setTimeout(() => {
+      scheduledCleanups.delete(timer);
+      run();
+    }, delayMs);
+    timer.unref?.();
+    scheduledCleanups.add(timer);
+    return {
+      cancel: () => {
+        clearTimeout(timer);
+        scheduledCleanups.delete(timer);
+      },
+    };
+  },
 };
 
 function channelRuntime(): ChannelRuntime {
@@ -136,7 +162,7 @@ const gateway = {
         const record = { id: params.id, status: "pending", questions: params.questions };
         const timer = setTimeout(() => gateway.finish(params.id, { status: "expired" }), params.timeoutMs);
         gateway.store.set(params.id, { record, settle, done, timer });
-        channelRuntime().handleRequested(record);
+        channelRuntime().handleRequested(record, questionScheduler);
         return { id: params.id };
       }
       case "question.waitAnswer":
@@ -298,6 +324,10 @@ describe.skipIf(!sdk)("stand: a question from the core through VK", () => {
     for (const stored of gateway.store.values()) {
       clearTimeout(stored.timer);
     }
+    for (const timer of scheduledCleanups) {
+      clearTimeout(timer);
+    }
+    scheduledCleanups.clear();
     gateway.store.clear();
     sdk!.question.clearVkQuestionDeliveries();
     sdk!.question.resetVkQuestionRuntimeForTest();
