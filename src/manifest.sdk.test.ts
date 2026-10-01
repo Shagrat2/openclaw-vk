@@ -21,6 +21,17 @@ const Ajv = (() => {
   }
 })();
 
+// The host's own SecretRef schema, as the oracle for the id grammars below.
+const secretInput = await (async () => {
+  try {
+    require.resolve("openclaw/plugin-sdk/secret-input");
+    const specifier = "openclaw/plugin-sdk/secret-input";
+    return (await import(/* @vite-ignore */ specifier)) as typeof import("openclaw/plugin-sdk/secret-input");
+  } catch {
+    return null;
+  }
+})();
+
 const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
 
 describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
@@ -121,5 +132,43 @@ describe.skipIf(!Ajv)("openclaw.plugin.json channel config schema", () => {
     // The root stays open: tightening it would fail existing configs on keys the
     // manifest has never listed.
     expect(validate({ textChunkLimit: 3000, accounts: { work: { token: "tok", dmPolicy: "open" } } })).toBe(true);
+  });
+  it("accepts the token as a string or a SecretRef, at channel level and under an account", () => {
+    const ref = { source: "exec", provider: "openclaw-keychain", id: "vk-group-token" };
+    for (const token of ["tok", ref, { source: "env", provider: "default", id: "VK_GROUP_TOKEN" }]) {
+      expect(validate({ token })).toBe(true);
+      expect(validate({ accounts: { work: { token } } })).toBe(true);
+    }
+  });
+
+  it("rejects a malformed SecretRef token, at either level", () => {
+    for (const token of [{ source: "exec" }, { source: "exec", provider: "p", id: "x", extra: 1 }, 42]) {
+      expect(validate({ token })).toBe(false);
+      expect(validate({ accounts: { work: { token } } })).toBe(false);
+    }
+  });
+
+  it("takes exactly the file and exec ids the host takes, at either level", () => {
+    // The review's input: any string passed, and the gateway then threw while
+    // resolving secrets. The host's schema decides; the manifest must agree with
+    // it on every case. The zod schema is pinned by the same cases in
+    // `config-schema.test.ts`: comparing it here would mix the plugin's zod with
+    // the host's, which CI installs separately.
+    expect(secretInput).not.toBeNull();
+    const hostSchema = secretInput!.buildSecretInputSchema();
+    const ids = [
+      "relative", "/bad~escape", "", "value", "/vk/token", "/a~0b/~1c", "/", "//",
+      "../token", "vault/./key", "vault/..", "./x", "vault/openai/api-key", "aws/secret#json_key",
+      "a..b/c.d", "-lead", "a b", `a${"b".repeat(255)}`, `a${"b".repeat(256)}`,
+    ];
+    for (const source of ["file", "exec"]) {
+      for (const id of ids) {
+        const token = { source, provider: "p", id };
+        const expected = hostSchema.safeParse(token).success;
+        const label = `${source} ${JSON.stringify(id)}`;
+        expect(validate({ token }), label).toBe(expected);
+        expect(validate({ accounts: { work: { token } } }), label).toBe(expected);
+      }
+    }
   });
 });
