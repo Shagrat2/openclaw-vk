@@ -2,6 +2,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (must be before channel.ts import) ─────────────────────────────
 
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
+}));
+
 vi.mock("openclaw/plugin-sdk/channel-config-helpers", () => ({
   adaptScopedAccountAccessor:
     (accessor: (params: Record<string, unknown>) => unknown) =>
@@ -144,6 +149,12 @@ const mockGetVkRuntime = vi.hoisted(() =>
   }),
 );
 vi.mock("./runtime.js", () => ({ getVkRuntime: mockGetVkRuntime }));
+
+const mockVkDiag = vi.hoisted(() => vi.fn());
+vi.mock("./diagnostics.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./diagnostics.js")>()),
+  vkDiag: mockVkDiag,
+}));
 
 const mockResolveVkAccount = vi.hoisted(() =>
   vi.fn().mockReturnValue({
@@ -863,6 +874,27 @@ describe("outbound", () => {
       }),
     );
     expect(result.channel).toBe("vk");
+  });
+
+  it("logs one line per core-routed send, which the inbound deliver log never sees", async () => {
+    mockVkDiag.mockClear();
+
+    await vkPlugin.outbound!.sendText({ cfg: {}, to: "123", text: "hello", accountId: "default" } as never);
+    await vkPlugin.outbound!.sendFormattedMedia({
+      cfg: {},
+      to: "123",
+      text: "look",
+      mediaUrl: "https://example.com/a.jpg",
+      accountId: "default",
+    } as never);
+    // `sendMedia` without a `mediaUrl` goes out as text, and is logged as sent too.
+    await vkPlugin.outbound!.sendMedia!({ cfg: {}, to: "123", text: "caption", accountId: "default" } as never);
+
+    expect(mockVkDiag.mock.calls).toEqual([
+      ["outbound sent", { stage: "sendText", to: "123", textLen: 5, media: false, messageId: "1" }],
+      ["outbound sent", { stage: "sendFormattedMedia", to: "123", textLen: 4, media: true, messageId: "fm-1" }],
+      ["outbound sent", { stage: "sendMedia", to: "123", textLen: 7, media: false, messageId: "1" }],
+    ]);
   });
 
   it("sendText delegates plain text delivery directly to VK", async () => {

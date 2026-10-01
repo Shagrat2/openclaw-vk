@@ -118,6 +118,14 @@ const TOKEN_FIELDS = new Set([
   "status",
   "errorName",
   "errno",
+  // The upload server's answer (send.ts): how far the POST got
+  // (`not-started` / `failed` / `answered`), its keys (field names), its error a
+  // code such as `ERR_UPLOAD_FILE`, its type `object` / `string`. The answer's
+  // text itself (`uploadAnswer`) is not here and stays `full`-only.
+  "uploadPost",
+  "uploadKeys",
+  "uploadError",
+  "uploadAnswerType",
 ]);
 const TOKEN_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MIME_RE = /^[a-z]+\/[a-z0-9.+-]{1,63}$/i;
@@ -179,10 +187,14 @@ const DATA_URI_START_RE = new RegExp(
  * assignments, JSON secret fields and CLI flags, and leaves a credential in a
  * URL's query string (`?access_token=…`) and a bare VK token (`vk1.a.…`) as they
  * are. Both can appear in an error thrown by vk-io, so they are stripped here.
+ * VK's one-time keys count too: an upload server address carries `hash` and
+ * `rhash`, and node-fetch repeats the address in a failed request's message;
+ * a document link carries `hash` and `dl`. `sig` is cut by the core's redactor
+ * from 2026.9 on but not by 2026.8, the oldest core this plugin supports.
  */
 const VK_TOKEN_RE = /\bvk1\.a\.[A-Za-z0-9_-]{8,}/g;
 const CREDENTIAL_QUERY_RE =
-  /([?&](?:access_token|token|secret|client_secret|api_key|apikey|key|password|passwd)=)[^&\s'"<>]+/gi;
+  /([?&](?:access_token|token|secret|client_secret|api_key|apikey|key|password|passwd|hash|rhash|dl|sig)=)[^&\s'"<>]+/gi;
 
 function isVkDiagLevel(value: unknown): value is VkDiagLevel {
   return VK_DIAG_LEVELS.includes(value as VkDiagLevel);
@@ -527,6 +539,16 @@ function emit(event: string, fields: Record<string, unknown>, failure: boolean):
   } else {
     logger.info(event, fields);
   }
+}
+
+/**
+ * An error for a plain log line written at every level (`runtime.error`), not
+ * through the diagnostics: its text without secrets and attachment contents,
+ * the way `full` shows it. A failed upload's error repeats the upload server
+ * address with its one-time keys.
+ */
+export function redactVkErrorText(error: unknown): string {
+  return fullText(String(error));
 }
 
 /**
