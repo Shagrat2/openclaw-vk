@@ -31,7 +31,7 @@ import {
   warnMissingProviderGroupPolicyFallbackOnce,
 } from "openclaw/plugin-sdk/runtime-group-policy";
 import { evaluateSupplementalContextVisibility } from "openclaw/plugin-sdk/security-runtime";
-import { redactVkId, vkDiag } from "./diagnostics.js";
+import { redactVkErrorText, redactVkId, vkDiag } from "./diagnostics.js";
 import { renderVkMarkdownChunks } from "./format.js";
 import { resolveVkButtonsFromPayload, resolveVkCommandFromPayload } from "./keyboard.js";
 import {
@@ -285,7 +285,7 @@ export async function handleVkInbound(params: {
     // Only reachable when every forward was hidden: the empty-message check above
     // already let this one through. Say so, without naming the hidden authors.
     runtime.log?.(
-      `vk: drop group peerId=${message.peerId} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
+      `vk: drop group peerId=${redactVkId(message.peerId)} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
     );
     return;
   }
@@ -296,16 +296,16 @@ export async function handleVkInbound(params: {
     if ("reason" in admission) {
       runtime.log?.(
         admission.reason === "chat-disabled"
-          ? `vk: drop group peerId=${message.peerId} (group disabled by config)`
+          ? `vk: drop group peerId=${redactVkId(message.peerId)} (group disabled by config)`
           : admission.reason === "policy-disabled"
-            ? `vk: drop group peerId=${message.peerId} (groupPolicy=${groupPolicy})`
-            : `vk: drop group sender ${senderDisplay} (groupPolicy=allowlist)`,
+            ? `vk: drop group peerId=${redactVkId(message.peerId)} (groupPolicy=${groupPolicy})`
+            : `vk: drop group sender ${redactVkId(message.senderId)} (groupPolicy=allowlist)`,
       );
       return;
     }
   } else {
     if (dmPolicy === "disabled") {
-      runtime.log?.(`vk: drop DM sender=${senderDisplay} (dmPolicy=disabled)`);
+      runtime.log?.(`vk: drop DM sender=${redactVkId(message.senderId)} (dmPolicy=disabled)`);
       return;
     }
     if (dmPolicy !== "open") {
@@ -328,11 +328,11 @@ export async function handleVkInbound(params: {
               });
             },
             onReplyError: (err) => {
-              runtime.error?.(`vk: pairing reply failed for ${senderDisplay}: ${String(err)}`);
+              runtime.error?.(`vk: pairing reply failed for ${redactVkId(message.senderId)}: ${String(err)}`);
             },
           });
         }
-        runtime.log?.(`vk: drop DM sender ${senderDisplay} (dmPolicy=${dmPolicy})`);
+        runtime.log?.(`vk: drop DM sender ${redactVkId(message.senderId)} (dmPolicy=${dmPolicy})`);
         return;
       }
     }
@@ -373,7 +373,7 @@ export async function handleVkInbound(params: {
       log: (line) => runtime.log?.(line),
       channel: CHANNEL_ID,
       reason: "control command (unauthorized)",
-      target: senderDisplay,
+      target: redactVkId(message.senderId),
     });
     return;
   }
@@ -387,7 +387,7 @@ export async function handleVkInbound(params: {
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
   if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
-    runtime.log?.(`vk: drop group peerId=${message.peerId} (mention required)`);
+    runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (mention required)`);
     return;
   }
 
@@ -551,7 +551,7 @@ export async function handleVkInbound(params: {
     // including when only a long answer's tail failed after the edited draft
     // was sent. Its error callback must also decide the final reaction.
     dispatchError = true;
-    runtime.error?.(`vk ${info.kind} reply failed: ${String(err)}`);
+    runtime.error?.(`vk ${info.kind} reply failed: ${redactVkErrorText(err)}`);
   };
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
@@ -561,7 +561,7 @@ export async function handleVkInbound(params: {
       logTypingFailure({
         log: (line) => runtime.log?.(line),
         channel: CHANNEL_ID,
-        target: String(message.peerId),
+        target: redactVkId(message.peerId),
         error: err,
       });
     },
@@ -594,7 +594,7 @@ export async function handleVkInbound(params: {
     await markMessageReadVk(String(message.peerId), message.messageId, account);
   } catch (err) {
     runtime.log?.(
-      `vk: mark read failed for peerId=${message.peerId} messageId=${message.messageId}: ${String(err)}`,
+      `vk: mark read failed for peerId=${redactVkId(message.peerId)} messageId=${redactVkId(message.messageId)}: ${String(err)}`,
     );
   }
 
@@ -651,7 +651,7 @@ export async function handleVkInbound(params: {
       emojiOverrides: statusReactionsCfg?.emojis,
       timing: statusReactionsCfg?.timing,
       onError: (err) => {
-        runtime.log?.(`vk: status-reaction error for cmid=${message.conversationMessageId}: ${String(err)}`);
+        runtime.log?.(`vk: status-reaction error for cmid=${redactVkId(message.conversationMessageId)}: ${String(err)}`);
       },
     });
     void statusReactions.setQueued();
@@ -995,7 +995,7 @@ export async function handleVkInbound(params: {
                   // at the end of the turn cannot delete it.
                   progressDraft.detach();
                   runtime.log?.(
-                    `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
+                    `vk: step-progress draft edited INTO final msgId=${redactVkId(draftMsgId)} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
                   // The answer's head is out: the draft now carries it.
                   statusSink?.({ lastOutboundAt: Date.now() });
@@ -1043,7 +1043,7 @@ export async function handleVkInbound(params: {
                       }
                     }
                   } catch (err) {
-                    runtime.error?.(`vk: step-progress answer tail failed: ${String(err)}`);
+                    runtime.error?.(`vk: step-progress answer tail failed: ${redactVkErrorText(err)}`);
                     throw err;
                   }
                   return;

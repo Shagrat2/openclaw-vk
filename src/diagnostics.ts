@@ -118,6 +118,14 @@ const TOKEN_FIELDS = new Set([
   "status",
   "errorName",
   "errno",
+  // The upload server's answer (send.ts): how far the POST got
+  // (`not-started` / `failed` / `answered`), its keys (field names), its error a
+  // code such as `ERR_UPLOAD_FILE`, its type `object` / `string`. The answer's
+  // text itself (`uploadAnswer`) is not here and stays `full`-only.
+  "uploadPost",
+  "uploadKeys",
+  "uploadError",
+  "uploadAnswerType",
 ]);
 const TOKEN_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MIME_RE = /^[a-z]+\/[a-z0-9.+-]{1,63}$/i;
@@ -179,10 +187,14 @@ const DATA_URI_START_RE = new RegExp(
  * assignments, JSON secret fields and CLI flags, and leaves a credential in a
  * URL's query string (`?access_token=…`) and a bare VK token (`vk1.a.…`) as they
  * are. Both can appear in an error thrown by vk-io, so they are stripped here.
+ * VK's one-time keys count too: an upload server address carries `hash` and
+ * `rhash`, and node-fetch repeats the address in a failed request's message;
+ * a document link carries `hash` and `dl`. `sig` is cut by the core's redactor
+ * from 2026.9 on but not by 2026.8, the oldest core this plugin supports.
  */
 const VK_TOKEN_RE = /\bvk1\.a\.[A-Za-z0-9_-]{8,}/g;
 const CREDENTIAL_QUERY_RE =
-  /([?&](?:access_token|token|secret|client_secret|api_key|apikey|key|password|passwd)=)[^&\s'"<>]+/gi;
+  /([?&](?:access_token|token|secret|client_secret|api_key|apikey|key|password|passwd|hash|rhash|dl|sig)=)[^&\s'"<>]+/gi;
 
 function isVkDiagLevel(value: unknown): value is VkDiagLevel {
   return VK_DIAG_LEVELS.includes(value as VkDiagLevel);
@@ -530,6 +542,16 @@ function emit(event: string, fields: Record<string, unknown>, failure: boolean):
 }
 
 /**
+ * An error for a plain log line written at every level (`runtime.error`), not
+ * through the diagnostics: its text without secrets and attachment contents,
+ * the way `full` shows it. A failed upload's error repeats the upload server
+ * address with its one-time keys.
+ */
+export function redactVkErrorText(error: unknown): string {
+  return fullText(String(error));
+}
+
+/**
  * An identifier for a regular log line.
  *
  * Not everything in the plugin goes through `vkDiag`: some messages are not
@@ -544,6 +566,50 @@ export function redactVkId(value: string | number | undefined | null): string {
     return "-";
   }
   return resolveVkDiagLevel() === "full" ? String(value) : redactIdentifier(String(value));
+}
+
+/** An address without its query and fragment: VK puts one-time keys there (`hash=`, `dl=`). */
+function withoutQuery(url: string): string {
+  const cut = url.search(/[?#]/);
+  return cut === -1 ? url : `${url.slice(0, cut)}?…`;
+}
+
+/**
+ * Every address in a text, the same way: an error may name a redirect target too.
+ * JSON-escaped slashes (`https:\/\/`) count as well.
+ */
+const URL_QUERY_RE = /\b(https?:(?:\\?\/){2}[^\s?#'"<>]+)[?#][^\s'"<>]*/gi;
+
+/**
+ * The response body the core's media fetcher appends to an HTTP error. It is the
+ * remote server's text: an address in it may be escaped or encoded in any way,
+ * so it is logged by length only.
+ */
+const RESPONSE_BODY_RE = /; body: ([\s\S]*)$/;
+
+/**
+ * A download failure for a regular log line, like `redactVkId` for an id. The
+ * address is only its kind below `full`, and at `full` it loses its query; the
+ * error is its class and codes below `full`, and at `full` its text with the
+ * address in it cut the same way (the core's fetch errors repeat the address)
+ * and the server's response body reduced to its length.
+ */
+export function describeVkDownloadFailure(url: string, error: unknown): string {
+  const summary = summarizeError(error);
+  const record = error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+  if (resolveVkDiagLevel() !== "full") {
+    // The core's media errors carry a word code (`http_error`, `fetch_failed`).
+    const code =
+      typeof record?.code === "string" && TOKEN_RE.test(record.code) ? record.code : undefined;
+    const codes = [summary.errorName, summary.vkCode ?? undefined, code ?? summary.errno]
+      .filter((part) => part !== undefined)
+      .join(" ");
+    return `${describeVkSourceKind(url)}: ${codes}`;
+  }
+  const text = errorText(error)
+    .replace(RESPONSE_BODY_RE, (_match, body: string) => `; body: <${body.length} chars>`)
+    .replace(URL_QUERY_RE, "$1?…");
+  return `${withoutQuery(url)}: ${summary.errorName}: ${fullText(text)}`;
 }
 
 /** Progress. Silent at `off`; fields are redacted according to the level. */

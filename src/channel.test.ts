@@ -150,6 +150,12 @@ const mockGetVkRuntime = vi.hoisted(() =>
 );
 vi.mock("./runtime.js", () => ({ getVkRuntime: mockGetVkRuntime }));
 
+const mockVkDiag = vi.hoisted(() => vi.fn());
+vi.mock("./diagnostics.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./diagnostics.js")>()),
+  vkDiag: mockVkDiag,
+}));
+
 const mockResolveVkAccount = vi.hoisted(() =>
   vi.fn().mockReturnValue({
     accountId: "default",
@@ -166,6 +172,16 @@ vi.mock("./accounts.js", () => ({
   resolveVkAccount: mockResolveVkAccount,
   listVkAccountIds: mockListVkAccountIds,
   resolveDefaultVkAccountId: mockResolveDefaultVkAccountId,
+  describeMissingVkToken: (account: { accountId: string; tokenUnresolved?: string }) =>
+    `VK token SecretRef ${account.tokenUnresolved} for account "${account.accountId}" is not resolved`,
+}));
+
+// The contract imports SDK subpaths that CI does not install; its own tests cover it.
+const mockSecretTargetRegistryEntries = vi.hoisted(() => [{ id: "channels.vk.token" }]);
+const mockCollectRuntimeConfigAssignments = vi.hoisted(() => vi.fn());
+vi.mock("./secret-contract.js", () => ({
+  secretTargetRegistryEntries: mockSecretTargetRegistryEntries,
+  collectRuntimeConfigAssignments: mockCollectRuntimeConfigAssignments,
 }));
 
 vi.mock("./config-schema.js", () => ({
@@ -898,6 +914,27 @@ describe("outbound", () => {
     expect(result.channel).toBe("vk");
   });
 
+  it("logs one line per core-routed send, which the inbound deliver log never sees", async () => {
+    mockVkDiag.mockClear();
+
+    await vkPlugin.outbound!.sendText({ cfg: {}, to: "123", text: "hello", accountId: "default" } as never);
+    await vkPlugin.outbound!.sendFormattedMedia({
+      cfg: {},
+      to: "123",
+      text: "look",
+      mediaUrl: "https://example.com/a.jpg",
+      accountId: "default",
+    } as never);
+    // `sendMedia` without a `mediaUrl` goes out as text, and is logged as sent too.
+    await vkPlugin.outbound!.sendMedia!({ cfg: {}, to: "123", text: "caption", accountId: "default" } as never);
+
+    expect(mockVkDiag.mock.calls).toEqual([
+      ["outbound sent", { stage: "sendText", to: "123", textLen: 5, media: false, messageId: "1" }],
+      ["outbound sent", { stage: "sendFormattedMedia", to: "123", textLen: 4, media: true, messageId: "fm-1" }],
+      ["outbound sent", { stage: "sendMedia", to: "123", textLen: 7, media: false, messageId: "1" }],
+    ]);
+  });
+
   it("sendText delegates plain text delivery directly to VK", async () => {
     const result = await vkPlugin.outbound!.sendText({
       cfg: {},
@@ -1338,6 +1375,13 @@ describe("gateway", () => {
     });
   });
 
+  it("hands the core its secret contract", () => {
+    expect(vkPlugin.secrets).toEqual({
+      secretTargetRegistryEntries: mockSecretTargetRegistryEntries,
+      collectRuntimeConfigAssignments: mockCollectRuntimeConfigAssignments,
+    });
+  });
+
   describe("startAccount", () => {
     it("calls probeVkBot and monitorVkProvider", async () => {
       const setStatus = vi.fn();
@@ -1384,6 +1428,21 @@ describe("gateway", () => {
       await expect(vkPlugin.gateway!.startAccount(ctx as never)).rejects.toThrow(
         "non-empty community access token",
       );
+    });
+
+    it("refuses to start on an unresolved SecretRef and names it, without calling VK", async () => {
+      const ctx = {
+        account: { accountId: "default", token: "", tokenUnresolved: "exec:openclaw-keychain:vk-group-token" },
+        cfg: {},
+        runtime: {},
+        log: { info: vi.fn() },
+      };
+
+      await expect(vkPlugin.gateway!.startAccount(ctx as never)).rejects.toThrow(
+        'VK token SecretRef exec:openclaw-keychain:vk-group-token for account "default" is not resolved',
+      );
+      expect(mockProbeVkBot).not.toHaveBeenCalled();
+      expect(mockMonitorVkProvider).not.toHaveBeenCalled();
     });
 
     it("continues if probe fails", async () => {

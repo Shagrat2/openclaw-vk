@@ -35,6 +35,7 @@
     "dist",
     "api.ts",
     "doctor-contract-api.ts",
+    "secret-contract-api.ts",
     "index.ts",
     "setup-entry.ts",
     "openclaw.plugin.json",
@@ -61,6 +62,7 @@
     "src/runtime.ts",
     "src/sanitize.ts",
     "src/sdk-compat.ts",
+    "src/secret-contract.ts",
     "src/send-support.ts",
     "src/send.ts",
     "src/setup-core.ts",
@@ -77,7 +79,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:sdk": "vitest run src/diagnostics.sdk.test.ts src/manifest.sdk.test.ts src/inbound.draft.sdk.test.ts src/inbound.ack.sdk.test.ts src/question.stand.sdk.test.ts src/group-access.sdk.test.ts"
+    "test:sdk": "vitest run src/diagnostics.sdk.test.ts src/manifest.sdk.test.ts src/inbound.draft.sdk.test.ts src/inbound.ack.sdk.test.ts src/question.stand.sdk.test.ts src/group-access.sdk.test.ts src/secret-contract.sdk.test.ts"
   },
   "dependencies": {
     "markdown-to-vk": "^0.3.2",

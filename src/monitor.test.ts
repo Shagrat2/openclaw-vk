@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── SDK mocks (for transitive accounts.ts and runtime.ts imports) ────────────
 
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
+}));
+
 vi.mock("openclaw/plugin-sdk/core", () => ({
   DEFAULT_ACCOUNT_ID: "default",
   tryReadSecretFileSync: vi.fn(),
@@ -790,6 +795,22 @@ describe("message_new handler", () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("dispatch failed"),
     );
+  });
+
+  it("names the peer of a failed handler without its raw VK id", async () => {
+    const runtime = createVkRuntimeEnv();
+    const errorSpy = vi.spyOn(runtime, "error").mockImplementation(() => {});
+
+    mockHandleVkInbound.mockRejectedValueOnce(new Error("dispatch failed"));
+
+    activeMonitor = startMonitor({ runtime });
+    await flush();
+
+    await getMessageHandler()(makeCtx({ peerId: 123_456_789 }));
+
+    const line = String(errorSpy.mock.calls[0]?.[0]);
+    expect(line).toContain("message handler error");
+    expect(line).not.toContain("123456789");
   });
 
   it("falls back to Date.now() when createdAt is missing", async () => {

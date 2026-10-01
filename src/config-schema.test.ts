@@ -284,3 +284,89 @@ describe("VkAccountSchema transport", () => {
     expect(result.success).toBe(false);
   });
 });
+
+// ── SecretRef token ──────────────────────────────────────────────────────────
+
+describe("token as a SecretRef", () => {
+  const ok = (token: unknown) => VkConfigSchema.safeParse({ token }).success;
+
+  it("accepts a string and every reference source the host resolves", () => {
+    expect(ok("vk1.a.xxx")).toBe(true);
+    expect(ok({ source: "exec", provider: "openclaw-keychain", id: "vk-group-token" })).toBe(true);
+    expect(ok({ source: "env", provider: "default", id: "VK_GROUP_TOKEN" })).toBe(true);
+    expect(ok({ source: "store", provider: "default", id: "VK_GROUP_TOKEN" })).toBe(true);
+    expect(ok({ source: "file", provider: "secrets-file", id: "/vk/token" })).toBe(true);
+  });
+
+  it("rejects a malformed reference the host would reject too", () => {
+    expect(ok({ source: "exec" })).toBe(false);
+    expect(ok({ source: "vault", provider: "default", id: "X" })).toBe(false);
+    expect(ok({ source: "env", provider: "default", id: "lowercase" })).toBe(false);
+    expect(ok({ source: "exec", provider: "Bad Provider", id: "x" })).toBe(false);
+    expect(ok({ source: "exec", provider: "p", id: "x", extra: true })).toBe(false);
+    expect(ok(42)).toBe(false);
+  });
+
+  // The review's input: these passed the schema and then threw while the
+  // gateway resolved secrets, failing activation instead of isolating VK.
+  const BAD_IDS: Array<[string, string]> = [
+    ["file", "relative"],
+    ["file", "/bad~escape"],
+    ["file", ""],
+    ["exec", "../token"],
+    ["exec", "vault/./key"],
+    ["exec", "vault/.."],
+    ["exec", ""],
+  ];
+  const GOOD_IDS: Array<[string, string]> = [
+    ["file", "value"],
+    ["file", "/vk/token"],
+    ["file", "/a~0b/~1c"],
+    ["exec", "vault/openai/api-key"],
+    ["exec", "aws/secret#json_key"],
+    ["exec", "a..b/c.d"],
+  ];
+
+  it("rejects file and exec ids outside the host's grammar, at channel and account level", () => {
+    for (const [source, id] of BAD_IDS) {
+      const token = { source, provider: "p", id };
+      expect(ok(token), `${source} ${JSON.stringify(id)}`).toBe(false);
+      expect(VkConfigSchema.safeParse({ accounts: { work: { token } } }).success, `${source} ${id}`).toBe(false);
+    }
+  });
+
+  it("accepts file and exec ids the host resolves", () => {
+    for (const [source, id] of GOOD_IDS) {
+      expect(ok({ source, provider: "p", id }), `${source} ${id}`).toBe(true);
+    }
+  });
+
+  it("gives the host's verdict on every id the manifest test runs through the host", () => {
+    // The verdicts of the host's `buildSecretInputSchema` (2026.9.7) on the ids
+    // in `manifest.sdk.test.ts`, which pins the manifest to the host directly.
+    const ids = [
+      "relative", "/bad~escape", "", "value", "/vk/token", "/a~0b/~1c", "/", "//",
+      "../token", "vault/./key", "vault/..", "./x", "vault/openai/api-key", "aws/secret#json_key",
+      "a..b/c.d", "-lead", "a b", `a${"b".repeat(255)}`, `a${"b".repeat(256)}`,
+    ];
+    const accepted: Record<string, string[]> = {
+      file: ["value", "/vk/token", "/a~0b/~1c", "/", "//"],
+      exec: ["relative", "value", "vault/openai/api-key", "aws/secret#json_key", "a..b/c.d", `a${"b".repeat(255)}`],
+    };
+    for (const source of ["file", "exec"]) {
+      for (const id of ids) {
+        const token = { source, provider: "p", id };
+        const expected = accepted[source]!.includes(id);
+        expect(ok(token), `${source} ${JSON.stringify(id)}`).toBe(expected);
+        expect(VkConfigSchema.safeParse({ accounts: { work: { token } } }).success, `${source} ${id}`).toBe(expected);
+      }
+    }
+  });
+
+  it("accepts a reference in a named account", () => {
+    const result = VkConfigSchema.safeParse({
+      accounts: { work: { token: { source: "exec", provider: "openclaw-keychain", id: "vk-work" } } },
+    });
+    expect(result.success).toBe(true);
+  });
+});

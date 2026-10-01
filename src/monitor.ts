@@ -6,6 +6,7 @@ import { globalAgent } from "node:https";
 import { PollingTransport, VK } from "vk-io";
 import { createStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { resolveVkAccount } from "./accounts.js";
+import { redactVkId } from "./diagnostics.js";
 import { handleVkInbound } from "./inbound.js";
 import {
   extractVkInboundAttachments,
@@ -374,7 +375,7 @@ export async function monitorVkProvider(opts: VkMonitorOptions): Promise<void> {
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      opts.runtime.error?.(`vk: message handler error for peerId=${peerId}: ${errorMessage}`);
+      opts.runtime.error?.(`vk: message handler error for peerId=${redactVkId(peerId)}: ${errorMessage}`);
     }
   });
 
