@@ -316,7 +316,7 @@ export async function handleVkInbound(params: {
     // Only reachable when every forward was hidden: the empty-message check above
     // already let this one through. Say so, without naming the hidden authors.
     runtime.log?.(
-      `vk: drop group peerId=${message.peerId} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
+      `vk: drop group peerId=${redactVkId(message.peerId)} (all ${message.forwards?.length ?? 0} forwards hidden by contextVisibility=${contextVisibility})`,
     );
     return;
   }
@@ -324,11 +324,11 @@ export async function handleVkInbound(params: {
   // Group access check
   if (isGroup) {
     if (groupConfig?.enabled === false) {
-      runtime.log?.(`vk: drop group peerId=${message.peerId} (group disabled by config)`);
+      runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (group disabled by config)`);
       return;
     }
     if (groupPolicy === "disabled") {
-      runtime.log?.(`vk: drop group peerId=${message.peerId} (groupPolicy=${groupPolicy})`);
+      runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (groupPolicy=${groupPolicy})`);
       return;
     }
   }
@@ -341,13 +341,13 @@ export async function handleVkInbound(params: {
         senderId: message.senderId,
       });
       if (!senderAllowed.allowed) {
-        runtime.log?.(`vk: drop group sender ${senderDisplay} (groupPolicy=allowlist)`);
+        runtime.log?.(`vk: drop group sender ${redactVkId(message.senderId)} (groupPolicy=allowlist)`);
         return;
       }
     }
   } else {
     if (dmPolicy === "disabled") {
-      runtime.log?.(`vk: drop DM sender=${senderDisplay} (dmPolicy=disabled)`);
+      runtime.log?.(`vk: drop DM sender=${redactVkId(message.senderId)} (dmPolicy=disabled)`);
       return;
     }
     if (dmPolicy !== "open") {
@@ -370,11 +370,11 @@ export async function handleVkInbound(params: {
               });
             },
             onReplyError: (err) => {
-              runtime.error?.(`vk: pairing reply failed for ${senderDisplay}: ${String(err)}`);
+              runtime.error?.(`vk: pairing reply failed for ${redactVkId(message.senderId)}: ${String(err)}`);
             },
           });
         }
-        runtime.log?.(`vk: drop DM sender ${senderDisplay} (dmPolicy=${dmPolicy})`);
+        runtime.log?.(`vk: drop DM sender ${redactVkId(message.senderId)} (dmPolicy=${dmPolicy})`);
         return;
       }
     }
@@ -415,7 +415,7 @@ export async function handleVkInbound(params: {
       log: (line) => runtime.log?.(line),
       channel: CHANNEL_ID,
       reason: "control command (unauthorized)",
-      target: senderDisplay,
+      target: redactVkId(message.senderId),
     });
     return;
   }
@@ -429,7 +429,7 @@ export async function handleVkInbound(params: {
   const requireMention = isGroup ? (groupConfig?.requireMention ?? false) : false;
 
   if (isGroup && requireMention && !wasMentioned && !hasControlCommand) {
-    runtime.log?.(`vk: drop group peerId=${message.peerId} (mention required)`);
+    runtime.log?.(`vk: drop group peerId=${redactVkId(message.peerId)} (mention required)`);
     return;
   }
 
@@ -568,7 +568,7 @@ export async function handleVkInbound(params: {
       logTypingFailure({
         log: (line) => runtime.log?.(line),
         channel: CHANNEL_ID,
-        target: String(message.peerId),
+        target: redactVkId(message.peerId),
         error: err,
       });
     },
@@ -601,7 +601,7 @@ export async function handleVkInbound(params: {
     await markMessageReadVk(String(message.peerId), message.messageId, account);
   } catch (err) {
     runtime.log?.(
-      `vk: mark read failed for peerId=${message.peerId} messageId=${message.messageId}: ${String(err)}`,
+      `vk: mark read failed for peerId=${redactVkId(message.peerId)} messageId=${redactVkId(message.messageId)}: ${String(err)}`,
     );
   }
 
@@ -658,7 +658,7 @@ export async function handleVkInbound(params: {
       emojiOverrides: statusReactionsCfg?.emojis,
       timing: statusReactionsCfg?.timing,
       onError: (err) => {
-        runtime.log?.(`vk: status-reaction error for cmid=${message.conversationMessageId}: ${String(err)}`);
+        runtime.log?.(`vk: status-reaction error for cmid=${redactVkId(message.conversationMessageId)}: ${String(err)}`);
       },
     });
     void statusReactions.setQueued();
@@ -965,7 +965,7 @@ export async function handleVkInbound(params: {
                   // at the end of the turn cannot delete it.
                   progressDraft.detach();
                   runtime.log?.(
-                    `vk: step-progress draft edited INTO final msgId=${draftMsgId} len=${chunks[0].text.length} chunks=${chunks.length}`,
+                    `vk: step-progress draft edited INTO final msgId=${redactVkId(draftMsgId)} len=${chunks[0].text.length} chunks=${chunks.length}`,
                   );
                   // The answer's head is out: the draft now carries it.
                   statusSink?.({ lastOutboundAt: Date.now() });

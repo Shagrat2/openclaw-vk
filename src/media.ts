@@ -3,6 +3,7 @@ import { basename, extname, isAbsolute, resolve as resolvePath, sep } from "node
 import { fileURLToPath } from "node:url";
 import type { EnvelopeFormatOptions } from "openclaw/plugin-sdk/channel-inbound";
 import { formatZonedTimestamp, type PluginRuntime } from "openclaw/plugin-sdk/core";
+import { describeVkDownloadFailure } from "./diagnostics.js";
 import type { VkInboundAttachment, VkInboundForward, VkInboundResolvedMedia } from "./types.js";
 
 const IMAGE_EXTENSIONS = new Set([
@@ -704,7 +705,7 @@ export async function resolveVkInboundResolvedMedia(params: {
         attachment,
       });
     } catch (err) {
-      params.logError?.(`vk: inbound media download failed for ${url}: ${String(err)}`);
+      params.logError?.(`vk: inbound media download failed for ${describeVkDownloadFailure(url, err)}`);
       out.push({
         url,
         contentType: attachment.mimeType,
