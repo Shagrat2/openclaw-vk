@@ -20,6 +20,7 @@ import {
   type ResolvedVkAccount,
 } from "./accounts.js";
 import { VkConfigSchema } from "./config-schema.js";
+import { vkDiag } from "./diagnostics.js";
 import { collectRuntimeConfigAssignments, secretTargetRegistryEntries } from "./secret-contract.js";
 import { monitorVkProvider } from "./monitor.js";
 import { probeVkBot } from "./probe.js";
@@ -167,6 +168,21 @@ const vkSecurityAdapter = {
     account: ResolvedVkAccount;
   }) => (resolveVkRuntimeGroupPolicy({ cfg, account }) === "open" ? [VK_OPEN_GROUP_WARNING] : []),
 };
+
+/**
+ * One line per core-routed send. Sends routed by the core — a queued
+ * follow-up's reply, `openclaw message send` — arrive through `outbound`, not
+ * through the inbound dispatcher's `deliver`, which is where every other reply
+ * is logged. Without a line of their own they leave no trace, and a delivered
+ * follow-up reply reads as a lost one.
+ */
+function logVkOutbound(
+  stage: string,
+  to: string,
+  fields: { textLen: number; media: boolean; messageId?: string },
+): void {
+  vkDiag("outbound sent", { stage, to, ...fields });
+}
 
 export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
   id: "vk",
@@ -332,6 +348,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
       });
+      logVkOutbound("sendPayload", to, {
+        textLen: payload.text?.length ?? 0,
+        media: Boolean(payload.mediaUrl || payload.mediaUrls?.length),
+        messageId: result?.messageId,
+      });
       return result
         ? { channel: "vk", ...result }
         : { channel: "vk", messageId: "", chatId: to };
@@ -341,6 +362,11 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         cfg,
         accountId: accountId ?? undefined,
         replyTo: replyToId ?? undefined,
+      });
+      logVkOutbound("sendFormattedText", to, {
+        textLen: text.length,
+        media: false,
+        messageId: results.at(-1)?.messageId,
       });
       return results.map((result) => ({ channel: "vk" as const, ...result }));
     },
@@ -353,6 +379,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
       });
+      logVkOutbound("sendFormattedMedia", to, { textLen: text.length, media: true, messageId: result.messageId });
       return { channel: "vk", ...result };
     },
     sendText: async ({ cfg, to, text, accountId, replyToId }) => {
@@ -361,6 +388,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         accountId: accountId ?? undefined,
         replyTo: replyToId ?? undefined,
       });
+      logVkOutbound("sendText", to, { textLen: text.length, media: false, messageId: result.messageId });
       return { channel: "vk", ...result };
     },
     sendMedia: async ({ cfg, to, text, mediaUrl, mediaLocalRoots, accountId, replyToId, forceDocument }) => {
@@ -374,6 +402,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
           accountId: accountId ?? undefined,
           replyTo: replyToId ?? undefined,
         });
+        logVkOutbound("sendMedia", to, { textLen: text?.length ?? 0, media: false, messageId: textOnly.messageId });
         return { channel: "vk", ...textOnly };
       }
       const result = await sendFormattedMediaVk(to, text, mediaUrl, {
@@ -384,6 +413,7 @@ export const vkPlugin: ChannelPlugin<ResolvedVkAccount, VkProbe> = {
         replyTo: replyToId ?? undefined,
         forceDocument: forceDocument ?? undefined,
       });
+      logVkOutbound("sendMedia", to, { textLen: text?.length ?? 0, media: true, messageId: result.messageId });
       return { channel: "vk", ...result };
     },
   },

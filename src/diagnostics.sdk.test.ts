@@ -100,6 +100,75 @@ describe.skipIf(!sdk || !diag)("VK diagnostics through the real SDK redactor", (
     expect(reason).toMatch(/ after <data URI cut, \d+ chars>$/);
   });
 
+  it("strips VK's one-time keys from a failed upload's address at full, and leaves plain text alone", () => {
+    // The review's input: node-fetch repeats the request address in its error,
+    // and an upload server address carries `hash` and `rhash`.
+    process.env.VK_DIAG_LEVEL = "full";
+    diag!.vkDiagFailure(
+      "vk upload failed",
+      Object.assign(
+        new Error(
+          "request to https://pu.vk.com/c1/upload.php?act=do_add&mid=1&gid=2&hash=SYNTHETIC_HASH&rhash=SYNTHETIC_RHASH&api=1 failed, reason: socket hang up",
+        ),
+        { name: "FetchError", code: "ECONNRESET" },
+      ),
+    );
+    const reason = String(lastFields(mockLogger.error).reason);
+    expect(reason).toContain("hash=<redacted>&rhash=<redacted>&api=1 failed, reason: socket hang up");
+    expect(reason).not.toContain("SYNTHETIC");
+
+    diag!.vkDiagFailure("vk upload failed", new Error("socket hang up after 3 attempts"));
+    expect(lastFields(mockLogger.error).reason).toBe("socket hang up after 3 attempts");
+
+    // A document link's download key and a signed link's signature, on the
+    // oldest core too, whose redactor leaves `sig` alone.
+    diag!.vkDiagFailure(
+      "vk upload failed",
+      new Error("GET https://vk.com/doc1_2?hash=SYNTHETIC_H&dl=SYNTHETIC_DL and https://cdn.example/a?sig=SYNTHETIC_SIG"),
+    );
+    expect(String(lastFields(mockLogger.error).reason)).not.toContain("SYNTHETIC");
+  });
+
+  it("strips the same keys from an error for a plain log line, at every level", () => {
+    // `vk final reply failed: …` goes to runtime.error whatever the level, and a
+    // failed upload's error repeats the upload server address.
+    const error = Object.assign(
+      new Error("request to https://pu.vk.com/c1/upload.php?act=do_add&hash=SYNTHETIC_HASH&rhash=SYNTHETIC_RHASH failed"),
+      { name: "FetchError" },
+    );
+    for (const level of ["off", "full"]) {
+      process.env.VK_DIAG_LEVEL = level;
+      const text = diag!.redactVkErrorText(error);
+      expect(text).toContain("FetchError: request to https://pu.vk.com/c1/upload.php?act=do_add&hash=<redacted>");
+      expect(text).not.toContain("SYNTHETIC");
+    }
+    expect(diag!.redactVkErrorText(new Error("delivery failed"))).toBe("Error: delivery failed");
+  });
+
+  it("keeps a failed upload's answer to its keys, code and flags at off", () => {
+    // Failures are logged at every level; the upload server's answer text may
+    // carry a path or a file token and is kept for `full` only.
+    diag!.vkDiagFailure("vk upload failed", Object.assign(new Error("file is undefined"), { code: 100 }), {
+      elapsedMs: 2100,
+      uploadPost: "answered",
+      uploadKeys: ["error", "error_descr"],
+      uploadHasPayload: false,
+      uploadError: "ERR_UPLOAD_FILE",
+      uploadAnswer: '{"error":"ERR_UPLOAD_FILE","error_descr":"refused for /данные/клиент"}',
+    });
+    const fields = lastFields(mockLogger.error);
+    expect(fields).toMatchObject({
+      vkCode: 100,
+      elapsedMs: 2100,
+      uploadPost: "answered",
+      uploadKeys: ["error", "error_descr"],
+      uploadHasPayload: false,
+      uploadError: "ERR_UPLOAD_FILE",
+      uploadAnswer: "<text>",
+    });
+    expect(JSON.stringify(fields)).not.toContain("данные");
+  });
+
   it("keeps a data URI with a percent-encoded parameter out of the log at full", () => {
     // The review's input: the old pattern did not match this header, and the
     // real redactor let the whole URI through.
@@ -114,5 +183,29 @@ describe.skipIf(!sdk || !diag)("VK diagnostics through the real SDK redactor", (
     expect(lastFields(mockLogger.error).reason).toBe(
       `failed to read <data URI cut, ${uri.length} chars>`,
     );
+  });
+
+  it("keeps a download failure's response body and escaped addresses out at full", () => {
+    // The review's input: the core's media fetcher appends the response body to
+    // an HTTP error, a JSON body escapes the slashes, and the real redactor let
+    // both keys through.
+    process.env.VK_DIAG_LEVEL = "full";
+    const body = '{"url":"https:\\/\\/vk.com\\/doc123_456?hash=SYNTHETIC_KEY&dl=SYNTHETIC_DL"}';
+    const failure = (message: string) =>
+      Object.assign(new Error(message), { name: "MediaFetchError", code: "http_error" });
+    const withBody = diag!.describeVkDownloadFailure(
+      "https://vk.com/doc123_456?hash=A",
+      failure(`Failed to fetch media from https://vk.com/doc123_456?hash=A: HTTP 403; body: ${body}`),
+    );
+    const escaped = diag!.describeVkDownloadFailure(
+      "https://vk.com/doc123_456?hash=A",
+      failure("fetch failed for https:\\/\\/vk.com\\/doc123_456?hash=SYNTHETIC_KEY&dl=SYNTHETIC_DL"),
+    );
+    expect(withBody).toContain(`HTTP 403; body: <${body.length} chars>`);
+    expect(escaped).toContain("https:\\/\\/vk.com\\/doc123_456?…");
+    for (const line of [withBody, escaped]) {
+      expect(line).not.toContain("SYNTHETIC");
+      expect(line).not.toContain("hash=A");
+    }
   });
 });
