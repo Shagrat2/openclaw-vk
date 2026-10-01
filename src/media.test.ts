@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, beforeAll, beforeEach, afterAll, vi } from "vitest";
+import { describe, expect, it, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { MessageContext, WallAttachment } from "vk-io";
 import {
   extractVkInboundAttachments,
@@ -21,6 +21,22 @@ import {
 
 vi.mock("openclaw/plugin-sdk/core", async () => ({
   formatZonedTimestamp: (await import("./test-helpers.js")).formatZonedTimestampLikeCore,
+}));
+
+// The download failure line goes through the channel's diagnostics rules.
+vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+  redactIdentifier: (value?: string) => `sha256:${String(value ?? "-").length}`,
+  redactSensitiveText: (text: string) => text,
+}));
+
+vi.mock("openclaw/plugin-sdk/runtime-store", () => ({
+  createPluginRuntimeStore: () => ({
+    setRuntime: () => {},
+    getRuntime: () => {
+      throw new Error("no runtime");
+    },
+    tryGetRuntime: () => null,
+  }),
 }));
 
 const mockFetch = vi.fn();
@@ -629,9 +645,78 @@ describe("resolveVkInboundResolvedMedia", () => {
         },
       },
     ]);
-    expect(logError).toHaveBeenCalledWith(
-      expect.stringContaining("vk: inbound media download failed for https://example.com/photo.jpg"),
-    );
+    expect(logError).toHaveBeenCalledWith("vk: inbound media download failed for remote: Error");
+  });
+
+  describe("the download failure line", () => {
+    // A VK document address carries the sender's id and a one-time key.
+    const DOC_URL = "https://vk.com/doc142153191_690001?hash=a1b2c3d4e5&dl=GQ4TAMRQG4ZDEMY";
+    // The core's fetch errors repeat the address, redirect target included.
+    const fetchError = () =>
+      Object.assign(
+        new Error(
+          `Failed to fetch media from ${DOC_URL} (redirected to https://psv4.userapi.com/c1/d/x.pdf?extra=ZZZ9): HTTP 403`,
+        ),
+        { name: "MediaFetchError", code: "http_error" },
+      );
+
+    async function failedDownloadLine(): Promise<string> {
+      const logError = vi.fn();
+      await resolveVkInboundResolvedMedia({
+        attachments: [{ type: "doc", kind: "document", url: DOC_URL, mimeType: "application/pdf" }],
+        mediaRuntime: {
+          fetchRemoteMedia: vi.fn().mockRejectedValue(fetchError()),
+          saveMediaBuffer: vi.fn(),
+        },
+        logError,
+      });
+      expect(logError).toHaveBeenCalledOnce();
+      return String(logError.mock.calls[0]?.[0]);
+    }
+
+    afterEach(() => {
+      delete process.env.VK_DIAG_LEVEL;
+    });
+
+    it("names only the kind of address and the error's class and code below full", async () => {
+      const line = await failedDownloadLine();
+      expect(line).toBe("vk: inbound media download failed for remote: MediaFetchError http_error");
+      expect(line).not.toContain("142153191");
+    });
+
+    it("keeps the address and the error text at full, without the query", async () => {
+      process.env.VK_DIAG_LEVEL = "full";
+      const line = await failedDownloadLine();
+      expect(line).toContain("https://vk.com/doc142153191_690001?…");
+      expect(line).toContain("HTTP 403");
+      for (const secret of ["hash=", "a1b2c3d4e5", "dl=", "GQ4TAMRQG4ZDEMY", "extra=", "ZZZ9"]) {
+        expect(line).not.toContain(secret);
+      }
+    });
+
+    it("keeps the server's response body out at full, escaped addresses in it included", async () => {
+      // The review's input: the core appends the body to an HTTP error, and a
+      // JSON body escapes the slashes, which the address pattern did not match.
+      const body = '{"url":"https:\\/\\/vk.com\\/doc123_456?hash=SYNTHETIC_KEY&dl=SYNTHETIC_DL"}';
+      process.env.VK_DIAG_LEVEL = "full";
+      const logError = vi.fn();
+      await resolveVkInboundResolvedMedia({
+        attachments: [{ type: "doc", kind: "document", url: DOC_URL, mimeType: "application/pdf" }],
+        mediaRuntime: {
+          fetchRemoteMedia: vi.fn().mockRejectedValue(
+            Object.assign(new Error(`Failed to fetch media from ${DOC_URL}: HTTP 403; body: ${body}`), {
+              name: "MediaFetchError",
+              code: "http_error",
+            }),
+          ),
+          saveMediaBuffer: vi.fn(),
+        },
+        logError,
+      });
+      const line = String(logError.mock.calls[0]?.[0]);
+      expect(line).toContain(`HTTP 403; body: <${body.length} chars>`);
+      expect(line).not.toContain("SYNTHETIC");
+    });
   });
 });
 

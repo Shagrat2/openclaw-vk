@@ -184,4 +184,28 @@ describe.skipIf(!sdk || !diag)("VK diagnostics through the real SDK redactor", (
       `failed to read <data URI cut, ${uri.length} chars>`,
     );
   });
+
+  it("keeps a download failure's response body and escaped addresses out at full", () => {
+    // The review's input: the core's media fetcher appends the response body to
+    // an HTTP error, a JSON body escapes the slashes, and the real redactor let
+    // both keys through.
+    process.env.VK_DIAG_LEVEL = "full";
+    const body = '{"url":"https:\\/\\/vk.com\\/doc123_456?hash=SYNTHETIC_KEY&dl=SYNTHETIC_DL"}';
+    const failure = (message: string) =>
+      Object.assign(new Error(message), { name: "MediaFetchError", code: "http_error" });
+    const withBody = diag!.describeVkDownloadFailure(
+      "https://vk.com/doc123_456?hash=A",
+      failure(`Failed to fetch media from https://vk.com/doc123_456?hash=A: HTTP 403; body: ${body}`),
+    );
+    const escaped = diag!.describeVkDownloadFailure(
+      "https://vk.com/doc123_456?hash=A",
+      failure("fetch failed for https:\\/\\/vk.com\\/doc123_456?hash=SYNTHETIC_KEY&dl=SYNTHETIC_DL"),
+    );
+    expect(withBody).toContain(`HTTP 403; body: <${body.length} chars>`);
+    expect(escaped).toContain("https:\\/\\/vk.com\\/doc123_456?…");
+    for (const line of [withBody, escaped]) {
+      expect(line).not.toContain("SYNTHETIC");
+      expect(line).not.toContain("hash=A");
+    }
+  });
 });

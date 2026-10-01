@@ -437,6 +437,46 @@ describe("DM access control", () => {
     expect(mockMarkMessageReadVk).not.toHaveBeenCalled();
   });
 
+  it("names a dropped sender in the log without their raw VK id", async () => {
+    installRuntime();
+    const env = createVkRuntimeEnv();
+    const log = vi.fn();
+    env.log = log;
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      account: makeAccount({ config: { dmPolicy: "disabled" } }),
+      config: baseCfg(),
+      runtime: env,
+    });
+
+    const lines = log.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("drop DM"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain(String(SENDER_ID));
+  });
+
+  it.each(["pairing", "allowlist"] as const)(
+    "names a sender dropped by dmPolicy=%s without their raw VK id",
+    async (dmPolicy) => {
+      installRuntime({ upsertPairingRequest: vi.fn().mockResolvedValue({ code: "X", created: true }) });
+      const env = createVkRuntimeEnv();
+      const log = vi.fn();
+      env.log = log;
+
+      await handleVkInbound({
+        message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+        account: makeAccount({ config: { dmPolicy, allowFrom: [] } }),
+        config: baseCfg(),
+        runtime: env,
+      });
+
+      const lines = log.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("drop DM"));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`dmPolicy=${dmPolicy}`);
+      expect(lines[0]).not.toContain(String(SENDER_ID));
+    },
+  );
+
   it("dispatches DM when dmPolicy=open", async () => {
     const runtime = installRuntime();
 
@@ -788,6 +828,33 @@ describe("group access control", () => {
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["the chat is disabled", { groupPolicy: "open", groups: { [String(GROUP_PEER_ID)]: { enabled: false } } }],
+    ["groupPolicy=disabled", { groupPolicy: "disabled" }],
+    ["the sender is not allowlisted", { groupPolicy: "allowlist", groupAllowFrom: [999_999] }],
+    ["a mention is required", { groupPolicy: "open", groups: { "*": { requireMention: true } } }],
+  ])("logs a group drop without raw VK ids when %s", async (_case, config) => {
+    installRuntime({
+      buildMentionRegexes: vi.fn().mockReturnValue([/@bot/i]),
+      matchesMentionPatterns: vi.fn().mockReturnValue(false),
+    });
+    const env = createVkRuntimeEnv();
+    const log = vi.fn();
+    env.log = log;
+
+    await handleVkInbound({
+      message: makeMessage({ peerId: GROUP_PEER_ID, senderId: SENDER_ID, isGroup: true, text: "hi" }),
+      account: makeAccount({ config: { dmPolicy: "open", ...config } }),
+      config: baseCfg(),
+      runtime: env,
+    });
+
+    const lines = log.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("drop group"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain(String(GROUP_PEER_ID));
+    expect(lines[0]).not.toContain(String(SENDER_ID));
   });
 });
 
@@ -1550,7 +1617,7 @@ describe("dispatch payload", () => {
     mockMarkMessageReadVk.mockRejectedValueOnce(new Error("markRead failed"));
 
     await handleVkInbound({
-      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID }),
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, messageId: "3131" }),
       account: makeAccount({ config: { dmPolicy: "open" } }),
       config: baseCfg(),
       runtime: runtimeEnv,
@@ -1559,6 +1626,9 @@ describe("dispatch payload", () => {
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining("mark read failed"),
     );
+    const line = String(logSpy.mock.calls.find(([text]) => String(text).includes("mark read failed"))?.[0]);
+    expect(line).not.toContain(String(SENDER_ID));
+    expect(line).not.toContain("3131");
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).toHaveBeenCalledOnce();
@@ -1589,7 +1659,7 @@ describe("dispatch payload", () => {
     expect(mockLogTypingFailure).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: "vk",
-        target: String(SENDER_ID),
+        target: `sha256:${String(SENDER_ID).length}`,
       }),
     );
   });
@@ -1613,6 +1683,8 @@ describe("dispatch payload", () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("pairing reply failed"),
     );
+    const line = String(errorSpy.mock.calls.find(([text]) => String(text).includes("pairing reply failed"))?.[0]);
+    expect(line).not.toContain(String(SENDER_ID));
   });
 });
 
@@ -1645,6 +1717,10 @@ describe("command gating", () => {
     expect(
       vi.mocked(runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher),
     ).not.toHaveBeenCalled();
+    const { logInboundDrop } = await import("openclaw/plugin-sdk/channel-inbound");
+    expect(vi.mocked(logInboundDrop)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ target: `sha256:${String(SENDER_ID).length}` }),
+    );
   });
 
   it("does not block DM messages even when command gate blocks", async () => {
@@ -2138,12 +2214,20 @@ describe("step-progress (channels.vk.streaming.mode=progress)", () => {
       },
     );
 
+    const env = createVkRuntimeEnv();
+    const log = vi.fn();
+    env.log = log;
     await handleVkInbound({
       message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 7 }),
       account: makeAccount({ config: { dmPolicy: "open" } }),
       config: baseCfg({ streaming: { mode: "progress" } }),
-      runtime: createVkRuntimeEnv(),
+      runtime: env,
     });
+
+    // The line that says so names the draft only masked.
+    const into = log.mock.calls.map(([line]) => String(line)).find((line) => line.includes("INTO final"));
+    expect(into).toBeDefined();
+    expect(into).not.toContain("555");
 
     // The draft message is edited into the answer; no separate reply is sent.
     expect(mockEditMessageVk).toHaveBeenCalledWith(
@@ -2351,6 +2435,31 @@ describe("status reaction lifecycle", () => {
     const gate = vi.mocked(runtime.channel.reactions.shouldAckReaction).mock.calls[0]?.[0];
     expect(gate).toMatchObject({ scope: "group-mentions", isGroup: true, shouldBypassMention: bypass });
     expect(gate).not.toHaveProperty("requireMention");
+  });
+
+  it("names the message of a failed status reaction without its raw id", async () => {
+    await installStatusController();
+    const runtime = installRuntime();
+    vi.mocked(runtime.channel.reactions.shouldAckReaction).mockReturnValue(true);
+    const env = createVkRuntimeEnv();
+    const log = vi.fn();
+    env.log = log;
+
+    await handleVkInbound({
+      message: makeMessage({ senderId: SENDER_ID, peerId: SENDER_ID, conversationMessageId: 4747 }),
+      account: makeAccount({ config: { dmPolicy: "open" } }),
+      config: statusReactionConfig(),
+      runtime: env,
+    });
+    const { createStatusReactionController } = await import("openclaw/plugin-sdk/channel-feedback");
+    const params = vi.mocked(createStatusReactionController).mock.calls.at(-1)?.[0] as
+      | { onError?: (err: unknown) => void }
+      | undefined;
+    params?.onError?.(new Error("reaction refused"));
+
+    const line = log.mock.calls.map(([text]) => String(text)).find((text) => text.includes("status-reaction error"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("4747");
   });
 
   it("maps agent progress to queued, thinking, tool, compaction, and done states", async () => {
@@ -3406,7 +3515,9 @@ describe("context visibility through the resolved account", () => {
     ).not.toHaveBeenCalled();
     const lines = env.log.mock.calls.map(([line]) => String(line));
     expect(lines.some((line) => line.startsWith("vk: drop group") && line.includes("contextVisibility"))).toBe(true);
-    // The hidden author is exactly what this line must not name.
+    // The hidden author is exactly what this line must not name, and the chat
+    // is named only masked.
     expect(lines.join("\n")).not.toContain("142153191");
+    expect(lines.join("\n")).not.toContain(String(GROUP_PEER_ID));
   });
 });
